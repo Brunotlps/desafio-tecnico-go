@@ -19,7 +19,18 @@ type Config struct {
 	HTTPAddr        string
 	LogLevel        string
 	RequestTimeout  time.Duration
-	ShutdownTimeout time.Duration
+	ShutdownTimeout time.Duration // prazo global do encerramento (padrão 20s)
+	// ShutdownDrain é o limite de drenagem dentro do prazo global (padrão 12s); o restante
+	// (padrão 8s) é a reserva compartilhada para cancelamento, cleanup e fechamento das dependências.
+	ShutdownDrain time.Duration
+
+	// Referências pendentes e seu worker.
+	ReferenceTTL            time.Duration // padrão 15m, desde a primeira persistência
+	ReferenceBackoffInitial time.Duration // padrão 1s
+	ReferenceBackoffMax     time.Duration // padrão 30s (teto, também do jitter)
+	ReferencePollInterval   time.Duration // padrão 1s
+	ReferencePhaseTimeout   time.Duration // padrão 10s: locks e commit de uma tentativa
+	ReferenceWorkers        int           // executores por processo: 1 (padrão) ou 0 (desligado)
 
 	DatabaseURL string
 	DBMaxConns  int32
@@ -75,14 +86,21 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		LogLevel:        strings.ToLower(get("LOG_LEVEL", "info")),
 		RequestTimeout:  duration("REQUEST_TIMEOUT", "10s"),
 		ShutdownTimeout: duration("SHUTDOWN_TIMEOUT", "20s"),
-		DatabaseURL:     required("DATABASE_URL"),
-		OIDCIssuer:      required("OIDC_ISSUER"),
-		OIDCJWKSURL:     required("OIDC_JWKS_URL"),
-		OIDCAudience:    required("OIDC_AUDIENCE"),
-		OIDCClockSkew:   duration("OIDC_CLOCK_SKEW", "5s"),
-		AWSRegion:       get("AWS_REGION", "us-east-1"),
-		AWSEndpointURL:  get("AWS_ENDPOINT_URL", ""),
-		SQSWagerQueue:   get("SQS_WAGER_QUEUE_NAME", "wager-transactions.fifo"),
+		ShutdownDrain:   duration("SHUTDOWN_DRAIN_TIMEOUT", "12s"),
+
+		ReferenceTTL:            duration("REFERENCE_TTL", "15m"),
+		ReferenceBackoffInitial: duration("REFERENCE_BACKOFF_INITIAL", "1s"),
+		ReferenceBackoffMax:     duration("REFERENCE_BACKOFF_MAX", "30s"),
+		ReferencePollInterval:   duration("REFERENCE_POLL_INTERVAL", "1s"),
+		ReferencePhaseTimeout:   duration("REFERENCE_PHASE_TIMEOUT", "10s"),
+		DatabaseURL:             required("DATABASE_URL"),
+		OIDCIssuer:              required("OIDC_ISSUER"),
+		OIDCJWKSURL:             required("OIDC_JWKS_URL"),
+		OIDCAudience:            required("OIDC_AUDIENCE"),
+		OIDCClockSkew:           duration("OIDC_CLOCK_SKEW", "5s"),
+		AWSRegion:               get("AWS_REGION", "us-east-1"),
+		AWSEndpointURL:          get("AWS_ENDPOINT_URL", ""),
+		SQSWagerQueue:           get("SQS_WAGER_QUEUE_NAME", "wager-transactions.fifo"),
 	}
 	httpURL("OIDC_ISSUER", c.OIDCIssuer)
 	httpURL("OIDC_JWKS_URL", c.OIDCJWKSURL)
@@ -93,6 +111,12 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 	default:
 		errs = append(errs, errors.New("LOG_LEVEL must be debug, info, warn or error"))
 	}
+
+	workers, err := strconv.ParseInt(get("REFERENCE_WORKERS", "1"), 10, 32)
+	if err != nil {
+		errs = append(errs, errors.New("REFERENCE_WORKERS must be 0 or 1"))
+	}
+	c.ReferenceWorkers = int(workers)
 
 	n, err := strconv.ParseInt(get("DB_MAX_CONNS", "10"), 10, 32)
 	if err != nil || n < 1 || n > 500 {
@@ -108,8 +132,47 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		}
 		c.AllowedCurrencies = append(c.AllowedCurrencies, cur)
 	}
+	if len(errs) == 0 {
+		if err := c.Validate(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if len(errs) > 0 {
 		return Config{}, fmt.Errorf("invalid configuration: %w", errors.Join(errs...))
 	}
 	return c, nil
+}
+
+// Validate confere as relações entre os prazos. É chamada por Load e na composição da
+// aplicação (bootstrap), de modo que configurações montadas diretamente também são validadas.
+func (c Config) Validate() error {
+	var errs []error
+	positive := func(name string, d time.Duration) {
+		if d <= 0 {
+			errs = append(errs, fmt.Errorf("%s must be greater than zero", name))
+		}
+	}
+	positive("SHUTDOWN_TIMEOUT", c.ShutdownTimeout)
+	positive("SHUTDOWN_DRAIN_TIMEOUT", c.ShutdownDrain)
+	positive("REFERENCE_TTL", c.ReferenceTTL)
+	positive("REFERENCE_BACKOFF_INITIAL", c.ReferenceBackoffInitial)
+	positive("REFERENCE_BACKOFF_MAX", c.ReferenceBackoffMax)
+	positive("REFERENCE_POLL_INTERVAL", c.ReferencePollInterval)
+	positive("REFERENCE_PHASE_TIMEOUT", c.ReferencePhaseTimeout)
+	if c.ShutdownDrain >= c.ShutdownTimeout {
+		errs = append(errs, errors.New("SHUTDOWN_DRAIN_TIMEOUT must be shorter than SHUTDOWN_TIMEOUT: the difference is the reserve for cancellation, cleanup and closing dependencies"))
+	}
+	if c.ReferenceBackoffInitial > c.ReferenceBackoffMax {
+		errs = append(errs, errors.New("REFERENCE_BACKOFF_INITIAL must not exceed REFERENCE_BACKOFF_MAX"))
+	}
+	if c.ReferenceBackoffInitial > c.ReferenceTTL {
+		errs = append(errs, errors.New("REFERENCE_BACKOFF_INITIAL must not exceed REFERENCE_TTL"))
+	}
+	if c.ReferenceWorkers < 0 || c.ReferenceWorkers > 1 {
+		errs = append(errs, errors.New("REFERENCE_WORKERS must be 0 or 1"))
+	}
+	if c.ReferenceWorkers > 0 && c.ReferencePhaseTimeout >= c.ShutdownTimeout {
+		errs = append(errs, errors.New("REFERENCE_PHASE_TIMEOUT must be shorter than SHUTDOWN_TIMEOUT"))
+	}
+	return errors.Join(errs...)
 }

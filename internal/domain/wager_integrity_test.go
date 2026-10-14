@@ -178,14 +178,13 @@ func TestReferencesAreCopiedOnTheWayInAndOut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.Process(mustMoney(t, "20.00", "BRL"), testNow); err != nil {
-		t.Fatal(err)
-	}
+	// Process exige a referência interna resolvida (coberto em reference_test.go);
+	// aqui o estado persistido é montado diretamente, pois o foco é a cópia do ponteiro.
 	ref := uuid.New()
 	original := ref
 	state := WagerTransactionState{
 		ID: tx.ID(), Origin: OriginExternal, Kind: KindWin, Status: StatusProcessed, WalletID: tx.WalletID(), PlayerID: tx.PlayerID(),
-		Money: tx.Money(), External: tx.External(), ReferenceTransactionID: &ref, ResultBalance: tx.ResultBalance(),
+		Money: tx.Money(), External: tx.External(), ReferenceTransactionID: &ref, ResultBalance: mustMoney(t, "20.00", "BRL"),
 		CreatedAt: testNow, UpdatedAt: testNow,
 	}
 	got, err := RehydrateWagerTransaction(state)

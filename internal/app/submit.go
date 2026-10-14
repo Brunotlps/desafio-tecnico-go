@@ -32,9 +32,10 @@ type SubmitResult struct {
 // Assim uma chave registrada reenviada com outra moeda ou outro tipo é conflito
 // (409), não 422/501.
 //
-// Estão implementados BET, WIN sem referência e LOSS. Os demais tipos válidos
-// (REFUND, ROLLBACK e WIN com referência), quando a operação é nova, devolvem
-// ErrKindNotSupported sem persistir nada. O corpo transacional é processExternal.
+// Todos os tipos externos estão implementados: BET, WIN (com ou sem referência),
+// LOSS, REFUND e ROLLBACK. Uma referência ainda indisponível deixa a operação em
+// PENDING_REFERENCE, confirmada junto com a agenda de retomada (ver references.go).
+// O corpo transacional é processExternal.
 func (s *Service) Submit(ctx context.Context, raw domain.RawExternalRequest, correlationID string) (SubmitResult, error) {
 	req, err := domain.NewExternalRequest(raw)
 	if err != nil {
@@ -48,7 +49,7 @@ func (s *Service) Submit(ctx context.Context, raw domain.RawExternalRequest, cor
 		// A unicidade do banco revelou uma operação concorrente confirmada
 		// (p.ex. mesma chave aplicada a outra carteira). Uma nova transação a
 		// enxerga e a trata como replay ou conflito.
-		if (errors.Is(err, ErrDuplicateIdempotencyKey) || errors.Is(err, ErrDuplicateExternalTransaction)) && attempt < maxConflictRetries {
+		if (errors.Is(err, ErrDuplicateIdempotencyKey) || errors.Is(err, ErrDuplicateExternalTransaction) || errors.Is(err, ErrReversalTargetTaken)) && attempt < maxConflictRetries {
 			continue
 		}
 		return SubmitResult{}, err
@@ -84,18 +85,21 @@ func (s *Service) submitOnce(ctx context.Context, req domain.ExternalRequest, co
 // Ordem das decisões (a entrada já passou pela validação estrutural em
 // domain.NewExternalRequest): identidade registrada → políticas de operação nova
 // → lock da carteira e validação contra ela → rechecagem da identidade → regra do
-// tipo → gravação de carteira, transação, ledger e outbox.
+// tipo (decide) → gravação de carteira, transação, agenda de pendência, ledger e
+// outbox. Ordem única de locks de todo o sistema: carteira → agenda/transação.
 func (s *Service) processExternal(ctx context.Context, r Repositories, req domain.ExternalRequest, txID uuid.UUID, correlationID string) (SubmitResult, error) {
 	// 1. Identidade já registrada tem precedência sobre qualquer validação que
 	// dependa do estado atual (p.ex. carteira inexistente): reutilizar a chave com
 	// outro conteúdo é conflito, e um replay legítimo não depende da carteira. Esta
-	// leitura não trava nada; só enxerga operações já confirmadas.
+	// leitura não trava nada; só enxerga operações já confirmadas. O replay de uma
+	// pendência devolve o estado atual dela (PENDING_REFERENCE): não cria outra
+	// agenda, não renova o prazo e não emite de novo o evento inicial.
 	if existing, err := s.resolveExisting(ctx, r, req); err != nil || existing != nil {
 		return SubmitResult{Transaction: existing, Replay: existing != nil}, err
 	}
 
-	// 2. Operação nova: políticas da aplicação (moeda habilitada, tipo processado).
-	// Nada foi gravado ainda; a tentativa é desfeita sem efeito.
+	// 2. Operação nova: políticas da aplicação (moeda habilitada). Nada foi gravado
+	// ainda; a tentativa é desfeita sem efeito.
 	if err := s.checkNewOperation(req); err != nil {
 		return SubmitResult{}, err
 	}
@@ -123,11 +127,11 @@ func (s *Service) processExternal(ctx context.Context, r Repositories, req domai
 		return SubmitResult{}, err
 	}
 	versionBefore := wallet.Version()
-	events, entry, err := s.applyKind(wallet, tx, correlationID, now)
+	out, err := s.decide(ctx, r, wallet, tx, correlationID, now, false)
 	if err != nil {
 		return SubmitResult{}, err
 	}
-	if entry != nil {
+	if out.entry != nil {
 		if err := r.Wallets.UpdateBalance(ctx, wallet, versionBefore); err != nil {
 			return SubmitResult{}, err
 		}
@@ -135,36 +139,30 @@ func (s *Service) processExternal(ctx context.Context, r Repositories, req domai
 	if err := r.Transactions.Insert(ctx, tx); err != nil {
 		return SubmitResult{}, err
 	}
-	if entry != nil {
-		if err := r.Ledger.Append(ctx, *entry); err != nil {
+	if out.wait {
+		// A pendência só é confirmada junto com a sua agenda: o prazo começa aqui.
+		if err := r.Pending.Insert(ctx, PendingReference{
+			TransactionID: tx.ID(), WalletID: tx.WalletID(), FirstPersistedAt: now,
+			ExpiresAt: now.Add(s.ref.TTL), NextAttemptAt: now.Add(s.backoff(0)),
+		}); err != nil {
 			return SubmitResult{}, err
 		}
 	}
-	if err := r.Outbox.Append(ctx, events); err != nil {
+	if out.entry != nil {
+		if err := r.Ledger.Append(ctx, *out.entry); err != nil {
+			return SubmitResult{}, err
+		}
+	}
+	if err := r.Outbox.Append(ctx, out.events); err != nil {
 		return SubmitResult{}, err
 	}
 	return SubmitResult{Transaction: tx}, nil
 }
 
-// checkNewOperation aplica as políticas de uma operação nova, nesta ordem: moeda
-// habilitada (ErrCurrencyNotSupported) e tipo com processamento implementado
-// (ErrKindNotSupported). Só é chamada depois de resolver a identidade existente.
-// Uma referência recebida nunca é ignorada: WIN com referência só será processado
-// junto com a resolução de referências.
+// checkNewOperation aplica as políticas de uma operação nova: moeda habilitada
+// (ErrCurrencyNotSupported). Só é chamada depois de resolver a identidade existente.
 func (s *Service) checkNewOperation(req domain.ExternalRequest) error {
-	if err := s.checkCurrency(req.Money().Currency()); err != nil {
-		return err
-	}
-	switch req.Kind() {
-	case domain.KindBet, domain.KindLoss:
-		return nil
-	case domain.KindWin:
-		if req.ReferenceExternalTransactionID() == "" {
-			return nil
-		}
-		return fmt.Errorf("%w: %s with a reference", ErrKindNotSupported, req.Kind())
-	}
-	return fmt.Errorf("%w: %s", ErrKindNotSupported, req.Kind())
+	return s.checkCurrency(req.Money().Currency())
 }
 
 // resolveExisting consulta as identidades da operação, sempre no escopo do
@@ -194,70 +192,170 @@ func (s *Service) resolveExisting(ctx context.Context, r Repositories, req domai
 	return nil, nil
 }
 
-// applyKind aplica em memória a regra do tipo da operação sobre a carteira já
-// travada. Devolve os eventos da outbox e, quando houve movimentação, o
-// lançamento do ledger (nil para LOSS e para rejeições).
-func (s *Service) applyKind(w *domain.Wallet, tx *domain.WagerTransaction, correlationID string, now time.Time) ([]domain.Event, *domain.LedgerEntry, error) {
+// outcome é o resultado de decidir uma operação: eventos da outbox, lançamento do
+// ledger (nil sem movimentação) e se a operação deve (continuar a) esperar a referência.
+type outcome struct {
+	events []domain.Event
+	entry  *domain.LedgerEntry
+	wait   bool
+}
+
+// decide aplica em memória a regra do tipo da operação sobre a carteira já
+// travada, tanto para uma operação nova (tx em PENDING) quanto para a retomada de
+// uma pendência (tx em PENDING_REFERENCE): as regras financeiras são as mesmas. O
+// chamador persiste o resultado. expired informa que o prazo da referência esgotou.
+func (s *Service) decide(ctx context.Context, r Repositories, w *domain.Wallet, tx *domain.WagerTransaction, correlationID string, now time.Time, expired bool) (outcome, error) {
 	switch tx.Kind() {
 	case domain.KindBet:
-		return s.applyMovement(w, tx, w.Debit, correlationID, now)
-	case domain.KindWin:
-		return s.applyMovement(w, tx, w.Credit, correlationID, now)
+		return s.applyMovement(w, tx, w.Debit, domain.FailureInsufficientFunds, correlationID, now)
 	case domain.KindLoss:
 		return s.applyLoss(w, tx, correlationID, now)
+	case domain.KindWin:
+		if tx.External().ReferenceExternalTransactionID == "" {
+			return s.applyMovement(w, tx, w.Credit, "", correlationID, now)
+		}
+		return s.decideWithReference(ctx, r, w, tx, correlationID, now, expired)
+	case domain.KindRefund, domain.KindRollback:
+		return s.decideWithReference(ctx, r, w, tx, correlationID, now, expired)
 	}
-	return nil, nil, fmt.Errorf("%w: %s", ErrKindNotSupported, tx.Kind())
+	return outcome{}, fmt.Errorf("%w: %s", ErrKindNotSupported, tx.Kind())
 }
 
 type moveFunc func(entryID, transactionID uuid.UUID, amount domain.Money, now time.Time) (domain.LedgerEntry, error)
 
-// applyMovement aplica um débito (BET) ou crédito (WIN): conclui a transação com
-// o saldo resultante e gera WagerTransactionProcessed e WalletBalanceChanged.
-// Saldo insuficiente é rejeição de negócio auditável, sem movimentação; qualquer
-// outro erro (p.ex. overflow do saldo) interrompe a tentativa sem efeitos, pois a
-// carteira só muda depois de a movimentação ser validada por inteiro.
-func (s *Service) applyMovement(w *domain.Wallet, tx *domain.WagerTransaction, move moveFunc, correlationID string, now time.Time) ([]domain.Event, *domain.LedgerEntry, error) {
+// applyMovement aplica um débito ou crédito: conclui a transação com o saldo
+// resultante e gera WagerTransactionProcessed e WalletBalanceChanged. Saldo
+// insuficiente é rejeição de negócio auditável (insufficient), sem movimentação;
+// qualquer outro erro (p.ex. overflow do saldo) interrompe a tentativa sem
+// efeitos, pois a carteira só muda depois de a movimentação ser validada por inteiro.
+func (s *Service) applyMovement(w *domain.Wallet, tx *domain.WagerTransaction, move moveFunc, insufficient domain.FailureCode, correlationID string, now time.Time) (outcome, error) {
 	entry, err := move(s.newID(), tx.ID(), tx.Money(), now)
 	switch {
 	case errors.Is(err, domain.ErrInsufficientFunds):
-		if err := tx.Reject(domain.FailureInsufficientFunds, w.Balance(), now); err != nil {
-			return nil, nil, err
-		}
-		ev, err := domain.NewWagerTransactionRejected(s.newID(), correlationID, nil, tx, now)
-		if err != nil {
-			return nil, nil, err
-		}
-		return []domain.Event{ev}, nil, nil
+		return s.reject(w, tx, insufficient, correlationID, now)
 	case err != nil:
-		return nil, nil, err
+		return outcome{}, err
 	}
 	if err := tx.Process(w.Balance(), now); err != nil {
-		return nil, nil, err
+		return outcome{}, err
 	}
 	processed, err := domain.NewWagerTransactionProcessed(s.newID(), correlationID, nil, tx, now)
 	if err != nil {
-		return nil, nil, err
+		return outcome{}, err
 	}
 	causation := processed.ID()
 	changed, err := domain.NewWalletBalanceChanged(s.newID(), correlationID, &causation, entry, w.Version(), now)
 	if err != nil {
-		return nil, nil, err
+		return outcome{}, err
 	}
-	return []domain.Event{processed, changed}, &entry, nil
+	return outcome{events: []domain.Event{processed, changed}, entry: &entry}, nil
+}
+
+// reject conclui a transação como rejeição de negócio, sem movimentação, com o
+// saldo observado sob o lock, e gera WagerTransactionRejected.
+func (s *Service) reject(w *domain.Wallet, tx *domain.WagerTransaction, code domain.FailureCode, correlationID string, now time.Time) (outcome, error) {
+	if err := tx.Reject(code, w.Balance(), now); err != nil {
+		return outcome{}, err
+	}
+	ev, err := domain.NewWagerTransactionRejected(s.newID(), correlationID, nil, tx, now)
+	if err != nil {
+		return outcome{}, err
+	}
+	return outcome{events: []domain.Event{ev}}, nil
 }
 
 // applyLoss registra o resultado de uma LOSS: não há movimentação, ledger,
 // alteração de saldo ou de versão, nem WalletBalanceChanged. O saldo observado
 // sob o lock da carteira é o resultado devolvido (e reproduzido em replays).
-func (s *Service) applyLoss(w *domain.Wallet, tx *domain.WagerTransaction, correlationID string, now time.Time) ([]domain.Event, *domain.LedgerEntry, error) {
+func (s *Service) applyLoss(w *domain.Wallet, tx *domain.WagerTransaction, correlationID string, now time.Time) (outcome, error) {
 	if err := tx.Process(w.Balance(), now); err != nil {
-		return nil, nil, err
+		return outcome{}, err
 	}
 	processed, err := domain.NewWagerTransactionProcessed(s.newID(), correlationID, nil, tx, now)
 	if err != nil {
-		return nil, nil, err
+		return outcome{}, err
 	}
-	return []domain.Event{processed}, nil, nil
+	return outcome{events: []domain.Event{processed}}, nil
+}
+
+// decideWithReference resolve a referência da operação (WIN com referência, REFUND
+// ou ROLLBACK) no escopo do provedor da própria operação — nunca em outro — e
+// aplica a política aprovada:
+//
+//	ausente            antes do prazo: espera · depois: REJECTED/REFERENCE_NOT_FOUND
+//	PENDING*           antes do prazo: espera · depois: REJECTED/REFERENCE_PENDING_TIMEOUT
+//	REJECTED/FAILED    REJECTED/REFERENCE_NOT_PROCESSED
+//	incompatível       REJECTED/REFERENCE_MISMATCH (escopo, tipo ou valor)
+//	PROCESSED          regras financeiras, mesmo depois do prazo
+//
+// Uma falha de consulta devolve erro (a tentativa é abortada): nunca vale como
+// referência ausente. A carteira já está travada, então o estado do alvo (da mesma
+// carteira) não muda durante a decisão e a unicidade da reversão é decidida sem corrida.
+func (s *Service) decideWithReference(ctx context.Context, r Repositories, w *domain.Wallet, tx *domain.WagerTransaction, correlationID string, now time.Time, expired bool) (outcome, error) {
+	ext := tx.External()
+	target, err := r.Transactions.FindByExternalID(ctx, ext.ProviderID, ext.ReferenceExternalTransactionID)
+	switch {
+	case errors.Is(err, ErrTransactionNotFound):
+		if expired {
+			return s.reject(w, tx, domain.FailureReferenceNotFound, correlationID, now)
+		}
+		return s.wait(tx, correlationID, now)
+	case err != nil:
+		return outcome{}, err
+	}
+	assessment, err := tx.AssessReference(target)
+	if err != nil {
+		return outcome{}, err
+	}
+	switch assessment.Outcome {
+	case domain.ReferenceRejected:
+		return s.reject(w, tx, assessment.Code, correlationID, now)
+	case domain.ReferenceUnavailable:
+		if expired {
+			return s.reject(w, tx, domain.FailureReferencePendingTimeout, correlationID, now)
+		}
+		return s.wait(tx, correlationID, now)
+	}
+	if err := tx.ResolveReference(target, now); err != nil {
+		return outcome{}, err
+	}
+	if tx.Kind() == domain.KindWin {
+		return s.applyMovement(w, tx, w.Credit, "", correlationID, now)
+	}
+	// Reversão: uma única reversão bem-sucedida por alvo, em todo o histórico.
+	reversed, err := r.Transactions.HasProcessedReversal(ctx, target.ID())
+	if err != nil {
+		return outcome{}, err
+	}
+	if reversed {
+		return s.reject(w, tx, domain.FailureAlreadyReversed, correlationID, now)
+	}
+	dir, err := domain.ReversalDirection(tx.Kind(), target.Kind())
+	if err != nil {
+		return outcome{}, err
+	}
+	move := moveFunc(w.Credit)
+	if dir == domain.Debit {
+		move = w.Debit
+	}
+	return s.applyMovement(w, tx, move, domain.FailureReversalInsufficientFunds, correlationID, now)
+}
+
+// wait mantém (ou inicia) a espera pela referência. Na primeira vez a transação vai
+// a PENDING_REFERENCE e o evento WagerTransactionPendingReference é emitido; numa
+// retomada que continua esperando nada muda e nenhum evento é repetido.
+func (s *Service) wait(tx *domain.WagerTransaction, correlationID string, now time.Time) (outcome, error) {
+	if tx.Status() == domain.StatusPendingReference {
+		return outcome{wait: true}, nil
+	}
+	if err := tx.AwaitReference(now); err != nil {
+		return outcome{}, err
+	}
+	ev, err := domain.NewWagerTransactionPendingReference(s.newID(), correlationID, nil, tx, now)
+	if err != nil {
+		return outcome{}, err
+	}
+	return outcome{events: []domain.Event{ev}, wait: true}, nil
 }
 
 func (s *Service) logResult(ctx context.Context, res SubmitResult, correlationID string) {

@@ -26,7 +26,12 @@ import (
 
 func testConfig(mods ...func(*config.Config)) config.Config {
 	cfg := config.Config{
-		HTTPAddr: "127.0.0.1:0", LogLevel: "warn", RequestTimeout: 10 * time.Second, ShutdownTimeout: 10 * time.Second,
+		HTTPAddr: "127.0.0.1:0", LogLevel: "warn", RequestTimeout: 10 * time.Second,
+		ShutdownTimeout: 10 * time.Second, ShutdownDrain: 5 * time.Second,
+		// Referências: TTL e backoff pequenos nos testes (o padrão de produção é 15m e 1s–30s). O worker
+		// fica desligado por padrão para que cada teste controle a retomada; os que a exercitam o ligam.
+		ReferenceTTL: time.Minute, ReferenceBackoffInitial: 20 * time.Millisecond, ReferenceBackoffMax: 100 * time.Millisecond,
+		ReferencePollInterval: 25 * time.Millisecond, ReferencePhaseTimeout: 5 * time.Second, ReferenceWorkers: 0,
 		DatabaseURL: env.runtimeURL, DBMaxConns: 20,
 		OIDCIssuer: env.issuer, OIDCJWKSURL: env.jwksURL, OIDCAudience: "wager-api", OIDCClockSkew: time.Second,
 		AWSRegion: "us-east-1", AWSEndpointURL: env.awsEndpoint, SQSWagerQueue: "wager-transactions.fifo",

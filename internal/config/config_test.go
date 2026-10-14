@@ -44,3 +44,41 @@ func TestLoadReportsEveryProblem(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadApprovedDefaultsForReferencesAndShutdown(t *testing.T) {
+	c, err := load(env(valid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ReferenceTTL != 15*time.Minute || c.ReferenceBackoffInitial != time.Second || c.ReferenceBackoffMax != 30*time.Second ||
+		c.ReferencePhaseTimeout != 10*time.Second || c.ReferenceWorkers != 1 ||
+		c.ShutdownTimeout != 20*time.Second || c.ShutdownDrain != 12*time.Second || c.DBMaxConns != 10 {
+		t.Fatalf("defaults: %+v", c)
+	}
+	if reserve := c.ShutdownTimeout - c.ShutdownDrain; reserve < 8*time.Second {
+		t.Fatalf("shutdown reserve = %v, want >= 8s", reserve)
+	}
+}
+
+func TestLoadValidatesTheRelationsBetweenDeadlines(t *testing.T) {
+	for name, tc := range map[string]struct {
+		set  map[string]string
+		want string
+	}{
+		"drain not shorter than the global deadline": {map[string]string{"SHUTDOWN_DRAIN_TIMEOUT": "20s"}, "SHUTDOWN_DRAIN_TIMEOUT must be shorter than SHUTDOWN_TIMEOUT"},
+		"backoff initial above its ceiling":          {map[string]string{"REFERENCE_BACKOFF_INITIAL": "40s"}, "REFERENCE_BACKOFF_INITIAL must not exceed REFERENCE_BACKOFF_MAX"},
+		"backoff initial above the TTL":              {map[string]string{"REFERENCE_TTL": "500ms", "REFERENCE_BACKOFF_INITIAL": "1s", "REFERENCE_BACKOFF_MAX": "2s"}, "REFERENCE_BACKOFF_INITIAL must not exceed REFERENCE_TTL"},
+		"phase timeout not shorter than shutdown":    {map[string]string{"REFERENCE_PHASE_TIMEOUT": "20s"}, "REFERENCE_PHASE_TIMEOUT must be shorter than SHUTDOWN_TIMEOUT"},
+		"more than one executor":                     {map[string]string{"REFERENCE_WORKERS": "2"}, "REFERENCE_WORKERS must be 0 or 1"},
+		"zero TTL":                                   {map[string]string{"REFERENCE_TTL": "0s"}, "REFERENCE_TTL must be greater than zero"},
+	} {
+		m := valid()
+		for k, v := range tc.set {
+			m[k] = v
+		}
+		_, err := load(env(m))
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: err = %v, want %q", name, err, tc.want)
+		}
+	}
+}

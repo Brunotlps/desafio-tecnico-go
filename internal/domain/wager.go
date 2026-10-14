@@ -264,6 +264,9 @@ func RehydrateWagerTransaction(s WagerTransactionState) (*WagerTransaction, erro
 		if hasCode || !hasResult {
 			return nil, invalid("PROCESSED requires a result balance and no failure code")
 		}
+		if t.needsResolvedReference() && t.referenceTransactionID == nil {
+			return nil, invalid("PROCESSED %s requires its reference to be resolved", s.Kind)
+		}
 	case StatusRejected:
 		if !hasCode || !hasResult {
 			return nil, invalid("REJECTED requires a failure code and a result balance")
@@ -350,6 +353,9 @@ func (t *WagerTransaction) transitionTo(to Status, now time.Time) error {
 // Process conclui a transação com sucesso, registrando o saldo resultante.
 func (t *WagerTransaction) Process(balance Money, now time.Time) error {
 	if err := t.checkBalance(balance); err != nil {
+		return err
+	}
+	if err := t.requireResolvedReference(); err != nil {
 		return err
 	}
 	if err := t.transitionTo(StatusProcessed, now); err != nil {

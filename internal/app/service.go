@@ -21,7 +21,54 @@ const maxConflictRetries = 3
 type Config struct {
 	// AllowedCurrencies lista as moedas aceitas na abertura e nas operações.
 	AllowedCurrencies []domain.Currency
+	// Reference configura as referências pendentes; valores zero assumem os padrões.
+	Reference ReferenceConfig
 }
+
+// ReferenceConfig são os parâmetros das referências pendentes e do seu worker.
+type ReferenceConfig struct {
+	// TTL é o prazo, contado desde a primeira persistência de PENDING_REFERENCE, a
+	// partir do qual uma referência ausente ou ainda pendente resulta em rejeição.
+	TTL time.Duration // padrão 15m
+	// BackoffInitial e BackoffMax limitam o intervalo exponencial (com jitter,
+	// sempre dentro do teto) entre verificações.
+	BackoffInitial time.Duration // padrão 1s
+	BackoffMax     time.Duration // padrão 30s
+	// PollInterval é a pausa do worker entre varreduras.
+	PollInterval time.Duration // padrão 1s
+	// PhaseTimeout limita a fase financeira de uma tentativa (locks e commit).
+	PhaseTimeout time.Duration // padrão 10s
+	// BatchSize é o máximo de agendas vencidas lidas por varredura.
+	BatchSize int // padrão 20
+}
+
+func (c ReferenceConfig) withDefaults() ReferenceConfig {
+	if c.TTL <= 0 {
+		c.TTL = 15 * time.Minute
+	}
+	if c.BackoffInitial <= 0 {
+		c.BackoffInitial = time.Second
+	}
+	if c.BackoffMax <= 0 {
+		c.BackoffMax = 30 * time.Second
+	}
+	if c.PollInterval <= 0 {
+		c.PollInterval = time.Second
+	}
+	if c.PhaseTimeout <= 0 {
+		c.PhaseTimeout = 10 * time.Second
+	}
+	if c.BatchSize <= 0 {
+		c.BatchSize = 20
+	}
+	return c
+}
+
+// Option personaliza o serviço (relógio e ids são injetáveis para testes).
+type Option func(*Service)
+
+// WithClock substitui o relógio da aplicação.
+func WithClock(now func() time.Time) Option { return func(s *Service) { s.now = now } }
 
 // Service implementa os casos de uso financeiros.
 type Service struct {
@@ -30,19 +77,24 @@ type Service struct {
 	log     *slog.Logger
 	now     func() time.Time
 	newID   domain.IDGenerator
+	ref     ReferenceConfig
 }
 
 // NewService cria o serviço com relógio e gerador de ids de produção (UUIDv7).
-func NewService(uow UnitOfWork, cfg Config, log *slog.Logger) *Service {
+func NewService(uow UnitOfWork, cfg Config, log *slog.Logger, opts ...Option) *Service {
 	allowed := make(map[domain.Currency]struct{}, len(cfg.AllowedCurrencies))
 	for _, c := range cfg.AllowedCurrencies {
 		allowed[c] = struct{}{}
 	}
-	return &Service{
-		uow: uow, allowed: allowed, log: log,
+	s := &Service{
+		uow: uow, allowed: allowed, log: log, ref: cfg.Reference.withDefaults(),
 		now:   func() time.Time { return time.Now().UTC() },
 		newID: func() uuid.UUID { return uuid.Must(uuid.NewV7()) },
 	}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 func (s *Service) checkCurrency(c domain.Currency) error {

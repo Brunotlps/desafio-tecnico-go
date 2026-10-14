@@ -77,6 +77,9 @@ services:
 
   api:
     build: .
+    # O encerramento gracioso da API leva até SHUTDOWN_TIMEOUT (20 s por padrão); o padrão do Docker (10 s)
+    # enviaria SIGKILL antes de a drenagem, o cancelamento e o fechamento das dependências terminarem.
+    stop_grace_period: 25s
     environment:
       HTTP_ADDR: ":8080"
       # Papel de runtime: não é dono das tabelas nem superusuário e não altera o ledger.

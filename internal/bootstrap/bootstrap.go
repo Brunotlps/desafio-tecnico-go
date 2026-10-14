@@ -18,6 +18,7 @@ import (
 	"desafio-tecnico-go/internal/infra/httpapi"
 	"desafio-tecnico-go/internal/infra/postgres"
 	"desafio-tecnico-go/internal/infra/sqs"
+	"desafio-tecnico-go/internal/lifecycle"
 )
 
 // Options devolve a composição completa da aplicação para a configuração dada.
@@ -26,12 +27,16 @@ func Options(cfg config.Config) fx.Option {
 		fx.Supply(cfg),
 		fx.WithLogger(func(l *slog.Logger) fxevent.Logger { return &fxevent.SlogLogger{Logger: l} }),
 		fx.StopTimeout(cfg.ShutdownTimeout),
+		// Falha rápido se as relações entre prazos forem incoerentes (também para
+		// configurações montadas diretamente, que não passam por config.Load).
+		fx.Invoke(func(cfg config.Config) error { return cfg.Validate() }),
 		loggingModule,
 		persistenceModule,
 		authModule,
 		messagingModule,
 		applicationModule,
 		httpModule,
+		lifecycleModule,
 	)
 }
 
@@ -83,9 +88,18 @@ var messagingModule = fx.Module("messaging",
 )
 
 var applicationModule = fx.Module("application",
-	fx.Provide(func(uow app.UnitOfWork, cfg config.Config, log *slog.Logger) *app.Service {
-		return app.NewService(uow, app.Config{AllowedCurrencies: cfg.AllowedCurrencies}, log)
-	}),
+	fx.Provide(
+		func(uow app.UnitOfWork, cfg config.Config, log *slog.Logger) *app.Service {
+			return app.NewService(uow, app.Config{
+				AllowedCurrencies: cfg.AllowedCurrencies,
+				Reference: app.ReferenceConfig{
+					TTL: cfg.ReferenceTTL, BackoffInitial: cfg.ReferenceBackoffInitial, BackoffMax: cfg.ReferenceBackoffMax,
+					PollInterval: cfg.ReferencePollInterval, PhaseTimeout: cfg.ReferencePhaseTimeout,
+				},
+			}, log)
+		},
+		func(svc *app.Service, log *slog.Logger) *app.ReferenceWorker { return app.NewReferenceWorker(svc, log) },
+	),
 )
 
 var httpModule = fx.Module("http",
@@ -96,7 +110,25 @@ var httpModule = fx.Module("http",
 		}
 		return httpapi.NewServer(cfg.HTTPAddr, httpapi.New(svc, v, checks, log, cfg.RequestTimeout), log)
 	}),
-	fx.Invoke(func(lc fx.Lifecycle, s *httpapi.Server) {
-		lc.Append(fx.Hook{OnStart: s.Start, OnStop: s.Stop})
+	// O servidor é um componente do coordenador (ver lifecycleModule): não tem hook próprio.
+)
+
+// lifecycleModule coordena o início e o encerramento dos componentes que admitem trabalho
+// (worker de referências e servidor HTTP). O hook do coordenador é registrado depois dos
+// hooks das dependências (pool, verificador, SQS), porque o Fx executa os OnStop em ordem
+// inversa: os componentes terminam (com confirmação) antes de as dependências serem fechadas.
+var lifecycleModule = fx.Module("lifecycle",
+	fx.Provide(func(cfg config.Config, log *slog.Logger, store *postgres.Store) *lifecycle.Coordinator {
+		c := lifecycle.New(log, cfg.ShutdownDrain)
+		c.OnShutdown(store.SetShutdownDeadline)
+		return c
+	}),
+	fx.Invoke(func(lc fx.Lifecycle, cfg config.Config, c *lifecycle.Coordinator, worker *app.ReferenceWorker, server *httpapi.Server) {
+		// Ordem de início: o worker primeiro; a porta HTTP, que admite entradas, por último.
+		if cfg.ReferenceWorkers > 0 {
+			c.Add(worker)
+		}
+		c.Add(server)
+		lc.Append(fx.Hook{OnStart: c.Start, OnStop: c.Stop})
 	}),
 )

@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -28,6 +29,24 @@ type querier interface {
 // Store implementa app.UnitOfWork sobre um pool pgx.
 type Store struct {
 	src PoolSource
+	// shutdownDeadline, quando definido, limita o rollback ao orçamento restante do encerramento.
+	shutdownDeadline atomic.Pointer[time.Time]
+}
+
+// SetShutdownDeadline informa o prazo global do encerramento: a partir daí, o rollback de
+// uma transação cancelada nunca ultrapassa o orçamento restante.
+func (s *Store) SetShutdownDeadline(deadline time.Time) { s.shutdownDeadline.Store(&deadline) }
+
+const defaultRollbackTimeout = 5 * time.Second
+
+func (s *Store) rollbackTimeout() time.Duration {
+	d := defaultRollbackTimeout
+	if p := s.shutdownDeadline.Load(); p != nil {
+		if rem := time.Until(*p); rem < d {
+			d = max(rem, 100*time.Millisecond)
+		}
+	}
+	return d
 }
 
 // NewStore cria a unidade de trabalho. O pool é resolvido a cada operação, o que
@@ -50,6 +69,7 @@ func repositories(q querier) app.Repositories {
 		Transactions: transactionRepo{q},
 		Ledger:       ledgerRepo{q},
 		Outbox:       outboxRepo{q},
+		Pending:      pendingRepo{q},
 	}
 }
 
@@ -101,14 +121,14 @@ func (s *Store) Do(ctx context.Context, fn func(ctx context.Context, r app.Repos
 		return classify(err)
 	}
 	if err := fn(ctx, repositories(tx)); err != nil {
-		rollback(tx)
+		s.rollback(ctx, tx)
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) {
 			// O servidor respondeu com erro: a transação foi desfeita.
-			rollback(tx)
+			s.rollback(ctx, tx)
 			return classify(err)
 		}
 		if errors.Is(err, pgx.ErrTxClosed) {
@@ -122,9 +142,10 @@ func (s *Store) Do(ctx context.Context, fn func(ctx context.Context, r app.Repos
 }
 
 // rollback desfaz a transação mesmo que o contexto da requisição já tenha sido
-// cancelado, para devolver a conexão ao pool sem locks pendentes.
-func rollback(tx pgx.Tx) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// cancelado (para devolver a conexão ao pool sem locks pendentes), com um prazo
+// próprio de 5 s que, durante o encerramento, respeita o orçamento restante.
+func (s *Store) rollback(ctx context.Context, tx pgx.Tx) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.rollbackTimeout())
 	defer cancel()
-	_ = tx.Rollback(ctx)
+	_ = tx.Rollback(rctx)
 }

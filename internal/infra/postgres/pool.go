@@ -91,12 +91,22 @@ func (d *Database) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop fecha o pool, aguardando as consultas em andamento.
-func (d *Database) Stop(context.Context) error {
-	if pool := d.pool.Swap(nil); pool != nil {
-		pool.Close()
+// Stop fecha o pool. pgxpool.Close espera todas as conexões serem devolvidas; se algum
+// usuário ainda segurar uma (shutdown incompleto), o fechamento não prende o encerramento
+// além do prazo do contexto.
+func (d *Database) Stop(ctx context.Context) error {
+	pool := d.pool.Swap(nil)
+	if pool == nil {
+		return nil
 	}
-	return nil
+	closed := make(chan struct{})
+	go func() { pool.Close(); close(closed) }()
+	select {
+	case <-closed:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("closing the database pool did not finish before the shutdown deadline: %w", ctx.Err())
+	}
 }
 
 // Ping verifica o banco para a readiness.

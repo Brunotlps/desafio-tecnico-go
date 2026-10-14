@@ -26,7 +26,7 @@ técnica** ou **pendência**. O estado de implementação está no fim e no READ
 * **Aplicação** (`internal/app`) orquestra casos de uso e define as portas (`UnitOfWork`, repositórios).
 * **Infraestrutura** (`internal/infra/*`) implementa as portas e as entradas. **Entradas**: HTTP agora; SQS depois,
   chamando o mesmo `app.Service.Submit`.
-* Sem hierarquias genéricas: uma interface por necessidade concreta (`UnitOfWork`, os quatro repositórios,
+* Sem hierarquias genéricas: uma interface por necessidade concreta (`UnitOfWork`, os cinco repositórios — carteiras, transações, ledger, outbox e agenda de pendências —,
   `httpapi.Service`/`TokenVerifier` para os handlers). Divergência das recomendações iniciais do prompt: **nenhuma**.
 
 ## 2. Dinheiro (requisito §5.1, §6.1)
@@ -177,15 +177,17 @@ técnica** ou **pendência**. O estado de implementação está no fim e no READ
 Tabela de status/`code` no README. Princípios: 4xx corrigível = entrada (`400/404/422`) e **não é gravada**;
 resultado definitivo de negócio = `422` com corpo de transação (`status: REJECTED`, `failureCode`) e **é auditado**;
 conflito de idempotência = `409`; indisponibilidade = `503` + `Retry-After`; commit incerto = `503` distinto
-(`COMMIT_OUTCOME_UNKNOWN`); tipo sem suporte = `501`; `202` (aceito/pendente) existe no contrato mas **não é alcançável**
+(`COMMIT_OUTCOME_UNKNOWN`); `202` = aceito e pendente (`PENDING_REFERENCE`: sem saldo, com retomada durável) — antes da implementação das referências era inalcançável. `501` ficou reservado a um tipo sem processamento (hoje nenhum)
 nesta versão (não há aceite assíncrono).
 
-`failureCode` implementados: `INSUFFICIENT_FUNDS` (BET). Reservados para o incremento de reversões, **ainda não
-emitidos**: ver §8. `WIN` e `LOSS` não têm código de rejeição próprio: o crédito não depende de saldo e `LOSS` apenas registra o resultado.
+`failureCode` emitidos: `INSUFFICIENT_FUNDS` (BET) e os de referência e reversão descritos em §8 (`REVERSAL_INSUFFICIENT_FUNDS`, `ALREADY_REVERSED`,
+`REFERENCE_NOT_FOUND`, `REFERENCE_PENDING_TIMEOUT`, `REFERENCE_NOT_PROCESSED`, `REFERENCE_MISMATCH`). `WIN` sem referência e `LOSS` não têm
+código de rejeição próprio: o crédito não depende de saldo e `LOSS` apenas registra o resultado.
 
-Processamento é **síncrono**: a transação é inserida já no estado final, sem commit intermediário de `PENDING`
-(permitido pelo enunciado para operações sem dependências). Por isso não há o que retomar após queda; o `PENDING`
-só passará a ser persistido junto com a retomada durável (worker de referências).
+Processamento é **síncrono** quando não há dependência: a transação é inserida já no estado final, sem commit intermediário de
+`PENDING` (permitido pelo enunciado para operações sem dependências). Quando a referência está indisponível, a única espera persistida é
+`PENDING_REFERENCE`, sempre junto com a agenda de retomada (§8); `PENDING` nunca é confirmado (o banco o recusa), então não há aceite sem
+continuidade durável.
 
 ## 7. Inbox e outbox (§6.5, §11)
 
@@ -197,7 +199,9 @@ só passará a ser persistido junto com a retomada durável (worker de referênc
 * **Pendente** (não implementado): publicador com `SELECT … FOR UPDATE SKIP LOCKED` + lease (colunas de lock serão
   adicionadas por migration), backoff exponencial, recuperação de trabalho abandonado, republicação com mesmo `eventId`.
   **Roteamento previsto** (destino já provisionado): SNS FIFO `wager-events.fifo`; `MessageGroupId = walletId`
-  (presente em `data` de todos os eventos, preservando a ordem por carteira) e `MessageDeduplicationId = eventId`;
+  (presente em `data` dos eventos de carteira e de transação) e `MessageDeduplicationId = eventId`. O broker preserva a ordem das publicações
+  aceitas no mesmo grupo, mas **o publicador não promete reproduzir a ordem original da outbox** (vários publicadores, retries e recuperação
+  podem reordenar e republicar): consumidores deduplicam por `eventId` e projeções de saldo aplicam `balanceAfter` só se `walletVersion` for maior;
   os consumidores devem deduplicar por `eventId`, pois a entrega é *at-least-once*.
 * **Inbox**: tabela e consumidor **não criados** (sem schema fictício). Desenho previsto: `UNIQUE(consumer_name,
   message_id)` + hash, inserida na mesma transação do caso de uso; `Submit` já é reutilizável pela entrada SQS
@@ -205,27 +209,71 @@ só passará a ser persistido junto com a retomada durável (worker de referênc
   visibilidade 60 s, `maxReceiveCount = 5` → DLQ; mensagens inválidas vão direto para a DLQ; rejeição de negócio
   confirmada remove a mensagem.
 
-## 8. Reversões, referências pendentes e `PENDING_REFERENCE` — **decisões em aberto**
+## 8. Reversões, referências e pendências (implementado)
 
-Não implementados (HTTP 501). O enunciado exige documentar a política; **não foi inventada nenhuma regra silenciosa**.
-`WIN`/`LOSS` já estão implementados (§5). Já garantido pelo schema: `reference_external_transaction_id` obrigatório para `REFUND/ROLLBACK`, opcional para `WIN`,
-proibido nos demais (CHECK); `reference_transaction_id` para a referência resolvida.
+**Política aprovada** (decisão da mentoria; o enunciado exige que a combinação `REFUND`×`ROLLBACK` seja documentada):
 
-Proposta para aprovação (não aplicada):
+| Tipo do movimento referenciado | Reversões admitidas | Efeito |
+| --- | --- | --- |
+| `BET` | `REFUND` ou `ROLLBACK`, **uma única vez com sucesso no total** | crédito integral |
+| `WIN` | `ROLLBACK`, uma vez | débito integral |
+| `REFUND` | `ROLLBACK`, uma vez | débito integral |
+| `ROLLBACK`, `LOSS`, `OPENING` | nenhuma | `REFERENCE_MISMATCH` |
 
-* **Regra "uma devolução por movimento"**: cada movimento original (`BET`, `WIN`, `REFUND`) pode receber **no máximo uma
-  reversão bem-sucedida** (`REFUND` ou `ROLLBACK`), imposta por índice único parcial sobre uma coluna
-  `reversal_target_id` das reversões `PROCESSED`. Consequências: `REFUND`+`ROLLBACK` sobre a mesma `BET` é impossível
-  (segunda → `REJECTED/ALREADY_REVERSED`), então o mesmo débito nunca é devolvido duas vezes; `WIN` só aceita
-  `ROLLBACK`; `ROLLBACK` de `REFUND` redebita e **encerra** a `BET` (não aceita nova devolução). Em disputa concorrente
-  o lock da carteira decide e o índice único é a garantia final.
-* **Códigos propostos**: `REFERENCE_NOT_FOUND` (TTL/tentativas esgotados), `REFERENCE_NOT_PROCESSED` (referência
-  `REJECTED/FAILED`, definitivo), `REFERENCE_MISMATCH` (provedor/jogador/carteira/moeda/rodada/valor), `ALREADY_REVERSED`,
-  `REVERSAL_INSUFFICIENT_FUNDS` (distinto de `INSUFFICIENT_FUNDS`, como exigido).
-* **Referência existente mas pendente** (`PENDING`/`PENDING_REFERENCE`): continua em `PENDING_REFERENCE` com o mesmo
-  backoff; **terminou sem sucesso**: rejeição imediata e definitiva.
-* **Backoff/TTL**: exponencial com jitter, máximo de tentativas ou TTL configurável; ao esgotar → `REJECTED` +
-  `WagerTransactionRejected`. Worker com `SKIP LOCKED` para múltiplas instâncias.
+* **Uma reversão bem-sucedida por movimento alvo, em todo o histórico**, seja `REFUND` ou `ROLLBACK` (mais restritivo que a unicidade
+  por tipo exigida literalmente). `BET → REFUND → ROLLBACK do REFUND` restaura o débito, e **a BET não admite outra reversão
+  bem-sucedida** (nem `REFUND`, nem `ROLLBACK`); o `REFUND` também não admite outra. Não existe estado `REVERSED`: as operações originais
+  continuam terminais e o ledger recebe novos lançamentos. Rejeições, falhas e pendências **não** consomem o direito de o alvo ser revertido.
+  Consequência aceita: o `ROLLBACK` da BET depois do `ROLLBACK` do REFUND seria financeiramente viável, mas é recusado pelo contrato.
+* `WIN` pode informar uma `BET` da mesma rodada como referência; o valor do prêmio é livre e o `WIN` **não** consome a unicidade da reversão.
+* **Validação da referência** (`WagerTransaction.AssessReference`, no domínio): provedor, id externo referenciado, jogador, carteira, moeda e
+  rodada iguais; tipo elegível (`REFUND`→`BET`; `WIN`→`BET`; `ROLLBACK`→`BET|WIN|REFUND`); **valor idêntico** nas reversões. Incompatibilidade →
+  `REJECTED/REFERENCE_MISMATCH` (campos imutáveis: vale mesmo se o alvo ainda estiver pendente). Uma operação não pode referenciar o próprio
+  id externo (entrada inválida, 400). A resolução é **sempre no escopo do `providerId` da própria operação**: a transação de outro provedor
+  com o mesmo id externo nunca é encontrada nem revelada.
+* **Códigos de falha** (todos `REJECTED`, auditáveis, com `WagerTransactionRejected` e sem ledger; todos **definitivos** — o cliente corrige
+  a entrada com *outra* operação/identidade, nunca reabrindo esta): `INSUFFICIENT_FUNDS` (BET), **`REVERSAL_INSUFFICIENT_FUNDS`** (o débito de
+  uma reversão excederia o saldo — distinto do da BET, como o enunciado exige), `ALREADY_REVERSED`, `REFERENCE_NOT_FOUND`,
+  `REFERENCE_PENDING_TIMEOUT`, `REFERENCE_NOT_PROCESSED` (referência `REJECTED`/`FAILED`) e `REFERENCE_MISMATCH`. Entrada corrigível (400/404/422
+  de entrada) não é gravada.
+
+### Pendências: `PENDING_REFERENCE`, agenda durável e worker
+
+* **Aceite.** Referência ainda indisponível (ausente, ou existente e `PENDING*`) ⇒ a operação é gravada em `PENDING_REFERENCE`, na **mesma
+  transação** da agenda (`pending_references`) e do evento `WagerTransactionPendingReference`; HTTP responde `202` sem saldo. Não há commit
+  intermediário de `PENDING` (o banco recusa um `PENDING` confirmado) nem `PENDING_REFERENCE` sem agenda aberta (verificação deferida).
+* **Prazo.** `expires_at = first_persisted_at + TTL` (15 min por padrão), fixado na primeira persistência e imutável (trigger e privilégio de
+  coluna): replay, reinício e tentativas **não o renovam**. Replay de pendência devolve o estado atual, sem outra agenda nem novo evento.
+* **Avaliação** (a mesma função `Service.decide` do processamento inicial — as regras financeiras não são duplicadas — sobre o estado durável
+  revalidado sob locks):
+
+  | Referência válida | Antes do TTL | Depois do TTL |
+  | --- | --- | --- |
+  | ausente | espera e reagenda | `REJECTED/REFERENCE_NOT_FOUND` |
+  | `PENDING`/`PENDING_REFERENCE` | espera e reagenda | `REJECTED/REFERENCE_PENDING_TIMEOUT` |
+  | `PROCESSED` | regras financeiras | regras financeiras (**mesmo se concluiu depois do prazo**) |
+  | `REJECTED`/`FAILED` | `REJECTED/REFERENCE_NOT_PROCESSED` | idem |
+
+  Encontrar o alvo `PROCESSED` não dispensa saldo, tipo/escopo/valor nem a unicidade da reversão. Uma rejeição por expiração já confirmada
+  é terminal e não é reaberta por uma chegada tardia nem por replay. **Falha de consulta não prova ausência**: a tentativa é abortada (erro
+  transitório), nada é gravado e o prazo original segue valendo.
+* **Retomada** (`Service.ProcessPending`): transação curta (fase financeira de até 10 s, incluindo locks e commit) que recarrega e revalida a
+  operação **original** — mesmo id, hash e chave; não recria nada nem usa reidratação como mutação — e conclui estado, saldo, ledger, outbox e
+  agenda no mesmo commit; ou apenas reagenda (`next_attempt_at`, `attempts`), sem repetir o evento inicial. Backoff **persistido**:
+  exponencial a partir de 1 s, teto 30 s, jitter uniforme em `[d/2, d]` (nunca acima do teto); nenhuma transação ou lock é mantido durante o backoff.
+* **Ordem única de locks** (HTTP, retomada e a futura entrada SQS): **carteira → agenda da pendência → linha da transação**. O caminho HTTP
+  trava a carteira primeiro; a retomada lê candidatos *sem locks* (só uma listagem, que não autoriza movimento), trava a carteira com
+  `FOR UPDATE SKIP LOCKED` — uma carteira ocupada é **pulada** (as demais seguem, sem lock global) e nunca prende a retomada na ordem inversa
+  — e depois a agenda. Como o alvo é sempre da mesma carteira (outra carteira é `REFERENCE_MISMATCH`, decidido por campos imutáveis), o estado
+  do alvo e a unicidade da reversão são decididos sem corrida sob o lock da carteira.
+* **Worker**: um executor por processo (`REFERENCE_WORKERS=1`), sem lease; vários processos podem rodar o seu ao mesmo tempo, e o resultado é
+  único porque a carteira e a agenda são travadas e revalidadas (a agenda concluída some das consultas de candidatos). Instâncias com relógios
+  diferentes: a retomada usa o **maior** entre o seu relógio e `updated_at` da transação (o domínio nunca ajusta um instante sozinho), de
+  modo que um relógio atrasado não vira erro de entrada do cliente. O TTL e o backoff usam o relógio da aplicação (a diferença entre instâncias
+  desloca o prazo, nunca o renova). `REFERENCE_PHASE_TIMEOUT` e o orçamento de shutdown limitam cada tentativa.
+* **Concorrência de reversões**: `REFUND` e `ROLLBACK` simultâneos contra a mesma BET ⇒ um `PROCESSED`, o outro `REJECTED/ALREADY_REVERSED`,
+  um único crédito. O índice único parcial (§10) é a barreira final: uma violação (`uq_wager_tx_one_reversal_per_target`) é classificada como
+  disputa (`ErrReversalTargetTaken`), a tentativa é desfeita e **refeita em nova transação**, que enxerga o vencedor e rejeita (nunca confirma efeito parcial).
 
 ## 9. Autenticação e autorização (§2)
 
@@ -251,7 +299,7 @@ Proposta para aprovação (não aplicada):
 
 ## 10. Garantias impostas pelo PostgreSQL (§5.3, §5.8)
 
-Migrations `00001_init.sql`, `00002_…` e `00003_…` — verificadas por tentativas **diretas de SQL** (inclusive pelo papel restrito de runtime) em `constraints_test.go`, `db_integrity_test.go` e `completed_movement_test.go`:
+Migrations `00001_init.sql` a `00005_…` — verificadas por tentativas **diretas de SQL** (inclusive pelo papel restrito de runtime) em `constraints_test.go`, `db_integrity_test.go` e `completed_movement_test.go`:
 
 | Garantia | Mecanismo |
 | --- | --- |
@@ -275,6 +323,12 @@ Migrations `00001_init.sql`, `00002_…` e `00003_…` — verificadas por tenta
 | Forma por estado | `CHECK` com `IS NOT NULL` explícito: `PROCESSED` exige `result_balance` não nulo e ≥ 0; `REJECTED` exige código e resultado; `PENDING*` não têm código nem resultado; `FAILED` exige código (um `CHECK` aceita `NULL` como "desconhecido", então `>= 0` sozinho não basta). Formato do `failure_code` também por `CHECK` |
 | Terminais imutáveis; transações nunca apagadas | trigger `wager_transactions_guard` |
 | Outbox: snapshot imutável | trigger `outbox_events_guard` (só tentativas/agenda/publicação mudam) |
+| **Referência coerente** (migration 00005) | trigger `BEFORE INSERT/UPDATE` `wager_tx_reference_guard`: a referência interna aponta para o alvo com o **mesmo** provedor, id externo referenciado, jogador, carteira, moeda e rodada; alvo `PROCESSED`; tipo elegível (`REFUND`→`BET`, `WIN`→`BET`, `ROLLBACK`→`BET|WIN|REFUND`); reversões com **valor idêntico**. `CHECK`: referência interna exige a externa (`ck_wager_tx_reference_pair`) e não pode ser a própria transação |
+| **Referência resolvida para concluir** | `CHECK ck_wager_tx_processed_reference`: `REFUND`, `ROLLBACK` e `WIN` com referência externa só ficam `PROCESSED` com a referência interna preenchida (forma `NULL` coberta explicitamente) |
+| **Uma reversão por alvo** | índice único parcial `uq_wager_tx_one_reversal_per_target (reference_transaction_id) WHERE kind IN ('REFUND','ROLLBACK') AND status = 'PROCESSED'`: vale para `REFUND` e `ROLLBACK` em conjunto; `WIN` com referência não o consome; rejeições/falhas/pendências também não |
+| **Sentido do lançamento de `ROLLBACK`** | `ledger_entry_matches_transaction` (deferida): alvo `BET` ⇒ `CREDIT`; alvo `WIN`/`REFUND` ⇒ `DEBIT`; `ROLLBACK` sem alvo resolvido é recusado |
+| **Mutabilidade das não terminais** | `wager_transactions_guard` (substituída): rodada, jogo, referência externa e criação passam a ser imutáveis, a referência interna não muda depois de resolvida, só transições `PENDING→*` e `PENDING_REFERENCE→PROCESSED|REJECTED|FAILED`, `updated_at` não regride |
+| **Pendência com retomada** | `pending_references` + constraint triggers deferidos: **nenhum `PENDING` é confirmado**; `PENDING_REFERENCE` exige agenda aberta; transação terminal não deixa agenda aberta; a agenda tem identidade e prazo imutáveis, `attempts` não diminui e nunca é apagada |
 
 ### 10.1. Papéis de banco: migrations × runtime
 
@@ -282,11 +336,13 @@ Migrations `00001_init.sql`, `00002_…` e `00003_…` — verificadas por tenta
 * **Runtime** (`wager_app`, criado por `migrate up` quando `RUNTIME_DB_ROLE` está definido, ou por `migrate grants`):
   `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT`, **sem posse de nada** e sem `CREATE` no
   schema. Privilégios mínimos (lista em `internal/infra/postgres/roles.go`, reaplicada de um estado conhecido a cada execução):
-  ledger `SELECT, INSERT`; transações e outbox `SELECT, INSERT`; carteiras `SELECT, INSERT` e `UPDATE (balance, version,
-  updated_at)`; `goose_db_version` `SELECT`. Sem `UPDATE/DELETE/TRUNCATE` no ledger, sem `DISABLE TRIGGER` (exige posse), sem
+  ledger `SELECT, INSERT`; outbox `SELECT, INSERT`; transações `SELECT, INSERT` e `UPDATE (status, failure_code, result_balance,
+  reference_transaction_id, updated_at)` (identidade, valor, provedor, chave, hash, rodada, jogo e referência externa **não** são atualizáveis);
+  agenda `pending_references` `SELECT, INSERT` e `UPDATE (next_attempt_at, attempts, last_attempt_at, last_error, completed_at)` (prazo e
+  identidade imutáveis, sem `DELETE`); carteiras `SELECT, INSERT` e `UPDATE (balance, version, updated_at)`; `goose_db_version` `SELECT`. Sem `UPDATE/DELETE/TRUNCATE` no ledger, sem `DISABLE TRIGGER` (exige posse), sem
   `session_replication_role` (exige superusuário), sem `DROP`/`ALTER`. Testado com tentativas reais (`role_test.go`) e com o fluxo
-  financeiro completo e a verificação de schema rodando com esse papel. Ampliar privilégios (p.ex. `UPDATE` de transações
-  pelo worker de referências, `UPDATE` da outbox pelo publicador) é uma mudança explícita nessa lista.
+  financeiro completo e a verificação de schema rodando com esse papel. Ampliar privilégios (p.ex. `UPDATE` da outbox pelo publicador) é uma mudança explícita nessa lista; a 00005 ampliou
+  só as colunas de transição das transações e da agenda. `migrate grants` omite a agenda em um banco ainda anterior à 00005.
 * Limitação restante: o dono e superusuários continuam podendo desabilitar triggers — por isso a aplicação nunca roda com
   esses papéis. Em produção, crie o papel de runtime fora do pipeline de migrations se o papel das migrations não tiver `CREATEROLE`.
 
@@ -302,6 +358,7 @@ versão anterior).
 | --- | --- | --- | --- |
 | `00002_ledger_chain_and_result_integrity` | cadeia do ledger quebrada; lançamento incoerente com sua transação; `PROCESSED`/`REJECTED` com resultado nulo; `failure_code` inválido; saldo ≠ ledger | cadeia contínua, FK composta, resultado explícito | remove o que instalou |
 | `00003_completed_movement_requires_ledger` | transação `PROCESSED` (≠ `LOSS`) **sem lançamento**; `result_balance` ≠ `balance_after` do lançamento | trigger deferido da transação e verificação de resultado no lado do ledger | remove o trigger e restaura a função de 00002; **não toca nos dados** (após a reversão a lacuna volta a existir) |
+| `00005_references_and_reversals` | **exclusão dos escritores** (mesmo `LOCK TABLE` da 00004) e, com eles excluídos: transação confirmada como `PENDING`; reversão/`WIN` com referência `PROCESSED` sem a referência interna; referência interna incoerente com a externa, o escopo, o tipo, o estado ou o valor; alvo com mais de uma reversão `PROCESSED`; lançamento de `ROLLBACK` no sentido errado (contagem e primeiros ids) | tudo o que está em §10 na linha "Referência coerente" em diante, mais a agenda `pending_references` | remove as garantias, restaura as funções da 00001/00003 e **descarta a agenda** (transações e ledger intactos; uma pendência aberta segue `PENDING_REFERENCE`, sem retomada, até um novo `migrate up`, que recria a agenda dela com prazo renovado — caso excepcional, pois antes da 00005 nenhuma pendência era gravada) |
 | `00004_revalidate_history_under_writer_exclusion` | **exclusão dos escritores** (`LOCK TABLE` em `wallets`, `wager_transactions`, `wallet_ledger_entries`) e, com eles excluídos: triggers das garantias ausentes ou desabilitados; cadeia do ledger quebrada; lançamento incoerente com a transação; saldo ≠ ledger; transação concluída sem lançamento; resultado ≠ `balance_after` (com contagem e primeiros ids) | nada (só valida; é a versão final esperada pela aplicação) | vazia: apenas retrocede a versão, sem tocar em dados nem garantias |
 
 Mecanismo da 00003 (por que um *constraint trigger* deferido): um `CHECK` não enxerga outra tabela; uma FK da transação para o
@@ -346,7 +403,7 @@ mecanismo. Justificativa:
 * A 00003 já foi publicada e não é reescrita; sua janela é tratada **depois do fato**: a 00004 detecta e recusa o histórico
   incompatível, inclusive em bancos onde a janela já ocorreu (e no upgrade 2→4 com um escritor aberto, que deixa o schema em 3).
 
-**Portão da versão final.** Um upgrade só termina bem na versão 4. Se a 00004 recusar, o schema fica na versão 3, **nada é apagado
+**Portão da versão final.** Um upgrade só termina bem na versão final (hoje 5). Se uma migration recusar (p.ex. a 00004 ou a 00005), o schema fica na versão anterior, **nada é apagado
 nem reescrito**, e a aplicação (que compara a versão do schema com a embutida no binário) **recusa iniciar**: o estado é visível e
 não é tratado como sucesso. A correção dos registros é manual; depois, `migrate up` conclui.
 
@@ -383,18 +440,31 @@ espera/retenção pelo lock, dados preservados, reversão/reaplicação e partid
 * **Início** (`OnStart`): `postgres.Database` — o pool só é aberto em `Start`, que faz `Ping`, confere a versão do schema por um
   `SELECT` em `goose_db_version` (`migrate up` pendente impede a partida) e **fecha o pool antes de devolver o erro se algo
   falhar**: o Fx não chama o `OnStop` de um hook cujo `OnStart` falhou, então a liberação não depende dele. Verificador →
-  carrega o JWKS; SQS → `GetQueueUrl` da fila de entrada; servidor → `Listen` síncrono e `Serve` em segundo plano.
-  Qualquer falha aborta a inicialização (o Fx desfaz os hooks já iniciados) e **nenhuma conexão com o PostgreSQL permanece
-  aberta** (testado, contando `pg_stat_activity`): PostgreSQL inacessível, schema sem migrations, schema desatualizado,
-  credenciais inválidas, IdP inacessível, fila ausente e broker inacessível.
-* **Encerramento**: o Fx executa os `OnStop` em ordem **inversa**; como o servidor depende do pool, ele para
-  **primeiro**: `Shutdown` fecha o listener, conclui as requisições em andamento até `SHUTDOWN_TIMEOUT` (padrão 20 s) e
-  então força o fechamento; depois o verificador e, por último, o pool é fechado (teste: requisição presa no lock
-  conclui durante o shutdown; conexões ao banco chegam a zero). `SIGTERM` com saída 0 testado em 3 processos.
+  carrega o JWKS; SQS → `GetQueueUrl` da fila de entrada. Por último, o **coordenador** inicia os componentes que admitem trabalho, na
+  ordem de registro: worker de referências e, por fim, o servidor HTTP (`Listen` síncrono, `Serve` em segundo plano) — a porta de entrada abre
+  por último. Se um componente falha ao iniciar, o coordenador encerra os já iniciados antes de devolver o erro, e o Fx desfaz os hooks
+  anteriores: **nenhuma conexão com o PostgreSQL permanece aberta** (testado contando `pg_stat_activity`, inclusive com o worker ativo e a porta
+  ocupada): PostgreSQL inacessível, schema sem migrations ou desatualizado, credenciais inválidas, IdP inacessível, fila ausente, broker
+  inacessível e porta ocupada. O contexto de `OnStart` só limita a inicialização: o worker tem contexto próprio, cancelável por `Cancel`.
+* **Encerramento coordenado** (`internal/lifecycle`): um único prazo global (`SHUTDOWN_TIMEOUT`, 20 s) com **drenagem de no máximo 12 s**
+  (`SHUTDOWN_DRAIN_TIMEOUT`) e uma **reserva compartilhada de pelo menos 8 s** — não concedida de novo a cada componente — para
+  cancelamento, cleanup e fechamento das dependências. Sequência: (1) **admissão fechada em todos os componentes ao mesmo tempo**: o servidor
+  fecha o listener e responde `503 SHUTTING_DOWN` a requisições novas (inclusive em conexões keep-alive), o worker deixa de buscar trabalho;
+  (2) **drenagem simultânea** do trabalho admitido; (3) no limite de drenagem, **cancelamento** do que restou (fecha as conexões e cancela o
+  contexto das requisições; cancela a tentativa do worker, cuja transação é desfeita); (4) **confirmação observável do término** de cada
+  componente (`Done`): o servidor só confirma quando o `http.Server` terminou **e** todos os handlers retornaram — o fim do `Serve`, sozinho,
+  não prova isso, e cancelar um contexto não prova o fim de uma goroutine; (5) só então o Fx executa os `OnStop` das dependências em ordem
+  inversa (verificador, SQS, pool). Se algum componente não confirmar até o prazo global menos uma margem de 1 s, o encerramento é registrado
+  como **incompleto** (erro e log) e a recuperação fica a cargo do estado durável; não se declara término normal sem confirmação. O fechamento do
+  pool nunca prende o encerramento além do prazo (`pgxpool.Close` espera conexões devolvidas). O *rollback* de uma transação cancelada usa um
+  prazo próprio de 5 s que, durante o encerramento, **respeita o orçamento restante** (`Store.SetShutdownDeadline`). `docker compose` usa
+  `stop_grace_period: 25s` para não enviar `SIGKILL` antes do fim do prazo de 20 s. `SIGTERM` com saída 0 testado em 3 processos; `SIGKILL`
+  não depende de hook: a pendência aceita e o movimento confirmado se recuperam pelo estado durável (testado).
   Nota: o `net/http` só trata como ociosas conexões novas sem requisição após 5 s, então um cliente que deixa
-  conexões abertas pode alongar o shutdown em até 5 s (dentro do prazo).
-* Não há workers neste incremento, logo nada de "worker vazio"; quando existirem, entrarão como hooks próprios,
-  parados antes do pool.
+  conexões abertas pode alongar a drenagem em até 5 s (dentro do prazo).
+* Configuração validada na composição (`Config.Validate`, também para configurações montadas diretamente): `SHUTDOWN_DRAIN_TIMEOUT` menor que
+  `SHUTDOWN_TIMEOUT`; `REFERENCE_BACKOFF_INITIAL` ≤ `REFERENCE_BACKOFF_MAX` e ≤ `REFERENCE_TTL`; `REFERENCE_PHASE_TIMEOUT` menor que o
+  prazo de shutdown; todos os prazos positivos; `REFERENCE_WORKERS` ∈ {0, 1}. Pool inicial: 10 conexões por processo.
 
 ## 12. Observabilidade
 
@@ -405,7 +475,8 @@ espera/retenção pelo lock, dados preservados, reversão/reaplicação e partid
 * Health: `/health/live` (processo) e `/health/ready` (PostgreSQL `Ping` + SQS `GetQueueUrl`, em paralelo, prazo de 2 s;
   503 se qualquer um falhar). O IdP não entra na readiness (o JWKS fica em cache; falha dele aparece como 401).
 * **Pendente**: métricas (resultados por status, duplicatas, retries, DLQ, conflitos de concorrência, atraso da outbox,
-  latência, divergências de reconciliação) e tracing.
+  latência, divergências de reconciliação) e tracing. O worker de referências registra em log (`transactionId`, `walletId`, `providerId`,
+  `kind`, `status`, `failureCode`) cada pendência concluída e cada tentativa abortada.
 
 ## 13. Interpretações adotadas (resumo)
 
@@ -419,15 +490,21 @@ espera/retenção pelo lock, dados preservados, reversão/reaplicação e partid
 6. Replay de `REJECTED` responde `422` com `idempotentReplay:true` (mesmo status do original).
 7. Serviço interno pode ler qualquer transação; provedor só as suas.
 8. `GET …/ledger` e `POST …/reconciliation` respondem `501` após autorização.
+9. Reversões: uma reversão bem-sucedida por movimento alvo em todo o histórico (§8); o TTL das referências conta da primeira persistência e
+   não é renovado; uma referência `PROCESSED` resolve mesmo depois do TTL; referência de outro provedor nunca é consultada.
 
 ## 14. Limitações e trabalho não concluído
 
-Ver "Escopo e pendências" no README. Em síntese: `REFUND/ROLLBACK` e `WIN` com referência, política de reversões (§8), SQS + inbox,
-publicador de outbox, worker de referências, paginação do ledger, reconciliação, métricas, e a prova com três processos
-para fluxos SQS/outbox. A prova com três processos **existe para o fluxo HTTP implementado** (`multiprocess_test.go`).
+Ver "Escopo e pendências" no README. Em síntese, **ainda ausentes**: SQS + inbox (consumidor, retry/DLQ, produtor autorizado), publicador
+de outbox, paginação do ledger, reconciliação, métricas, o controle de acesso do broker (a troca de LocalStack por MiniStack está
+**pendente de decisão**, ver README), e a prova com três processos para os fluxos SQS/outbox. A prova com três processos **existe** para
+HTTP (apostas, WIN/LOSS) e para reversões e pendências com o worker real (`references_multiprocess_test.go`).
 
 Limites das garantias atuais (detalhes nas seções indicadas): dono do schema e superusuários podem desabilitar triggers — a aplicação
-nunca roda com eles (§10.1); o `result_balance` de `LOSS` não é verificável contra o ledger e o sentido do lançamento de `ROLLBACK`
-só será imposto com o processamento de reversões (§10.2); a regressão de relógio entre instâncias é recusada pelo domínio e tratada
-por quem chama a transição (§3); a rotação de chaves do IdP pode causar 401 por até 30 s (§9). A política de combinações
-`REFUND`/`ROLLBACK` continua **em aberto** (§8).
+nunca roda com eles (§10.1); o `result_balance` de `LOSS` não é verificável contra o ledger (§10.2); a regressão de relógio entre instâncias
+é recusada pelo domínio e tratada por quem chama a transição (§3, §8); a rotação de chaves do IdP pode causar 401 por até 30 s (§9). Da
+política de reversões (§8): o `ROLLBACK` da BET depois do `ROLLBACK` do REFUND é recusado (escolha de contrato, não de viabilidade
+financeira). Das pendências: o TTL e o backoff usam o relógio da aplicação (diferença entre instâncias desloca o prazo, nunca o renova); uma
+carteira continuamente ocupada pode adiar a retomada (a varredura a pula, `SKIP LOCKED`); o worker não tem lease (a exclusão é pelos locks
+e pela revalidação). Dos testes: o harness de processos reais compila o binário **sem `-race`** — `go test -race` do processo pai não
+instrumenta os filhos (adaptação prevista para a consolidação final). A reversão da migration 00005 descarta a agenda de pendências.

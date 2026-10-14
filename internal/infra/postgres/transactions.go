@@ -46,6 +46,32 @@ func (r transactionRepo) Insert(ctx context.Context, t *domain.WagerTransaction)
 	return classify(err)
 }
 
+func (r transactionRepo) Update(ctx context.Context, t *domain.WagerTransaction, from domain.Status) error {
+	var result *int64
+	if rb := t.ResultBalance(); rb.IsInitialized() {
+		m := rb.Minor()
+		result = &m
+	}
+	tag, err := r.q.Exec(ctx, `UPDATE wager_transactions
+		SET status = $2, failure_code = $3, result_balance = $4, reference_transaction_id = $5, updated_at = $6
+		WHERE id = $1 AND status = $7`,
+		t.ID(), string(t.Status()), nullable(string(t.FailureCode())), result, t.ReferenceTransactionID(), t.UpdatedAt(), string(from))
+	if err != nil {
+		return classify(err)
+	}
+	if tag.RowsAffected() != 1 {
+		return app.ErrConcurrentModification
+	}
+	return nil
+}
+
+func (r transactionRepo) HasProcessedReversal(ctx context.Context, targetID uuid.UUID) (bool, error) {
+	var exists bool
+	err := r.q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM wager_transactions
+		WHERE reference_transaction_id = $1 AND kind IN ('REFUND', 'ROLLBACK') AND status = 'PROCESSED')`, targetID).Scan(&exists)
+	return exists, classify(err)
+}
+
 func (r transactionRepo) GetByID(ctx context.Context, id uuid.UUID) (*domain.WagerTransaction, error) {
 	return r.get(ctx, `SELECT `+txColumns+` FROM wager_transactions WHERE id = $1`, id)
 }

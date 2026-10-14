@@ -249,6 +249,18 @@ func TestTransactionPendingReferencePath(t *testing.T) {
 	if err := tx.AwaitReference(testNow); !errors.Is(err, ErrInvalidTransition) {
 		t.Errorf("await twice: %v", err)
 	}
+	// Concluir exige a referência resolvida.
+	if err := tx.Process(mustMoney(t, "125.00", "BRL"), testNow); !errors.Is(err, ErrInvalidTransition) || tx.Status() != StatusPendingReference {
+		t.Fatalf("process without a resolved reference: %v", err)
+	}
+	betRaw := rawBet()
+	betRaw.ExternalTransactionID, betRaw.IdempotencyKey = "bet-1", "key-bet-1"
+	betReq, _ := NewExternalRequest(betRaw)
+	bet, _ := NewExternalTransaction(uuid.New(), betReq, testNow)
+	_ = bet.Process(mustMoney(t, "100.00", "BRL"), testNow)
+	if err := tx.ResolveReference(bet, testNow); err != nil {
+		t.Fatal(err)
+	}
 	if err := tx.Process(mustMoney(t, "125.00", "BRL"), testNow); err != nil || tx.Status() != StatusProcessed {
 		t.Fatalf("resolve: %v", err)
 	}

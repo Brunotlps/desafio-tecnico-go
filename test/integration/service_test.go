@@ -128,12 +128,7 @@ func TestServiceSubmitBet(t *testing.T) {
 	if _, err := svc.Submit(ctx, rawBet(wallet, uuid.NewString(), id("k5"), id("t5"), "1.00"), "c"); !errors.Is(err, app.ErrWalletMismatch) {
 		t.Errorf("new operation, wrong player: %v", err)
 	}
-	// Tipos sem processamento e entradas inválidas não gravam nada.
-	win := rawBet(wallet, player, id("k6"), id("t6"), "1.00")
-	win.Kind, win.ReferenceExternalTransactionID = "WIN", "some-bet"
-	if _, err := svc.Submit(ctx, win, "c"); !errors.Is(err, app.ErrKindNotSupported) {
-		t.Errorf("WIN with a reference: %v", err)
-	}
+	// Entradas inválidas não gravam nada.
 	opening := rawBet(wallet, player, id("k7"), id("t7"), "1.00")
 	opening.Kind = "OPENING"
 	if _, err := svc.Submit(ctx, opening, "c"); !errors.Is(err, domain.ErrKindNotAllowed) {
