@@ -105,12 +105,35 @@ type WagerTransactionState struct {
 	UpdatedAt              time.Time
 }
 
+// Política temporal (criação, transições e reidratação): createdAt e updatedAt
+// não são nulos, updatedAt >= createdAt e updatedAt nunca regride. Uma transição
+// só é aplicada com um instante que a respeita; caso contrário é recusada, sem
+// efeito, com ErrInvalidTimestamp (um ErrInvalidTransaction). O instante igual
+// ao da última atualização é válido: etapas do mesmo commit usam o mesmo relógio.
+// Uma instância com relógio atrasado em relação à última atualização gravada por
+// outra instância deve repetir a transição mais tarde ou informar, como instante,
+// o maior entre o seu relógio e UpdatedAt(); o domínio nunca ajusta o instante
+// silenciosamente.
+func checkTimestamps(createdAt, updatedAt time.Time) error {
+	switch {
+	case createdAt.IsZero() || updatedAt.IsZero():
+		return fmt.Errorf("%w: %w: zero timestamp", ErrInvalidTransaction, ErrInvalidTimestamp)
+	case updatedAt.Before(createdAt):
+		return fmt.Errorf("%w: %w: updatedAt %s precedes createdAt %s", ErrInvalidTransaction, ErrInvalidTimestamp,
+			updatedAt.UTC().Format(time.RFC3339Nano), createdAt.UTC().Format(time.RFC3339Nano))
+	}
+	return nil
+}
+
 // NewExternalTransaction cria uma transação externa em PENDING. A requisição é
 // revalidada (incluindo a coerência entre campos e hash): um valor zero ou
 // alterado de outra forma nunca produz uma transação.
 func NewExternalTransaction(id uuid.UUID, req ExternalRequest, now time.Time) (*WagerTransaction, error) {
-	if id == uuid.Nil || now.IsZero() {
+	if id == uuid.Nil {
 		return nil, fmt.Errorf("%w: incomplete external transaction", ErrInvalidTransaction)
+	}
+	if err := checkTimestamps(now, now); err != nil {
+		return nil, err
 	}
 	if err := req.check(); err != nil {
 		return nil, err
@@ -131,8 +154,11 @@ func NewExternalTransaction(id uuid.UUID, req ExternalRequest, now time.Time) (*
 // NewOpeningTransaction cria a transação interna OPENING em PENDING. Só existe
 // para saldo inicial positivo.
 func NewOpeningTransaction(id, walletID, playerID uuid.UUID, initial Money, now time.Time) (*WagerTransaction, error) {
-	if id == uuid.Nil || walletID == uuid.Nil || playerID == uuid.Nil || now.IsZero() {
+	if id == uuid.Nil || walletID == uuid.Nil || playerID == uuid.Nil {
 		return nil, fmt.Errorf("%w: incomplete opening transaction", ErrInvalidTransaction)
+	}
+	if err := checkTimestamps(now, now); err != nil {
+		return nil, err
 	}
 	if err := KindOpening.ValidateAmount(initial); err != nil {
 		return nil, err
@@ -158,8 +184,8 @@ func RehydrateWagerTransaction(s WagerTransactionState) (*WagerTransaction, erro
 	if !s.Status.valid() {
 		return nil, invalid("status %q", s.Status)
 	}
-	if s.CreatedAt.IsZero() || s.UpdatedAt.IsZero() || s.UpdatedAt.Before(s.CreatedAt) {
-		return nil, invalid("inconsistent timestamps")
+	if err := checkTimestamps(s.CreatedAt, s.UpdatedAt); err != nil {
+		return nil, err
 	}
 	if !s.Money.IsInitialized() {
 		return nil, ErrUninitializedMoney
@@ -287,7 +313,9 @@ func (t *WagerTransaction) External() *ExternalMeta {
 	return &ext
 }
 
-func (t *WagerTransaction) transition(to Status, now time.Time) error {
+// checkTransition valida a transição para `to` no instante `now` sem alterar a
+// entidade: estado de origem, destino permitido e política temporal.
+func (t *WagerTransaction) checkTransition(to Status, now time.Time) error {
 	if t.status.IsTerminal() {
 		return fmt.Errorf("%w: %s", ErrTerminalTransaction, t.status)
 	}
@@ -296,6 +324,23 @@ func (t *WagerTransaction) transition(to Status, now time.Time) error {
 	case t.status == StatusPendingReference && (to == StatusProcessed || to == StatusRejected || to == StatusFailed):
 	default:
 		return fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, t.status, to)
+	}
+	return checkTimestamps(t.createdAt, now) // zero ou anterior à criação
+}
+
+// checkAfterUpdate garante que o histórico não regride: o instante da transição
+// não pode preceder a última atualização.
+func (t *WagerTransaction) checkAfterUpdate(now time.Time) error {
+	return checkTimestamps(t.updatedAt, now)
+}
+
+// transitionTo valida e aplica a mudança de estado; nada é alterado se falhar.
+func (t *WagerTransaction) transitionTo(to Status, now time.Time) error {
+	if err := t.checkTransition(to, now); err != nil {
+		return err
+	}
+	if err := t.checkAfterUpdate(now); err != nil {
+		return err
 	}
 	t.status = to
 	t.updatedAt = now.UTC()
@@ -307,7 +352,7 @@ func (t *WagerTransaction) Process(balance Money, now time.Time) error {
 	if err := t.checkBalance(balance); err != nil {
 		return err
 	}
-	if err := t.transition(StatusProcessed, now); err != nil {
+	if err := t.transitionTo(StatusProcessed, now); err != nil {
 		return err
 	}
 	t.resultBalance = balance
@@ -323,7 +368,7 @@ func (t *WagerTransaction) Reject(code FailureCode, balance Money, now time.Time
 	if err := t.checkBalance(balance); err != nil {
 		return err
 	}
-	if err := t.transition(StatusRejected, now); err != nil {
+	if err := t.transitionTo(StatusRejected, now); err != nil {
 		return err
 	}
 	t.failureCode = code
@@ -336,7 +381,7 @@ func (t *WagerTransaction) AwaitReference(now time.Time) error {
 	if t.kind.referencePolicy() == referenceForbidden || t.external == nil || t.external.ReferenceExternalTransactionID == "" {
 		return fmt.Errorf("%w: %s has no reference to wait for", ErrInvalidTransition, t.kind)
 	}
-	return t.transition(StatusPendingReference, now)
+	return t.transitionTo(StatusPendingReference, now)
 }
 
 // Fail registra falha permanente de infraestrutura para auditoria.
@@ -344,7 +389,7 @@ func (t *WagerTransaction) Fail(code FailureCode, now time.Time) error {
 	if !failureCodeRe.MatchString(string(code)) {
 		return fmt.Errorf("%w: failure code %q", ErrInvalidTransaction, code)
 	}
-	if err := t.transition(StatusFailed, now); err != nil {
+	if err := t.transitionTo(StatusFailed, now); err != nil {
 		return err
 	}
 	t.failureCode = code
