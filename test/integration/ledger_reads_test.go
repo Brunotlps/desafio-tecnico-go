@@ -405,3 +405,59 @@ func TestLedgerWalkUnderParallelWritersNeverSkipsOrRepeats(t *testing.T) {
 		}
 	}
 }
+
+// Uma query malformada nunca é consumida pela metade: o parsing explícito recusa a requisição inteira (400 INVALID_QUERY, sem
+// dados) antes de chamar o serviço. r.URL.Query() descartaria o par inválido e a API devolveria o ledger com os defaults.
+func TestLedgerRejectsAMalformedRawQueryWithoutData(t *testing.T) {
+	a := startApp(t, testConfig())
+	tok := token(t, "internal-service")
+	w := openWallet(t, a, "100.00")
+	submitBET(t, a, w, "1.00")
+	submitBET(t, a, w, "2.00") // OPENING + 2 BETs = 3 lançamentos
+	cursor := pageOf(t, getLedger(t, a, tok, w.ID, url.Values{"limit": {"1"}})).next
+	if cursor == "" {
+		t.Fatal("setup: no cursor")
+	}
+	before := stateOf(t, w.ID)
+	for _, q := range []string{
+		"limit=%ZZ",
+		"cursor=%ZZ",
+		"limit=1&limit=%ZZ",
+		"cursor=%ZZ&limit=1",
+		"limit=1;cursor=garbage",
+		"cursor=garbage;limit=1",
+		"cursor=" + cursor + "&cursor=%ZZ",
+		"limit=2&unrelated=%ZZ",
+		"%ZZ=1",
+		"limit=2;",
+	} {
+		r := call(t, a.URL, "GET", "/wallets/"+w.ID+"/ledger?"+q, tok, nil, nil)
+		if r.Status != http.StatusBadRequest || r.str("code") != "INVALID_QUERY" {
+			t.Errorf("?%s: %d %s, want 400 INVALID_QUERY", q, r.Status, r.Raw)
+		}
+		if strings.Contains(r.Raw, "items") || strings.Contains(r.Raw, "nextCursor") || strings.Contains(r.Raw, w.ID) {
+			t.Errorf("?%s: an error must carry no ledger data: %s", q, r.Raw)
+		}
+	}
+	// Escapes VÁLIDOS continuam funcionando (inclusive o cursor), e parâmetros ausentes valem o default.
+	if p := pageOf(t, call(t, a.URL, "GET", "/wallets/"+w.ID+"/ledger?limit=%32&cursor="+cursor, tok, nil, nil)); len(p.ids) != 2 || p.next != "" {
+		t.Errorf("valid escapes: %v %q", p.ids, p.next)
+	}
+	if p := pageOf(t, getLedger(t, a, tok, w.ID, nil)); len(p.ids) != 3 {
+		t.Errorf("defaults: %v", p.ids)
+	}
+	// As recusas de entrada continuam as de antes (sem regressão do código estável por causa do novo parsing).
+	if r := call(t, a.URL, "GET", "/wallets/"+w.ID+"/ledger?limit=1&limit=2", tok, nil, nil); r.Status != 400 || r.str("code") != "INVALID_LIMIT" {
+		t.Errorf("repeated limit: %d %s", r.Status, r.Raw)
+	}
+	if after := stateOf(t, w.ID); after != before {
+		t.Errorf("rejected requests changed state: %s -> %s", before, after)
+	}
+	// A autenticação continua antes de tudo: sem token, a query malformada é 401 (não 400).
+	if r := call(t, a.URL, "GET", "/wallets/"+w.ID+"/ledger?limit=%ZZ", "", nil, nil); r.Status != 401 {
+		t.Errorf("anonymous with a malformed query: %d %s", r.Status, r.Raw)
+	}
+	if r := call(t, a.URL, "GET", "/wallets/"+w.ID+"/ledger?limit=%ZZ", token(t, "provider-a"), nil, nil); r.Status != 403 {
+		t.Errorf("provider with a malformed query: %d %s", r.Status, r.Raw)
+	}
+}

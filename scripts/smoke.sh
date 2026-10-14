@@ -96,6 +96,7 @@ expect "ledger page 2" "$P2" 200 '(.items | length) == 2 and (.nextCursor | type
 C2=$(jq -er .nextCursor <<<"${P2#* }")
 expect "ledger last page has no nextCursor" "$(req GET "/wallets/$WID/ledger?limit=2&cursor=$C2" "$INTERNAL")" 200 '(.items | length) == 1 and (has("nextCursor") | not)'
 expect "invalid cursor" "$(req GET "/wallets/$WID/ledger?cursor=nope" "$INTERNAL")" 400 '.code == "INVALID_CURSOR"'
+expect "malformed query is rejected" "$(req GET "/wallets/$WID/ledger?limit=%ZZ" "$INTERNAL")" 400 '.code == "INVALID_QUERY" and (has("items") | not)'
 expect "limit above the maximum" "$(req GET "/wallets/$WID/ledger?limit=101" "$INTERNAL")" 400 '.code == "INVALID_LIMIT"'
 expect "reconciliation is consistent" "$(req POST "/wallets/$WID/reconciliation" "$INTERNAL")" 200 \
   '.consistent == true and .storedBalance.amount == "100.00" and .calculatedBalance.amount == "100.00" and .difference.amount == "0.00" and .checkedEntries == 5'
