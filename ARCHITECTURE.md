@@ -120,15 +120,21 @@ técnica** ou **pendência**. O estado de implementação está no fim e no READ
 
 **Fluxo de `Submit`** (uma transação SQL):
 
-1. Valida e normaliza (`NewExternalRequest`); tipo ≠ `BET` → `ErrKindNotSupported` (nada é gravado).
+1. Analisa, valida e **normaliza** a entrada (`NewExternalRequest`): entradas estruturalmente inválidas (tipo desconhecido ou `OPENING`,
+   valor/moeda malformados, política de zero e de referência por tipo, identificadores) são recusadas aqui, mesmo que a identidade
+   exista. Nada que dependa de política ou de estado é avaliado ainda.
 2. **Identidade primeiro**, sem lock, numa **única consulta** (`FindByIdentity`: chave *ou* id externo, um snapshot — duas
    consultas separadas poderiam ver um commit concorrente pela metade e reportar conflito para um reenvio legítimo).
    Mesma chave: hash igual → **replay** do resultado persistido (`idempotentReplay:true`, saldo **original**, inclusive para
    `REJECTED`); hash diferente → 409 `IDEMPOTENCY_KEY_REUSED`. Só o id externo coincide (outra chave) → 409
-   `EXTERNAL_TRANSACTION_ALREADY_REGISTERED`. Isto vem **antes** de qualquer validação que dependa do estado atual: reutilizar
-   a chave com carteira inexistente, jogador ou moeda diferentes é conflito (409), não 404/422, e um replay legítimo não
-   depende da carteira. A busca é sempre no escopo do provedor autenticado.
-3. Operação nova: `GetForUpdate(walletId)`; inexistente → 404; jogador/moeda divergentes → 422 (erros de **entrada**, não gravados).
+   `EXTERNAL_TRANSACTION_ALREADY_REGISTERED`. Isto vem **antes** de qualquer política de operação nova e de qualquer validação que
+   dependa do estado atual: reutilizar a chave com moeda não habilitada (EUR numa aplicação BRL), com outro tipo (`BET` → `WIN`,
+   `LOSS`, `REFUND`, `ROLLBACK`), carteira inexistente, jogador ou moeda diferentes é conflito (409), não 422/501/404, e um replay
+   legítimo não depende da carteira nem da configuração atual de moedas. A busca é sempre no escopo do provedor autenticado
+   (autenticação e autorização antecedem tudo e não mudam).
+2b. **Políticas de operação nova** (só se a identidade não existe), nesta ordem: moeda habilitada (422 `CURRENCY_NOT_SUPPORTED`) e tipo
+   com processamento implementado (501 `KIND_NOT_SUPPORTED`, nada é gravado).
+3. `GetForUpdate(walletId)`; inexistente → 404; jogador/moeda divergentes → 422 (erros de **entrada**, não gravados).
 4. Com a carteira travada, repete o passo 2 (uma operação concorrente da mesma carteira pode ter confirmado entre os passos).
 5. Aplica a regra (débito ou rejeição), grava carteira (CAS), transação, ledger e outbox, e confirma.
 6. Se uma unicidade do banco dispara no INSERT (mesma identidade aplicada a **outra** carteira, portanto sem disputar o lock),

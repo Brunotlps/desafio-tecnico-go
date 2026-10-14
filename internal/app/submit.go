@@ -22,18 +22,20 @@ type SubmitResult struct {
 // e confirma transação, saldo, lançamento e eventos da outbox. O PENDING não
 // é confirmado isoladamente; sem dependências, a operação nasce já concluída.
 //
-// Somente BET está implementado. Os demais tipos válidos devolvem
-// ErrKindNotSupported sem persistir nada.
+// Ordem das decisões: (1) a entrada é analisada e normalizada, e entradas
+// estruturalmente inválidas são recusadas; (2) a identidade já registrada
+// (chave de idempotência ou id externo, no escopo do provedor) é resolvida como
+// replay ou conflito; (3) só então valem as políticas de uma operação NOVA —
+// moeda habilitada e tipo processado — e as validações que dependem da carteira.
+// Assim uma chave registrada reenviada com outra moeda ou outro tipo é conflito
+// (409), não 422/501.
+//
+// Somente BET está implementado. Os demais tipos válidos, quando a operação é
+// nova, devolvem ErrKindNotSupported sem persistir nada.
 func (s *Service) Submit(ctx context.Context, raw domain.RawExternalRequest, correlationID string) (SubmitResult, error) {
 	req, err := domain.NewExternalRequest(raw)
 	if err != nil {
 		return SubmitResult{}, err
-	}
-	if err := s.checkCurrency(req.Money().Currency()); err != nil {
-		return SubmitResult{}, err
-	}
-	if req.Kind() != domain.KindBet {
-		return SubmitResult{}, fmt.Errorf("%w: %s", ErrKindNotSupported, req.Kind())
 	}
 	for attempt := 0; ; attempt++ {
 		res, err := s.submitOnce(ctx, req, correlationID)
@@ -65,7 +67,13 @@ func (s *Service) submitOnce(ctx context.Context, req domain.ExternalRequest, co
 			return err
 		}
 
-		// 2. Operação nova: trava a carteira e valida a entrada contra ela.
+		// 2. Operação nova: políticas da aplicação (moeda habilitada, tipo processado).
+		// Nada foi gravado ainda; a transação é desfeita sem efeito.
+		if err := s.checkNewOperation(req); err != nil {
+			return err
+		}
+
+		// 3. Trava a carteira e valida a entrada contra ela.
 		wallet, err := r.Wallets.GetForUpdate(ctx, req.WalletID())
 		if err != nil {
 			return err
@@ -74,7 +82,7 @@ func (s *Service) submitOnce(ctx context.Context, req domain.ExternalRequest, co
 			return ErrWalletMismatch
 		}
 
-		// 3. Com a carteira travada, repete a resolução: uma operação concorrente da
+		// 4. Com a carteira travada, repete a resolução: uma operação concorrente da
 		// mesma carteira pode ter confirmado entre os passos 1 e 2. Operações de
 		// carteiras diferentes com a mesma identidade são resolvidas pelas
 		// unicidades do banco (ver Submit).
@@ -121,6 +129,19 @@ func (s *Service) submitOnce(ctx context.Context, req domain.ExternalRequest, co
 	}
 	s.logResult(ctx, result, correlationID)
 	return result, nil
+}
+
+// checkNewOperation aplica as políticas de uma operação nova, nesta ordem: moeda
+// habilitada (ErrCurrencyNotSupported) e tipo com processamento implementado
+// (ErrKindNotSupported). Só é chamada depois de resolver a identidade existente.
+func (s *Service) checkNewOperation(req domain.ExternalRequest) error {
+	if err := s.checkCurrency(req.Money().Currency()); err != nil {
+		return err
+	}
+	if req.Kind() != domain.KindBet {
+		return fmt.Errorf("%w: %s", ErrKindNotSupported, req.Kind())
+	}
+	return nil
 }
 
 // resolveExisting consulta as identidades da operação, sempre no escopo do
