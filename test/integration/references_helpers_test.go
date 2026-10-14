@@ -157,3 +157,13 @@ type wrappedUoW struct {
 func (w wrappedUoW) Do(ctx context.Context, fn func(context.Context, app.Repositories) error) error {
 	return w.do(ctx, w.UnitOfWork, fn)
 }
+
+// refBody monta o corpo HTTP de uma operação com referência (REFUND, ROLLBACK ou WIN).
+func refBody(w wallet, provider, ext, kind, amount, ref string) map[string]any {
+	b := betBody(w, provider, ext, amount)
+	b["kind"] = kind
+	if ref != "" {
+		b["referenceExternalTransactionId"] = ref
+	}
+	return b
+}

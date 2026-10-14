@@ -69,7 +69,10 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-func startProc(t *testing.T, name string) *proc {
+func startProc(t *testing.T, name string) *proc { return startProcEnv(t, name) }
+
+// startProcEnv inicia um processo real da API; extra (CHAVE=valor) sobrescreve o ambiente padrão.
+func startProcEnv(t *testing.T, name string, extra ...string) *proc {
 	t.Helper()
 	port := freePort(t)
 	p := &proc{name: name, URL: fmt.Sprintf("http://127.0.0.1:%d", port), out: &bytes.Buffer{}, appName: name + "-" + uuid.NewString()[:6], done: make(chan struct{})}
@@ -80,7 +83,9 @@ func startProc(t *testing.T, name string) *proc {
 		"DB_MAX_CONNS=10", "LOG_LEVEL=warn", "SHUTDOWN_TIMEOUT=15s", "ALLOWED_CURRENCIES=BRL",
 		"OIDC_ISSUER="+env.issuer, "OIDC_JWKS_URL="+env.jwksURL, "OIDC_AUDIENCE=wager-api", "OIDC_CLOCK_SKEW=1s",
 		"AWS_ENDPOINT_URL="+env.awsEndpoint, "SQS_WAGER_QUEUE_NAME=wager-transactions.fifo",
+		"REFERENCE_WORKERS=0", // o worker é ligado só pelos testes que o exercitam
 	)
+	p.cmd.Env = append(p.cmd.Env, extra...)
 	p.cmd.Stdout, p.cmd.Stderr = p.out, p.out
 	if err := p.cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -115,10 +120,12 @@ func startProc(t *testing.T, name string) *proc {
 	return nil
 }
 
-func startCluster(t *testing.T, n int) []*proc {
+func startCluster(t *testing.T, n int) []*proc { return startClusterEnv(t, n) }
+
+func startClusterEnv(t *testing.T, n int, extra ...string) []*proc {
 	procs := make([]*proc, n)
 	for i := range procs {
-		procs[i] = startProc(t, fmt.Sprintf("api%d", i+1))
+		procs[i] = startProcEnv(t, fmt.Sprintf("api%d", i+1), extra...)
 	}
 	return procs
 }

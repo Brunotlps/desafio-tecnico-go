@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Teste de fumaça ponta a ponta contra a API em execução (Docker Compose): autenticação real,
-# abertura de carteira, BET aceita/rejeitada, replay, conflito e isolamento entre provedores.
+# abertura de carteira, BET aceita/rejeitada, replay, conflito, isolamento entre provedores, reversões
+# (REFUND/ROLLBACK, uma por alvo) e uma referência pendente concluída pelo worker de referências.
 #
 #   docker compose up --build -d && scripts/smoke.sh
 #
@@ -64,4 +65,24 @@ TXID=$(jq -er .transactionId <<<"${R1#* }")
 expect "provider-a reads its transaction" "$(req GET "/wagering/transactions/$TXID" "$PA")" 200 '.status == "PROCESSED"'
 expect "provider-b does not see it" "$(req GET "/wagering/transactions/$TXID" "$PB")" 404
 expect "provider-b cannot query provider-a's namespace" "$(req GET "/providers/provider-a/wagering/transactions/t1-$RUN" "$PB")" 403
+
+# --- Reversões e referências pendentes -------------------------------------------------------------
+op() { # chave id-externo tipo valor referência [token]
+  req POST /wagering/transactions "${6:-$PA}" "$1" "{\"providerId\":\"provider-a\",\"externalTransactionId\":\"$2\",\"playerId\":\"$PLAYER\",\"walletId\":\"$WID\",\"roundId\":\"r\",\"gameId\":\"g\",\"kind\":\"$3\",\"money\":{\"amount\":\"$4\",\"currency\":\"BRL\"},\"referenceExternalTransactionId\":\"$5\"}"
+}
+expect "REFUND of the 80.00 BET" "$(op "kr-$RUN" "tr-$RUN" REFUND 80.00 "t1-$RUN")" 200 '.status == "PROCESSED" and .balance.amount == "100.00"'
+expect "a second reversal of the same BET is rejected" "$(op "kx-$RUN" "tx-$RUN" ROLLBACK 80.00 "t1-$RUN")" 422 '.failureCode == "ALREADY_REVERSED" and .balance.amount == "100.00"'
+expect "reversal with another amount" "$(op "km-$RUN" "tm-$RUN" REFUND 79.00 "t1-$RUN")" 422 '.failureCode == "REFERENCE_MISMATCH"'
+PEND=$(op "kp-$RUN" "tp-$RUN" REFUND 10.00 "late-$RUN")
+expect "REFUND before its BET stays pending (202, no balance)" "$PEND" 202 '.status == "PENDING_REFERENCE" and (has("balance") | not)'
+PID=$(jq -er .transactionId <<<"${PEND#* }")
+expect "replay of the pending operation" "$(op "kp-$RUN" "tp-$RUN" REFUND 10.00 "late-$RUN")" 202 '.idempotentReplay == true and .transactionId == "'"$PID"'"'
+expect "the referenced BET arrives" "$(bet "kl-$RUN" "late-$RUN" 10.00)" 200 '.balance.amount == "90.00"'
+for _ in $(seq 1 40); do
+  S=$(req GET "/wagering/transactions/$PID" "$PA")
+  [ "$(jq -r .status <<<"${S#* }")" = "PROCESSED" ] && break
+  sleep 1
+done
+expect "the worker resolved the pending REFUND" "$S" 200 '.status == "PROCESSED" and .balance.amount == "100.00"'
+expect "final wallet balance" "$(req GET "/wallets/$WID" "$INTERNAL")" 200 '.balance.amount == "100.00"'
 echo "smoke OK"
