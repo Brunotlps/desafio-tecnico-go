@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -166,54 +167,125 @@ func (m *Migrator) preserveSchedule(ctx context.Context) (restore func() error, 
 	}
 
 	// 2. A cópia: nunca substitui o original por um estado reconstruído.
-	var copyExists bool
-	if err := tx.QueryRowContext(ctx, `SELECT to_regclass('public.pending_references_preserved') IS NOT NULL`).Scan(&copyExists); err != nil {
+	copyExists, sameTable, err := scheduleCopyState(ctx, tx)
+	if err != nil {
 		return nil, err
 	}
-	refresh := !copyExists
-	if copyExists {
-		var sameTable bool
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(obj_description('public.pending_references'::regclass, 'pg_class') LIKE $1 || '%'
-				AND obj_description('public.pending_references'::regclass, 'pg_class') = obj_description('public.pending_references_preserved'::regclass, 'pg_class'), false)
-			OR (NOT EXISTS (SELECT `+scheduleColumns+` FROM pending_references EXCEPT SELECT `+scheduleColumns+` FROM pending_references_preserved)
-			    AND NOT EXISTS (SELECT `+scheduleColumns+` FROM pending_references_preserved EXCEPT SELECT `+scheduleColumns+` FROM pending_references))`,
-			tokenPrefix).Scan(&sameTable); err != nil {
-			return nil, fmt.Errorf("compare the schedule with the preserved copy: %w", err)
+	if !copyExists || sameTable {
+		if err := refreshCopy(ctx, tx); err != nil {
+			return nil, err
 		}
-		refresh = sameTable
-	}
-	if refresh {
-		token := tokenPrefix + uuid.NewString()
-		for _, stmt := range []string{
-			`DROP TABLE IF EXISTS ` + preservedTable,
-			`CREATE TABLE ` + preservedTable + ` AS SELECT *, now() AS preserved_at FROM ` + scheduleTable,
-			`REVOKE ALL ON TABLE ` + preservedTable + ` FROM PUBLIC`,
-			`COMMENT ON TABLE ` + preservedTable + ` IS '` + token + `'`,
-			`COMMENT ON TABLE ` + scheduleTable + ` IS '` + token + `'`,
-		} {
-			if _, err := tx.ExecContext(ctx, stmt); err != nil {
-				return nil, fmt.Errorf("preserve the pending reference schedule before rolling back migration 00005: %w", err)
-			}
-		}
-	} else {
-		// A cópia é o original; a agenda viva deve ser só a reconstrução intacta da 00005.
-		var n int64
-		var ids string
-		if err := tx.QueryRowContext(ctx, `SELECT count(*), COALESCE(string_agg(transaction_id::text, ', ' ORDER BY transaction_id) FILTER (WHERE rn <= 5), '') FROM (
-				SELECT p.transaction_id, row_number() OVER (ORDER BY p.transaction_id) AS rn FROM pending_references p
-				WHERE NOT EXISTS (SELECT 1 FROM pending_references_preserved c WHERE c.transaction_id = p.transaction_id)
-				   OR p.attempts <> 0 OR p.completed_at IS NOT NULL OR p.last_attempt_at IS NOT NULL OR p.last_error IS NOT NULL) s`).Scan(&n, &ids); err != nil {
-			return nil, fmt.Errorf("compare the schedule with the preserved copy: %w", err)
-		}
-		if n > 0 {
-			return nil, refuse("%d schedule row(s) were created or changed after migration 00005 was reapplied on top of a preserved original copy "+
-				"(first ids: %s); rolling back would lose them. Resolve them manually (the preserved copy %s is untouched)", n, ids, "pending_references_preserved")
-		}
+	} else if msg, err := reconstructionDrift(ctx, tx); err != nil {
+		return nil, err
+	} else if msg != "" {
+		return nil, refuse("%s", msg)
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return func() error { return m.restoreScheduleGrants(grants) }, nil
+}
+
+// scheduleCopyState diz se existe a cópia e, se existir, se a agenda viva é a MESMA tabela que foi copiada (mesmo token em
+// COMMENT, ou conteúdo idêntico): nesse caso a reversão da 00005 nunca chegou a apagá-la e ela contém tudo; caso contrário a
+// agenda viva é a reconstrução criada pelo Up da 00005 e a cópia é o original.
+func scheduleCopyState(ctx context.Context, tx *sql.Tx) (copyExists, sameTable bool, err error) {
+	if err := tx.QueryRowContext(ctx, `SELECT to_regclass('public.pending_references_preserved') IS NOT NULL`).Scan(&copyExists); err != nil {
+		return false, false, err
+	}
+	if !copyExists {
+		return false, false, nil
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(obj_description('public.pending_references'::regclass, 'pg_class') LIKE $1 || '%'
+			AND obj_description('public.pending_references'::regclass, 'pg_class') = obj_description('public.pending_references_preserved'::regclass, 'pg_class'), false)
+		OR (NOT EXISTS (SELECT `+scheduleColumns+` FROM pending_references EXCEPT SELECT `+scheduleColumns+` FROM pending_references_preserved)
+		    AND NOT EXISTS (SELECT `+scheduleColumns+` FROM pending_references_preserved EXCEPT SELECT `+scheduleColumns+` FROM pending_references))`,
+		tokenPrefix).Scan(&sameTable); err != nil {
+		return false, false, fmt.Errorf("compare the schedule with the preserved copy: %w", err)
+	}
+	return true, sameTable, nil
+}
+
+// refreshCopy (re)grava a cópia a partir da agenda viva e marca as duas tabelas com um token novo.
+func refreshCopy(ctx context.Context, tx *sql.Tx) error {
+	token := tokenPrefix + uuid.NewString()
+	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS ` + preservedTable,
+		`CREATE TABLE ` + preservedTable + ` AS SELECT *, now() AS preserved_at FROM ` + scheduleTable,
+		`REVOKE ALL ON TABLE ` + preservedTable + ` FROM PUBLIC`,
+		`COMMENT ON TABLE ` + preservedTable + ` IS '` + token + `'`,
+		`COMMENT ON TABLE ` + scheduleTable + ` IS '` + token + `'`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("preserve the pending reference schedule before rolling back migration 00005: %w", err)
+		}
+	}
+	return nil
+}
+
+// reconstructionDrift verifica, com a cópia sendo o original, que a agenda viva é só a reconstrução intacta da 00005 (toda
+// linha existe na cópia, sem tentativas, diagnóstico nem conclusão). Devolve uma mensagem de recusa (com contagem e ids) se
+// houver algo que o restauro da cópia, ou o descarte da tabela, perderia; vazia se não houver.
+func reconstructionDrift(ctx context.Context, tx *sql.Tx) (string, error) {
+	var n int64
+	var ids string
+	if err := tx.QueryRowContext(ctx, `SELECT count(*), COALESCE(string_agg(transaction_id::text, ', ' ORDER BY transaction_id) FILTER (WHERE rn <= 5), '') FROM (
+			SELECT p.transaction_id, row_number() OVER (ORDER BY p.transaction_id) AS rn FROM pending_references p
+			WHERE NOT EXISTS (SELECT 1 FROM pending_references_preserved c WHERE c.transaction_id = p.transaction_id)
+			   OR p.attempts <> 0 OR p.completed_at IS NOT NULL OR p.last_attempt_at IS NOT NULL OR p.last_error IS NOT NULL) s`).Scan(&n, &ids); err != nil {
+		return "", fmt.Errorf("compare the schedule with the preserved copy: %w", err)
+	}
+	if n == 0 {
+		return "", nil
+	}
+	return fmt.Sprintf("%d schedule row(s) were created or changed after migration 00005 was reapplied on top of a preserved original copy "+
+		"(first ids: %s); proceeding would overwrite or lose them. Resolve them manually (the preserved copy pending_references_preserved is untouched)", n, ids), nil
+}
+
+// settleScheduleCopyBeforeUp é a decisão segura de Up/UpTo quando o schema está na versão 5 e a 00006 (que restaura a cópia por cima
+// da agenda) vai ser aplicada. Sob exclusão dos escritores:
+//   - sem cópia: nada a fazer;
+//   - a agenda viva é a MESMA tabela que foi copiada (um Down preparado foi cancelado ou falhou antes de apagá-la): ela contém tudo,
+//     inclusive o que o runtime confirmou depois; a cópia, defasada, seria restaurada por cima e perderia esse trabalho — é descartada;
+//   - a agenda viva é a reconstrução da 00005 e a cópia é o original: a restauração é o que se quer, desde que a reconstrução esteja
+//     intacta; se não, o Up é RECUSADO antes de qualquer perda.
+func (m *Migrator) settleScheduleCopyBeforeUp(ctx context.Context) error {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `SELECT to_regclass('public.pending_references') IS NOT NULL AND to_regclass('public.pending_references_preserved') IS NOT NULL`).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	for _, stmt := range []string{
+		`SET LOCAL lock_timeout = '30s'`,
+		`LOCK TABLE wallets, wager_transactions, pending_references IN SHARE ROW EXCLUSIVE MODE`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("settle the preserved pending reference schedule before applying migration 00006: %w", err)
+		}
+	}
+	_, sameTable, err := scheduleCopyState(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if sameTable {
+		for _, stmt := range []string{`DROP TABLE ` + preservedTable, `COMMENT ON TABLE ` + scheduleTable + ` IS NULL`} {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("discard the stale schedule copy: %w", err)
+			}
+		}
+	} else if msg, err := reconstructionDrift(ctx, tx); err != nil {
+		return err
+	} else if msg != "" {
+		return fmt.Errorf("refusing to apply migration 00006, nothing was changed: %s", msg)
+	}
+	return tx.Commit()
 }
 
 // restoreScheduleGrants devolve os privilégios revogados pela preparação quando a reversão não chegou a apagar a agenda

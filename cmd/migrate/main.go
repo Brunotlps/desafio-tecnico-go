@@ -19,6 +19,8 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/pressly/goose/v3"
+
 	"desafio-tecnico-go/internal/infra/postgres"
 )
 
@@ -51,7 +53,14 @@ func run(args []string) error {
 
 	switch args[0] {
 	case "up":
-		res, err := m.Up(ctx)
+		var res []*goose.MigrationResult
+		var err error
+		if role, ok := runtimeRoleFromEnv(); ok {
+			// O Up e a provisão dos privilégios formam uma única operação coordenada do migrador.
+			res, err = m.UpAndProvision(ctx, role)
+		} else {
+			res, err = m.Up(ctx)
+		}
 		for _, r := range res {
 			fmt.Printf("applied %s (%s)\n", r.Source.Path, r.Duration)
 		}
@@ -61,7 +70,10 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		return provisionRuntime(ctx, url, false)
+		if role, ok := runtimeRoleFromEnv(); ok {
+			fmt.Printf("runtime role %q provisioned with minimal privileges\n", role.Name)
+		}
+		return nil
 	case "down":
 		r, err := m.Down(ctx)
 		if r != nil {
@@ -82,7 +94,16 @@ func run(args []string) error {
 		}
 		return err
 	case "grants":
-		return provisionRuntime(ctx, url, true)
+		role, ok := runtimeRoleFromEnv()
+		if !ok {
+			return fmt.Errorf("RUNTIME_DB_ROLE is required")
+		}
+		// Coordenado com as demais operações do migrador: espera um Down em andamento e respeita o cancelamento.
+		if err := m.ProvisionRuntime(ctx, role); err != nil {
+			return err
+		}
+		fmt.Printf("runtime role %q provisioned with minimal privileges\n", role.Name)
+		return nil
 	case "status":
 		st, err := m.Status(ctx)
 		if err != nil {
@@ -100,19 +121,11 @@ func run(args []string) error {
 	return fmt.Errorf("unknown command %q", args[0])
 }
 
-// provisionRuntime cria o papel de runtime e aplica seus privilégios quando
-// RUNTIME_DB_ROLE está definido (obrigatório se required).
-func provisionRuntime(ctx context.Context, ownerURL string, required bool) error {
+// runtimeRoleFromEnv lê o papel de runtime de RUNTIME_DB_ROLE/RUNTIME_DB_PASSWORD (ok=false se não definido).
+func runtimeRoleFromEnv() (postgres.RuntimeRole, bool) {
 	name := os.Getenv("RUNTIME_DB_ROLE")
 	if name == "" {
-		if required {
-			return fmt.Errorf("RUNTIME_DB_ROLE is required")
-		}
-		return nil
+		return postgres.RuntimeRole{}, false
 	}
-	if err := postgres.ProvisionRuntimeRole(ctx, ownerURL, postgres.RuntimeRole{Name: name, Password: os.Getenv("RUNTIME_DB_PASSWORD")}); err != nil {
-		return err
-	}
-	fmt.Printf("runtime role %q provisioned with minimal privileges\n", name)
-	return nil
+	return postgres.RuntimeRole{Name: name, Password: os.Getenv("RUNTIME_DB_PASSWORD")}, true
 }
