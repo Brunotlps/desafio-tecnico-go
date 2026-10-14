@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
 	"desafio-tecnico-go/internal/domain"
 )
 
@@ -30,8 +32,9 @@ type SubmitResult struct {
 // Assim uma chave registrada reenviada com outra moeda ou outro tipo é conflito
 // (409), não 422/501.
 //
-// Somente BET está implementado. Os demais tipos válidos, quando a operação é
-// nova, devolvem ErrKindNotSupported sem persistir nada.
+// Estão implementados BET, WIN sem referência e LOSS. Os demais tipos válidos
+// (REFUND, ROLLBACK e WIN com referência), quando a operação é nova, devolvem
+// ErrKindNotSupported sem persistir nada. O corpo transacional é processExternal.
 func (s *Service) Submit(ctx context.Context, raw domain.RawExternalRequest, correlationID string) (SubmitResult, error) {
 	req, err := domain.NewExternalRequest(raw)
 	if err != nil {
@@ -56,69 +59,9 @@ func (s *Service) submitOnce(ctx context.Context, req domain.ExternalRequest, co
 	var result SubmitResult
 	txID := s.newID() // fixado antes da transação: identifica a tentativa em logs de commit incerto
 	err := s.uow.Do(ctx, func(ctx context.Context, r Repositories) error {
-		result = SubmitResult{}
-
-		// 1. Identidade já registrada tem precedência sobre qualquer validação que
-		// dependa do estado atual (p.ex. carteira inexistente): reutilizar a chave com
-		// outro conteúdo é conflito, e um replay legítimo não depende da carteira. Esta
-		// leitura não trava nada; só enxerga operações já confirmadas.
-		if existing, err := s.resolveExisting(ctx, r, req); err != nil || existing != nil {
-			result = SubmitResult{Transaction: existing, Replay: existing != nil}
-			return err
-		}
-
-		// 2. Operação nova: políticas da aplicação (moeda habilitada, tipo processado).
-		// Nada foi gravado ainda; a transação é desfeita sem efeito.
-		if err := s.checkNewOperation(req); err != nil {
-			return err
-		}
-
-		// 3. Trava a carteira e valida a entrada contra ela.
-		wallet, err := r.Wallets.GetForUpdate(ctx, req.WalletID())
-		if err != nil {
-			return err
-		}
-		if wallet.PlayerID() != req.PlayerID() || wallet.Currency() != req.Money().Currency() {
-			return ErrWalletMismatch
-		}
-
-		// 4. Com a carteira travada, repete a resolução: uma operação concorrente da
-		// mesma carteira pode ter confirmado entre os passos 1 e 2. Operações de
-		// carteiras diferentes com a mesma identidade são resolvidas pelas
-		// unicidades do banco (ver Submit).
-		if existing, err := s.resolveExisting(ctx, r, req); err != nil || existing != nil {
-			result = SubmitResult{Transaction: existing, Replay: existing != nil}
-			return err
-		}
-
-		now := s.now()
-		tx, err := domain.NewExternalTransaction(txID, req, now)
-		if err != nil {
-			return err
-		}
-		versionBefore := wallet.Version()
-		events, entry, err := s.applyBet(wallet, tx, correlationID, now)
-		if err != nil {
-			return err
-		}
-		if entry != nil {
-			if err := r.Wallets.UpdateBalance(ctx, wallet, versionBefore); err != nil {
-				return err
-			}
-		}
-		if err := r.Transactions.Insert(ctx, tx); err != nil {
-			return err
-		}
-		if entry != nil {
-			if err := r.Ledger.Append(ctx, *entry); err != nil {
-				return err
-			}
-		}
-		if err := r.Outbox.Append(ctx, events); err != nil {
-			return err
-		}
-		result = SubmitResult{Transaction: tx}
-		return nil
+		var err error
+		result, err = s.processExternal(ctx, r, req, txID, correlationID)
+		return err
 	})
 	if err != nil {
 		if errors.Is(err, ErrCommitUnknown) {
@@ -131,17 +74,97 @@ func (s *Service) submitOnce(ctx context.Context, req domain.ExternalRequest, co
 	return result, nil
 }
 
+// processExternal é o núcleo financeiro compartilhado por todas as entradas
+// (HTTP agora; SQS com inbox depois). Opera exclusivamente sobre os repositórios
+// recebidos — todos vinculados à transação SQL da tentativa — e não abre nem
+// confirma transação: quem chama controla o commit, de modo que outros efeitos
+// (p.ex. a inbox) possam compartilhar a mesma transação. Em caso de erro nada
+// foi confirmado e o chamador deve desfazer a tentativa.
+//
+// Ordem das decisões (a entrada já passou pela validação estrutural em
+// domain.NewExternalRequest): identidade registrada → políticas de operação nova
+// → lock da carteira e validação contra ela → rechecagem da identidade → regra do
+// tipo → gravação de carteira, transação, ledger e outbox.
+func (s *Service) processExternal(ctx context.Context, r Repositories, req domain.ExternalRequest, txID uuid.UUID, correlationID string) (SubmitResult, error) {
+	// 1. Identidade já registrada tem precedência sobre qualquer validação que
+	// dependa do estado atual (p.ex. carteira inexistente): reutilizar a chave com
+	// outro conteúdo é conflito, e um replay legítimo não depende da carteira. Esta
+	// leitura não trava nada; só enxerga operações já confirmadas.
+	if existing, err := s.resolveExisting(ctx, r, req); err != nil || existing != nil {
+		return SubmitResult{Transaction: existing, Replay: existing != nil}, err
+	}
+
+	// 2. Operação nova: políticas da aplicação (moeda habilitada, tipo processado).
+	// Nada foi gravado ainda; a tentativa é desfeita sem efeito.
+	if err := s.checkNewOperation(req); err != nil {
+		return SubmitResult{}, err
+	}
+
+	// 3. Trava a carteira e valida a entrada contra ela.
+	wallet, err := r.Wallets.GetForUpdate(ctx, req.WalletID())
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	if wallet.PlayerID() != req.PlayerID() || wallet.Currency() != req.Money().Currency() {
+		return SubmitResult{}, ErrWalletMismatch
+	}
+
+	// 4. Com a carteira travada, repete a resolução: uma operação concorrente da
+	// mesma carteira pode ter confirmado entre os passos 1 e 2. Operações de
+	// carteiras diferentes com a mesma identidade são resolvidas pelas
+	// unicidades do banco (ver Submit).
+	if existing, err := s.resolveExisting(ctx, r, req); err != nil || existing != nil {
+		return SubmitResult{Transaction: existing, Replay: existing != nil}, err
+	}
+
+	now := s.now()
+	tx, err := domain.NewExternalTransaction(txID, req, now)
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	versionBefore := wallet.Version()
+	events, entry, err := s.applyKind(wallet, tx, correlationID, now)
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	if entry != nil {
+		if err := r.Wallets.UpdateBalance(ctx, wallet, versionBefore); err != nil {
+			return SubmitResult{}, err
+		}
+	}
+	if err := r.Transactions.Insert(ctx, tx); err != nil {
+		return SubmitResult{}, err
+	}
+	if entry != nil {
+		if err := r.Ledger.Append(ctx, *entry); err != nil {
+			return SubmitResult{}, err
+		}
+	}
+	if err := r.Outbox.Append(ctx, events); err != nil {
+		return SubmitResult{}, err
+	}
+	return SubmitResult{Transaction: tx}, nil
+}
+
 // checkNewOperation aplica as políticas de uma operação nova, nesta ordem: moeda
 // habilitada (ErrCurrencyNotSupported) e tipo com processamento implementado
 // (ErrKindNotSupported). Só é chamada depois de resolver a identidade existente.
+// Uma referência recebida nunca é ignorada: WIN com referência só será processado
+// junto com a resolução de referências.
 func (s *Service) checkNewOperation(req domain.ExternalRequest) error {
 	if err := s.checkCurrency(req.Money().Currency()); err != nil {
 		return err
 	}
-	if req.Kind() != domain.KindBet {
-		return fmt.Errorf("%w: %s", ErrKindNotSupported, req.Kind())
+	switch req.Kind() {
+	case domain.KindBet, domain.KindLoss:
+		return nil
+	case domain.KindWin:
+		if req.ReferenceExternalTransactionID() == "" {
+			return nil
+		}
+		return fmt.Errorf("%w: %s with a reference", ErrKindNotSupported, req.Kind())
 	}
-	return nil
+	return fmt.Errorf("%w: %s", ErrKindNotSupported, req.Kind())
 }
 
 // resolveExisting consulta as identidades da operação, sempre no escopo do
@@ -171,10 +194,30 @@ func (s *Service) resolveExisting(ctx context.Context, r Repositories, req domai
 	return nil, nil
 }
 
-// applyBet aplica a regra de BET em memória: débito se houver saldo; caso
-// contrário, rejeição auditável sem movimentação.
-func (s *Service) applyBet(w *domain.Wallet, tx *domain.WagerTransaction, correlationID string, now time.Time) ([]domain.Event, *domain.LedgerEntry, error) {
-	entry, err := w.Debit(s.newID(), tx.ID(), tx.Money(), now)
+// applyKind aplica em memória a regra do tipo da operação sobre a carteira já
+// travada. Devolve os eventos da outbox e, quando houve movimentação, o
+// lançamento do ledger (nil para LOSS e para rejeições).
+func (s *Service) applyKind(w *domain.Wallet, tx *domain.WagerTransaction, correlationID string, now time.Time) ([]domain.Event, *domain.LedgerEntry, error) {
+	switch tx.Kind() {
+	case domain.KindBet:
+		return s.applyMovement(w, tx, w.Debit, correlationID, now)
+	case domain.KindWin:
+		return s.applyMovement(w, tx, w.Credit, correlationID, now)
+	case domain.KindLoss:
+		return s.applyLoss(w, tx, correlationID, now)
+	}
+	return nil, nil, fmt.Errorf("%w: %s", ErrKindNotSupported, tx.Kind())
+}
+
+type moveFunc func(entryID, transactionID uuid.UUID, amount domain.Money, now time.Time) (domain.LedgerEntry, error)
+
+// applyMovement aplica um débito (BET) ou crédito (WIN): conclui a transação com
+// o saldo resultante e gera WagerTransactionProcessed e WalletBalanceChanged.
+// Saldo insuficiente é rejeição de negócio auditável, sem movimentação; qualquer
+// outro erro (p.ex. overflow do saldo) interrompe a tentativa sem efeitos, pois a
+// carteira só muda depois de a movimentação ser validada por inteiro.
+func (s *Service) applyMovement(w *domain.Wallet, tx *domain.WagerTransaction, move moveFunc, correlationID string, now time.Time) ([]domain.Event, *domain.LedgerEntry, error) {
+	entry, err := move(s.newID(), tx.ID(), tx.Money(), now)
 	switch {
 	case errors.Is(err, domain.ErrInsufficientFunds):
 		if err := tx.Reject(domain.FailureInsufficientFunds, w.Balance(), now); err != nil {
@@ -201,6 +244,20 @@ func (s *Service) applyBet(w *domain.Wallet, tx *domain.WagerTransaction, correl
 		return nil, nil, err
 	}
 	return []domain.Event{processed, changed}, &entry, nil
+}
+
+// applyLoss registra o resultado de uma LOSS: não há movimentação, ledger,
+// alteração de saldo ou de versão, nem WalletBalanceChanged. O saldo observado
+// sob o lock da carteira é o resultado devolvido (e reproduzido em replays).
+func (s *Service) applyLoss(w *domain.Wallet, tx *domain.WagerTransaction, correlationID string, now time.Time) ([]domain.Event, *domain.LedgerEntry, error) {
+	if err := tx.Process(w.Balance(), now); err != nil {
+		return nil, nil, err
+	}
+	processed, err := domain.NewWagerTransactionProcessed(s.newID(), correlationID, nil, tx, now)
+	if err != nil {
+		return nil, nil, err
+	}
+	return []domain.Event{processed}, nil, nil
 }
 
 func (s *Service) logResult(ctx context.Context, res SubmitResult, correlationID string) {

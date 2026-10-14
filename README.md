@@ -1,8 +1,8 @@
 # Wager Service — processamento de apostas (Go, PostgreSQL, Keycloak, SQS)
 
 Implementação do desafio descrito em [`descricao-desafio/README.md`](descricao-desafio/README.md) (a fonte normativa;
-não é alterada aqui). Este repositório contém o **primeiro incremento funcional**: base operacional
-e o fluxo financeiro vertical *abertura de carteira → BET → consulta*, por HTTP, com autenticação
+não é alterada aqui). Este repositório contém a base operacional e o fluxo financeiro vertical
+*abertura de carteira → BET / WIN / LOSS → consulta*, por HTTP, com autenticação
 real, ledger, idempotência persistente e eventos gravados na outbox.
 
 > **Status resumido** — o que existe e o que **não** existe está na seção [Escopo e pendências](#escopo-e-pendências).
@@ -82,7 +82,7 @@ curl -s -H "Authorization: Bearer $INTERNAL"   localhost:8080/wallets/$WALLET
 | --------------------------------------------------------------------- | ------------------ | ------- |
 | `POST /wallets`                                                       | `internal-service` | 201     |
 | `GET /wallets/{walletId}`                                             | `internal-service` | 200     |
-| `POST /wagering/transactions` (header `Idempotency-Key` obrigatório)  | `provider`         | 200 (`PROCESSED`) · 422 (`REJECTED`) |
+| `POST /wagering/transactions` (header `Idempotency-Key` obrigatório; `BET`, `WIN` sem referência, `LOSS`) | `provider` | 200 (`PROCESSED`) · 422 (`REJECTED`) |
 | `GET /wagering/transactions/{transactionId}`                          | `provider` (só as suas) · `internal-service` (todas) | 200 |
 | `GET /providers/{providerId}/wagering/transactions/{externalTransactionId}` | `provider` (só o seu id) · `internal-service` | 200 |
 | `GET /health/live`, `GET /health/ready`                               | público            | 200 / 503 |
@@ -102,7 +102,8 @@ Respostas de erro: `{"code":"...","message":"..."}`.
 | Carteira já existe para jogador+moeda                  | 409  | `WALLET_ALREADY_EXISTS` (+ `walletId`)   |
 | Carteira não pertence ao jogador/moeda; moeda não habilitada (operação nova); `OPENING` por HTTP | 422 | `WALLET_MISMATCH`, `CURRENCY_NOT_SUPPORTED`, `KIND_NOT_ALLOWED` |
 | Rejeição de negócio (saldo insuficiente)               | 422  | corpo `{"status":"REJECTED","failureCode":"INSUFFICIENT_FUNDS",...}` |
-| `WIN`, `LOSS`, `REFUND`, `ROLLBACK` **novos** (ainda sem processamento) | 501 | `KIND_NOT_SUPPORTED` — nada é persistido; se a chave ou o id externo já estiver registrado, a resposta é 409 (ver acima) |
+| `REFUND`, `ROLLBACK` e `WIN` com `referenceExternalTransactionId` **novos** (ainda sem processamento) | 501 | `KIND_NOT_SUPPORTED` — nada é persistido; a referência recebida nunca é ignorada; se a chave ou o id externo já estiver registrado, a resposta é 409 (ver acima) |
+| Crédito de `WIN` que ultrapassaria o limite de `Money` | 400 | `INVALID_AMOUNT` — nada é persistido |
 | Aceito sem resultado (`PENDING*`; **inalcançável nesta versão**) | 202 | corpo com `status`                       |
 | Indisponibilidade transitória                          | 503  | `TEMPORARILY_UNAVAILABLE` (+ `Retry-After`) |
 | Resultado do commit desconhecido                       | 503  | `COMMIT_OUTCOME_UNKNOWN` — repita com a **mesma** chave |
@@ -250,6 +251,7 @@ Variáveis opcionais (padrões coincidem com o Compose): `TEST_DATABASE_URL`, `T
 | Casos de uso | `service_test.go` | abertura de carteira e BET direto no serviço (sem HTTP): replay, conflitos com precedência da identidade, rejeição, 50 reenvios e 2×80,00 sobre 100,00 |
 | Verificador JWT | `auth_verifier_test.go` | identidades derivadas do token do Keycloak; adulterado, forjado, `alg:none`, HS256, emissor/audiência diferentes, expirado; `Start` falha com IdP inacessível |
 | Fluxo | `flow_test.go` | abertura positiva (OPENING, ledger, 2 eventos, versão 1), zero, duplicada (409), parsing estrito de dinheiro por HTTP, BET aceita/rejeitada, tipos não suportados, validação de entrada |
+| WIN e LOSS | `win_loss_test.go` | `WIN` credita uma vez (ledger `CREDIT`, `WagerTransactionProcessed` + `WalletBalanceChanged` com causalidade e `walletVersion`); overflow sem efeitos parciais; `LOSS` sem ledger, sem alterar saldo/versão e só com `WagerTransactionProcessed`; replays com o saldo original; 50 reenvios de `WIN`/`LOSS` em paralelo; `LOSS` espera o lock da carteira; `WIN` com referência segue 501; **3 processos reais** (reenvios e créditos distintos sem perda) |
 | Idempotência | `idempotency_test.go` | replay devolve o saldo original após outras movimentações; rejeição terminal não é reavaliada após crédito; conflito de payload; mesma operação externa com outra chave; chaves por provedor; **conflito tem precedência sobre carteira inexistente/jogador/moeda divergentes**; disputa da mesma identidade entre carteiras diferentes |
 | Precedência da identidade | `identity_precedence_test.go` | caso de uso e HTTP: chave ou id externo já registrado com **moeda não habilitada ou tipo diferente (WIN/LOSS/REFUND/ROLLBACK)** → 409; entradas estruturalmente inválidas continuam 400/422; operações novas continuam 422/501; escopo por provedor; 401/403 antes de tudo; nada é persistido |
 | Concorrência | `concurrency_test.go` | 50 reenvios paralelos → 1 débito; 2×80,00 sobre 100,00 (com reenvios) → 1 processada, 1 rejeitada, saldo 20,00; sem lost update; carteiras independentes não se bloqueiam; várias carteiras em paralelo |
@@ -304,7 +306,7 @@ test/integration   testes com infraestrutura real (build tag `integration`)
 **Implementado e testado (HTTP):** configuração validada; Fx com lifecycle; Docker Compose; Keycloak e
 LocalStack provisionados; migrations; health checks reais; Money; Wallet; WagerTransaction (máquina
 de estados completa no domínio); LedgerEntry; abertura de carteira; `BET` com idempotência
-persistente, rejeição por saldo, ledger e outbox atômicos; consultas com isolamento por provedor;
+persistente, rejeição por saldo, ledger e outbox atômicos; `WIN` (sem referência) e `LOSS`; consultas com isolamento por provedor;
 autenticação/autorização reais. **Garantias do banco** (migrations 00001–00003, verificadas por SQL direto pelo papel
 restrito): ledger append-only e de cadeia contínua; saldo = último `balance_after`; toda transação `PROCESSED` com movimento
 exige, no COMMIT, o lançamento da própria carteira e `result_balance` = `balance_after` dele (`LOSS` e rejeições não têm
@@ -315,7 +317,7 @@ replay/conflito (409) antes das políticas de operação nova (moeda, tipo).
 
 | Item do enunciado | Situação |
 | --- | --- |
-| `WIN`, `LOSS`, `REFUND`, `ROLLBACK` | regras de valor/referência validadas no domínio; processamento **ausente** (HTTP 501, sem persistir). Política de combinações REFUND×ROLLBACK **não decidida** — ver `ARCHITECTURE.md` §Reversões |
+| `REFUND`, `ROLLBACK`, `WIN` com referência | regras de valor/referência validadas no domínio; processamento **ausente** (HTTP 501, sem persistir). `BET`, `WIN` sem referência e `LOSS` estão implementados — ver `ARCHITECTURE.md` §5 e §Reversões |
 | Consumidor SQS e tabela de inbox | ausentes (a fila é provisionada e a readiness a verifica) |
 | Publicador de outbox (múltiplas instâncias, backoff, recuperação) | ausente; eventos ficam gravados em `outbox_events` com colunas de tentativas/próximo envio |
 | `PENDING_REFERENCE`, worker de referências, backoff/TTL | ausentes (estado e evento existem no domínio) |
@@ -326,6 +328,6 @@ replay/conflito (409) antes das políticas de operação nova (moeda, tipo).
 | Testes de carga, OpenTelemetry, partidas dobradas | opcionais, não feitos |
 | Limites das garantias atuais | o dono do schema e superusuários podem desabilitar triggers (a API roda com papel restrito); o `result_balance` de `LOSS` (saldo observado, sem lançamento) não é verificável contra o ledger; o sentido do lançamento de `ROLLBACK` só será imposto com o processamento de reversões; a regressão de relógio entre instâncias é recusada pelo domínio e tratada por quem chama a transição (ARCHITECTURE §3); rotação de chaves do IdP pode causar 401 por até 30 s |
 
-**Próximo incremento recomendado:** `WIN`/`LOSS` sem referência + `REFUND`/`ROLLBACK` com a política
-de reversões decidida; em seguida inbox + consumidor SQS reutilizando `app.Service.Submit` e o
-publicador de outbox. Detalhes em `ARCHITECTURE.md`.
+**Próximo incremento recomendado:** `REFUND`/`ROLLBACK` e `WIN` com referência (política de reversões,
+`PENDING_REFERENCE` com worker); em seguida o publicador de outbox e a inbox + consumidor SQS sobre o
+mesmo núcleo financeiro (`Service.processExternal`). Detalhes em `ARCHITECTURE.md`.
