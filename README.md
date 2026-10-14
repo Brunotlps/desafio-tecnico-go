@@ -97,12 +97,12 @@ Respostas de erro: `{"code":"...","message":"..."}`.
 | JSON inválido, número no lugar de string monetária    | 400  | `INVALID_JSON`                           |
 | Valor/moeda/tipo/campo inválidos                       | 400  | `INVALID_AMOUNT`, `INVALID_CURRENCY`, `INVALID_KIND`, `INVALID_REQUEST`, `AMOUNT_NOT_ALLOWED_FOR_KIND`, `IDEMPOTENCY_KEY_REQUIRED` |
 | Carteira / transação inexistente                       | 404  | `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND` |
-| Mesma chave com conteúdo diferente                     | 409  | `IDEMPOTENCY_KEY_REUSED`                 |
+| Mesma chave com conteúdo diferente (valor, carteira, **moeda ou tipo**, inclusive moeda não habilitada ou tipo não processado) | 409  | `IDEMPOTENCY_KEY_REUSED`                 |
 | Mesmo `(providerId, externalTransactionId)` com outra chave | 409 | `EXTERNAL_TRANSACTION_ALREADY_REGISTERED` |
 | Carteira já existe para jogador+moeda                  | 409  | `WALLET_ALREADY_EXISTS` (+ `walletId`)   |
-| Carteira não pertence ao jogador/moeda; moeda não aceita; `OPENING` por HTTP | 422 | `WALLET_MISMATCH`, `CURRENCY_NOT_SUPPORTED`, `KIND_NOT_ALLOWED` |
+| Carteira não pertence ao jogador/moeda; moeda não habilitada (operação nova); `OPENING` por HTTP | 422 | `WALLET_MISMATCH`, `CURRENCY_NOT_SUPPORTED`, `KIND_NOT_ALLOWED` |
 | Rejeição de negócio (saldo insuficiente)               | 422  | corpo `{"status":"REJECTED","failureCode":"INSUFFICIENT_FUNDS",...}` |
-| `WIN`, `LOSS`, `REFUND`, `ROLLBACK` (ainda sem processamento) | 501 | `KIND_NOT_SUPPORTED` — nada é persistido |
+| `WIN`, `LOSS`, `REFUND`, `ROLLBACK` **novos** (ainda sem processamento) | 501 | `KIND_NOT_SUPPORTED` — nada é persistido; se a chave ou o id externo já estiver registrado, a resposta é 409 (ver acima) |
 | Aceito sem resultado (`PENDING*`; **inalcançável nesta versão**) | 202 | corpo com `status`                       |
 | Indisponibilidade transitória                          | 503  | `TEMPORARILY_UNAVAILABLE` (+ `Retry-After`) |
 | Resultado do commit desconhecido                       | 503  | `COMMIT_OUTCOME_UNKNOWN` — repita com a **mesma** chave |
@@ -220,6 +220,7 @@ Variáveis opcionais (padrões coincidem com o Compose): `TEST_DATABASE_URL`, `T
 | Verificador JWT | `auth_verifier_test.go` | identidades derivadas do token do Keycloak; adulterado, forjado, `alg:none`, HS256, emissor/audiência diferentes, expirado; `Start` falha com IdP inacessível |
 | Fluxo | `flow_test.go` | abertura positiva (OPENING, ledger, 2 eventos, versão 1), zero, duplicada (409), parsing estrito de dinheiro por HTTP, BET aceita/rejeitada, tipos não suportados, validação de entrada |
 | Idempotência | `idempotency_test.go` | replay devolve o saldo original após outras movimentações; rejeição terminal não é reavaliada após crédito; conflito de payload; mesma operação externa com outra chave; chaves por provedor; **conflito tem precedência sobre carteira inexistente/jogador/moeda divergentes**; disputa da mesma identidade entre carteiras diferentes |
+| Precedência da identidade | `identity_precedence_test.go` | caso de uso e HTTP: chave ou id externo já registrado com **moeda não habilitada ou tipo diferente (WIN/LOSS/REFUND/ROLLBACK)** → 409; entradas estruturalmente inválidas continuam 400/422; operações novas continuam 422/501; escopo por provedor; 401/403 antes de tudo; nada é persistido |
 | Concorrência | `concurrency_test.go` | 50 reenvios paralelos → 1 débito; 2×80,00 sobre 100,00 (com reenvios) → 1 processada, 1 rejeitada, saldo 20,00; sem lost update; carteiras independentes não se bloqueiam; várias carteiras em paralelo |
 | Banco | `constraints_test.go`, `db_integrity_test.go` | SQL direto: unicidade, saldo não negativo, ledger append-only (UPDATE/DELETE/TRUNCATE), saldo×ledger no mesmo commit, OPENING único, forma interna×externa, política de zero, imutabilidade de terminais e da outbox; **cadeia contínua do ledger** (cenário da revisão, primeiro lançamento, vários lançamentos por transação, escritor concorrente obsoleto, carteira independente não bloqueada); **vínculo lançamento→transação→carteira**; **resultado explícito (NULL e valores inválidos)** |
 | Papéis | `role_test.go` | o papel de runtime não é superusuário nem dono, e 20+ tentativas (UPDATE/DELETE/TRUNCATE do ledger, `DISABLE TRIGGER`, `session_replication_role`, DDL…) são negadas; o fluxo financeiro e a verificação de schema funcionam com ele; provisão idempotente |
