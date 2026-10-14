@@ -31,7 +31,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: migrate up | down | down-to <version> | status")
+		return fmt.Errorf("usage: migrate up | down | down-to <version> | grants | status   (down/down-to N>0 preserve the pending-reference schedule; down-to 0 is the destructive reset)")
 	}
 	url := os.Getenv("MIGRATE_DATABASE_URL")
 	if url == "" {

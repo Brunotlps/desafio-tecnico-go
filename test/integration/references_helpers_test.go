@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"desafio-tecnico-go/internal/app"
@@ -47,6 +48,12 @@ var testRef = app.ReferenceConfig{TTL: 15 * time.Minute, BackoffInitial: time.Se
 // UnitOfWork (injeção de falhas em pontos observáveis); clock substitui o relógio.
 func newServiceWith(t *testing.T, clock *fakeClock, wrap func(app.UnitOfWork) app.UnitOfWork) *app.Service {
 	t.Helper()
+	return newServiceRef(t, clock, testRef, wrap)
+}
+
+// newServiceRef é newServiceWith com parâmetros de referência próprios (p.ex. BatchSize).
+func newServiceRef(t *testing.T, clock *fakeClock, ref app.ReferenceConfig, wrap func(app.UnitOfWork) app.UnitOfWork) *app.Service {
+	t.Helper()
 	pool, err := pgxpool.New(context.Background(), env.runtimeURL)
 	if err != nil {
 		t.Fatal(err)
@@ -60,7 +67,7 @@ func newServiceWith(t *testing.T, clock *fakeClock, wrap func(app.UnitOfWork) ap
 	if clock != nil {
 		opts = append(opts, app.WithClock(clock.Now))
 	}
-	return app.NewService(uow, app.Config{AllowedCurrencies: []domain.Currency{"BRL", "USD"}, Reference: testRef},
+	return app.NewService(uow, app.Config{AllowedCurrencies: []domain.Currency{"BRL", "USD"}, Reference: ref},
 		slog.New(slog.NewTextHandler(io.Discard, nil)), opts...)
 }
 
@@ -166,4 +173,51 @@ func refBody(w wallet, provider, ext, kind, amount, ref string) map[string]any {
 		b["referenceExternalTransactionId"] = ref
 	}
 	return b
+}
+
+// isolated é um serviço sobre um banco EXCLUSIVO do teste (versão final do schema). Os testes de varredura precisam
+// dele: a varredura enxerga todas as pendências do banco, e as deixadas por outros testes no banco compartilhado
+// consumiriam o orçamento de tentativas e tornariam a prova dependente da ordem de execução.
+type isolated struct {
+	svc   *app.Service
+	owner *pgx.Conn
+	db    *upgradeDB
+}
+
+func newIsolated(t *testing.T, clock *fakeClock, ref app.ReferenceConfig, wrap func(app.UnitOfWork) app.UnitOfWork) isolated {
+	t.Helper()
+	final, _ := postgres.ExpectedVersion()
+	d := newUpgradeDB(t, "audit_scan", final)
+	var uow app.UnitOfWork = postgres.NewStore(postgres.StaticPool(d.runtime))
+	if wrap != nil {
+		uow = wrap(uow)
+	}
+	svc := app.NewService(uow, app.Config{AllowedCurrencies: []domain.Currency{"BRL"}, Reference: ref},
+		slog.New(slog.NewTextHandler(io.Discard, nil)), app.WithClock(clock.Now))
+	return isolated{svc: svc, owner: d.owner, db: d}
+}
+
+// another cria outro serviço (outra instância) sobre o mesmo banco isolado.
+func (i isolated) another(t *testing.T, clock *fakeClock, ref app.ReferenceConfig, wrap func(app.UnitOfWork) app.UnitOfWork) *app.Service {
+	t.Helper()
+	var uow app.UnitOfWork = postgres.NewStore(postgres.StaticPool(i.db.runtime))
+	if wrap != nil {
+		uow = wrap(uow)
+	}
+	return app.NewService(uow, app.Config{AllowedCurrencies: []domain.Currency{"BRL"}, Reference: ref},
+		slog.New(slog.NewTextHandler(io.Discard, nil)), app.WithClock(clock.Now))
+}
+
+func (i isolated) pending(t *testing.T, txID uuid.UUID) pendingRow {
+	t.Helper()
+	r, ok := readSchedules(t, i.owner)[txID]
+	if !ok {
+		return pendingRow{}
+	}
+	return pendingRow{First: r.First, Expires: r.Expires, Next: r.Next, Attempts: r.Attempts, Completed: r.Completed != nil, Rows: 1}
+}
+
+func (i isolated) ledgerEntries(t *testing.T, txID uuid.UUID) int64 {
+	t.Helper()
+	return queryOn(t, i.owner, `SELECT count(*) FROM wallet_ledger_entries WHERE transaction_id = $1`, txID)
 }

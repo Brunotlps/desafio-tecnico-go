@@ -73,6 +73,7 @@ func TestPendingReferenceIsPersistedWithItsScheduleAndResolvedLater(t *testing.T
 
 	// A BET chega; a retomada conclui a MESMA operação (id, hash, chave) uma única vez.
 	mustSubmit(t, svc, op(wallet, player, "BET", id("bet"), "25.00", ""))
+	clock.Advance(time.Minute) // intencional: a retomada só ocorre depois da próxima tentativa agendada
 	hashBefore := hashOf(t, txID)
 	done, err = process(t, svc, txID)
 	if err != nil || !done {
@@ -220,6 +221,7 @@ func TestAReferenceThatFinishesWithoutSuccessRejectsTheWaitingOperation(t *testi
 
 	pend := mustSubmit(t, svc, op(wallet, player, "REFUND", id("refund"), "50.00", id("bet")))
 	mustStatus(t, mustSubmit(t, svc, op(wallet, player, "BET", id("bet"), "50.00", "")), domain.StatusRejected, domain.FailureInsufficientFunds)
+	clock.Advance(time.Minute) // intencional: depois da primeira data agendada
 	if done, err := process(t, svc, pend.Transaction.ID()); err != nil || !done {
 		t.Fatalf("done=%v err=%v", done, err)
 	}
@@ -239,6 +241,7 @@ func TestResumedReversalsRespectTheOneReversalRule(t *testing.T) {
 	a := mustSubmit(t, svc, op(wallet, player, "REFUND", id("a"), "25.00", id("bet")))
 	b := mustSubmit(t, svc, op(wallet, player, "ROLLBACK", id("b"), "25.00", id("bet")))
 	mustSubmit(t, svc, op(wallet, player, "BET", id("bet"), "25.00", ""))
+	clock.Advance(time.Minute) // intencional: depois da primeira data agendada
 	for _, tx := range []uuid.UUID{a.Transaction.ID(), b.Transaction.ID()} {
 		if _, err := process(t, svc, tx); err != nil {
 			t.Fatal(err)
@@ -261,6 +264,7 @@ func TestManyExecutorsOnOnePendingReferenceApplyItOnce(t *testing.T) {
 	pend := mustSubmit(t, seed, op(wallet, player, "REFUND", id("refund"), "25.00", id("bet")))
 	mustSubmit(t, seed, op(wallet, player, "BET", id("bet"), "25.00", ""))
 
+	clock.Advance(time.Minute) // intencional: depois da primeira data agendada
 	execs := make([]*app.Service, 10)
 	for i := range execs {
 		execs[i] = newServiceWith(t, clock, nil)
@@ -372,6 +376,7 @@ func TestResumeFailuresBeforeAndAfterCommitNeverDuplicate(t *testing.T) {
 	wallet, player := svcOpen(t, svc, "100.00")
 	pend := mustSubmit(t, svc, op(wallet, player, "REFUND", id("refund"), "25.00", id("bet")))
 	mustSubmit(t, svc, op(wallet, player, "BET", id("bet"), "25.00", ""))
+	clock.Advance(time.Minute) // intencional: depois da primeira data agendada
 	txID := pend.Transaction.ID()
 
 	mode.Store(1)
@@ -463,6 +468,7 @@ func TestResumeToleratesABackwardsClock(t *testing.T) {
 	wallet, player := svcOpen(t, svc, "100.00")
 	pend := mustSubmit(t, svc, op(wallet, player, "REFUND", id("refund"), "25.00", id("bet")))
 	mustSubmit(t, svc, op(wallet, player, "BET", id("bet"), "25.00", ""))
+	clock.Advance(time.Minute) // intencional: a pendência está vencida para esta instância
 	// Outra instância gravou a transação "no futuro" (atualização à frente do relógio desta).
 	future := clock.Now().Add(5 * time.Second)
 	if _, err := testPool.Exec(context.Background(), `UPDATE wager_transactions SET updated_at = $2 WHERE id = $1`, pend.Transaction.ID(), future); err != nil {

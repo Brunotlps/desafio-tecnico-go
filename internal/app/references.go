@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	"desafio-tecnico-go/internal/domain"
 )
 
@@ -28,10 +30,17 @@ import (
 type resumeStatus int
 
 const (
-	resumeSkipped   resumeStatus = iota // já concluída por outra instância, ou carteira ocupada
+	resumeSkipped   resumeStatus = iota // já concluída por outra instância (a agenda não está mais aberta)
+	resumeBusy                          // a carteira está travada por outra transação: nada foi tocado
+	resumeNotDue                        // a agenda recarregada sob os locks ainda não venceu: nada foi tocado
 	resumeWaiting                       // continua esperando; nova data agendada
 	resumeCompleted                     // terminou (PROCESSED ou REJECTED)
 )
+
+// maxScanPages limita o trabalho de uma varredura: no máximo este número de páginas de candidatos (cada uma
+// de BatchSize). Cada carteira ocupada encontrada sai das páginas seguintes, então o limite só importa com
+// muitíssimas carteiras ocupadas ao mesmo tempo.
+const maxScanPages = 50
 
 // backoff devolve o intervalo antes da próxima verificação: exponencial a partir
 // de BackoffInitial, com jitter uniforme em [d/2, d] e teto BackoffMax.
@@ -47,16 +56,20 @@ func (s *Service) backoff(attempts int) time.Duration {
 	return half + time.Duration(rand.Int64N(int64(d-half)+1))
 }
 
-// ProcessPending executa uma tentativa para uma pendência (a leitura de ref só
-// identifica o candidato). Devolve o desfecho para diagnóstico.
+// ProcessPending executa uma tentativa para uma pendência (a leitura de ref só identifica o candidato: a
+// elegibilidade é revalidada sob os locks). Devolve se a operação terminou (PROCESSED ou REJECTED).
 func (s *Service) ProcessPending(ctx context.Context, ref PendingReference) (completed bool, err error) {
+	status, err := s.attempt(ctx, ref)
+	return status == resumeCompleted, err
+}
+
+func (s *Service) attempt(ctx context.Context, ref PendingReference) (resumeStatus, error) {
 	for attempt := 0; ; attempt++ {
-		var status resumeStatus
-		status, err = s.resumeOnce(ctx, ref)
+		status, err := s.resumeOnce(ctx, ref)
 		if errors.Is(err, ErrReversalTargetTaken) && attempt < maxConflictRetries {
 			continue // o banco revelou uma reversão concorrente; uma nova tentativa a enxerga e rejeita
 		}
-		return status == resumeCompleted, err
+		return status, err
 	}
 }
 
@@ -76,6 +89,13 @@ func (s *Service) resumeOnce(ctx context.Context, ref PendingReference) (resumeS
 		}
 		if err != nil {
 			return err
+		}
+		// A seleção de candidatos foi só uma leitura: a elegibilidade temporal é decidida aqui, com a agenda
+		// recarregada sob os locks. Uma seleção antiga não autoriza uma tentativa que outra instância já
+		// reagendou para o futuro (o backoff persistido vale para todas as instâncias).
+		if sched.NextAttemptAt.After(s.now()) {
+			status = resumeNotDue
+			return nil
 		}
 		tx, err := r.Transactions.GetByID(ctx, ref.TransactionID)
 		if err != nil {
@@ -124,7 +144,7 @@ func (s *Service) resumeOnce(ctx context.Context, ref PendingReference) (resumeS
 	})
 	switch {
 	case errors.Is(err, ErrWalletBusy):
-		return resumeSkipped, nil
+		return resumeBusy, nil
 	case err != nil:
 		if errors.Is(err, ErrCommitUnknown) {
 			s.log.WarnContext(ctx, "pending reference commit outcome unknown; the durable state decides on the next attempt",
@@ -140,33 +160,66 @@ func (s *Service) resumeOnce(ctx context.Context, ref PendingReference) (resumeS
 	return status, nil
 }
 
-// ProcessDue varre as pendências vencidas (leitura sem locks) e tenta cada uma em
-// sequência, parando assim que stop for fechado. Devolve quantas terminaram e se
-// alguma tentativa falhou (para o worker espaçar a próxima varredura).
+// ProcessDue faz uma varredura limitada das pendências vencidas e tenta cada candidato em sequência, parando assim
+// que stop for fechado (ou ctx cancelado). Devolve quantas terminaram e se alguma tentativa falhou (para o worker
+// espaçar a próxima varredura).
+//
+// A leitura dos candidatos é paginada por chave (próxima tentativa, id), sem OFFSET, e uma carteira que se mostra
+// ocupada é excluída das páginas seguintes: um prefixo de candidatos todo em carteiras ocupadas não impede a varredura
+// de chegar às carteiras independentes. O trabalho é limitado: no máximo BatchSize tentativas efetivas (as puladas por
+// carteira ocupada ou ainda não vencidas custam uma verificação barata e não contam) e maxScanPages páginas.
+// Uma varredura em que tudo está ocupado termina sem tentar nada e sem alterar nenhuma agenda.
 func (s *Service) ProcessDue(ctx context.Context, stop <-chan struct{}) (completed int, failed bool) {
-	due, err := s.uow.Reader().Pending.Due(ctx, s.now(), s.ref.BatchSize)
-	if err != nil {
-		s.log.WarnContext(ctx, "listing due pending references failed", "error", err.Error())
-		return 0, true
-	}
-	for _, p := range due {
-		select {
-		case <-stop:
-			return completed, failed
-		case <-ctx.Done():
-			return completed, failed
-		default:
+	now := s.now()
+	busy := map[uuid.UUID]struct{}{}
+	var excluded []uuid.UUID
+	var cursor *DueCursor
+	attempts := 0
+	reader := s.uow.Reader().Pending
+	for page := 0; page < maxScanPages && attempts < s.ref.BatchSize; page++ {
+		due, err := reader.Due(ctx, DueQuery{Now: now, Limit: s.ref.BatchSize, After: cursor, ExcludeWallets: excluded})
+		if err != nil {
+			s.log.WarnContext(ctx, "listing due pending references failed", "error", err.Error())
+			return completed, true
 		}
-		attemptCtx, cancel := context.WithTimeout(ctx, s.ref.PhaseTimeout)
-		done, err := s.ProcessPending(attemptCtx, p)
-		cancel()
-		switch {
-		case err != nil:
-			failed = true
-			s.log.WarnContext(ctx, "pending reference attempt aborted; it will be retried from the durable state",
-				"transactionId", p.TransactionID, "walletId", p.WalletID, "error", err.Error())
-		case done:
-			completed++
+		if len(due) == 0 {
+			break
+		}
+		for _, p := range due {
+			select {
+			case <-stop:
+				return completed, failed
+			case <-ctx.Done():
+				return completed, failed
+			default:
+			}
+			cursor = &DueCursor{NextAttemptAt: p.NextAttemptAt, TransactionID: p.TransactionID}
+			if _, isBusy := busy[p.WalletID]; isBusy {
+				continue
+			}
+			if attempts >= s.ref.BatchSize {
+				return completed, failed
+			}
+			attemptCtx, cancel := context.WithTimeout(ctx, s.ref.PhaseTimeout)
+			status, err := s.attempt(attemptCtx, p)
+			cancel()
+			switch {
+			case err != nil:
+				attempts++
+				failed = true
+				s.log.WarnContext(ctx, "pending reference attempt aborted; it will be retried from the durable state",
+					"transactionId", p.TransactionID, "walletId", p.WalletID, "error", err.Error())
+			case status == resumeBusy:
+				busy[p.WalletID] = struct{}{}
+				excluded = append(excluded, p.WalletID)
+			case status == resumeNotDue, status == resumeSkipped:
+				// nada a fazer: outra instância reagendou ou concluiu
+			case status == resumeCompleted:
+				attempts++
+				completed++
+			default:
+				attempts++
+			}
 		}
 	}
 	return completed, failed
