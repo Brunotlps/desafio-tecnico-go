@@ -15,6 +15,9 @@ type pendingRepo struct{ q querier }
 
 const pendingColumns = `transaction_id, wallet_id, first_persisted_at, expires_at, next_attempt_at, attempts, last_attempt_at, COALESCE(last_error, '')`
 
+// pendingColumnsP são as mesmas colunas, qualificadas com o alias `p` (consultas com junção).
+const pendingColumnsP = `p.transaction_id, p.wallet_id, p.first_persisted_at, p.expires_at, p.next_attempt_at, p.attempts, p.last_attempt_at, COALESCE(p.last_error, '')`
+
 func scanPending(row pgx.Row) (app.PendingReference, error) {
 	var p app.PendingReference
 	err := row.Scan(&p.TransactionID, &p.WalletID, &p.FirstPersistedAt, &p.ExpiresAt, &p.NextAttemptAt, &p.Attempts, &p.LastAttemptAt, &p.LastError)
@@ -73,11 +76,18 @@ func (r pendingRepo) Due(ctx context.Context, q app.DueQuery) ([]app.PendingRefe
 	if exclude == nil {
 		exclude = []uuid.UUID{}
 	}
-	rows, err := r.q.Query(ctx, `SELECT `+pendingColumns+` FROM pending_references
-		WHERE completed_at IS NULL AND next_attempt_at <= $1
-		  AND ($3::timestamptz IS NULL OR (next_attempt_at, transaction_id) > ($3, $4))
-		  AND NOT (wallet_id = ANY($5::uuid[]))
-		ORDER BY next_attempt_at, transaction_id LIMIT $2`, q.Now, q.Limit, afterAt, afterID, exclude)
+	// Candidatos: pendências vencidas em ordem estável, SEM as carteiras travadas por outra transação. `FOR KEY SHARE ... SKIP
+	// LOCKED` na carteira faz o banco pular, dentro da própria consulta, as carteiras que uma transação segura com FOR UPDATE
+	// (o mesmo conflito que TryLockForUpdate enxerga), de modo que um prefixo ocupado, por maior que seja, não esconde as
+	// carteiras independentes que vêm depois dele. É só uma leitura: o lock dura o tempo da consulta (não há espera, nem lock
+	// durante o backoff) e a elegibilidade e a carteira são revalidadas sob os locks da tentativa.
+	rows, err := r.q.Query(ctx, `SELECT `+pendingColumnsP+` FROM pending_references p
+		JOIN wallets w ON w.id = p.wallet_id
+		WHERE p.completed_at IS NULL AND p.next_attempt_at <= $1
+		  AND ($3::timestamptz IS NULL OR (p.next_attempt_at, p.transaction_id) > ($3, $4))
+		  AND NOT (p.wallet_id = ANY($5::uuid[]))
+		ORDER BY p.next_attempt_at, p.transaction_id LIMIT $2
+		FOR KEY SHARE OF w SKIP LOCKED`, q.Now, q.Limit, afterAt, afterID, exclude)
 	if err != nil {
 		return nil, classify(err)
 	}

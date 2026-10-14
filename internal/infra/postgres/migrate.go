@@ -3,11 +3,13 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"embed"
 	"fmt"
 	"io/fs"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
@@ -31,7 +33,7 @@ func NewMigrator(databaseURL string) (*Migrator, error) {
 		return nil, err
 	}
 	db := stdlib.OpenDB(*cfg.ConnConfig)
-	locker, err := lock.NewPostgresSessionLocker()
+	locker, err := lock.NewPostgresSessionLocker(lock.WithLockTimeout(1, 300)) // 300 s no total, como o padrão; sonda a cada 1 s
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -51,14 +53,51 @@ func NewMigrator(databaseURL string) (*Migrator, error) {
 
 func (m *Migrator) Close() error { return m.db.Close() }
 
+// MigratorLockID é a chave do advisory lock de sessão que serializa as operações do Migrator (decisão de versão,
+// preparação do rollback, reversão e restauração). É distinta da chave do goose: o Migrator a adquire ANTES de chamar o
+// provider, nunca a mesma chave que o provider disputa em outra conexão (o que seria um deadlock).
+const MigratorLockID int64 = 1981000005
+
+// exclusive serializa uma operação do Migrator contra os demais migradores, mantendo o lock numa conexão própria. O lock do
+// goose (outra chave) é adquirido por dentro, pelo provider, sempre depois deste: a ordem é única, sem deadlock.
+func (m *Migrator) exclusive(ctx context.Context, fn func(context.Context) error) error {
+	conn, err := m.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, MigratorLockID); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("wait for the migrator lock: %w", err)
+	}
+	defer func() {
+		uctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var released bool
+		if err := conn.QueryRowContext(uctx, `SELECT pg_advisory_unlock($1)`, MigratorLockID).Scan(&released); err != nil || !released {
+			// Estado da sessão desconhecido: descarta a conexão física (o fim da sessão libera o lock).
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		_ = conn.Close()
+	}()
+	return fn(ctx)
+}
+
 // Up aplica todas as migrations pendentes.
-func (m *Migrator) Up(ctx context.Context) ([]*goose.MigrationResult, error) {
-	return m.provider.Up(ctx)
+func (m *Migrator) Up(ctx context.Context) (res []*goose.MigrationResult, err error) {
+	err = m.exclusive(ctx, func(ctx context.Context) error {
+		res, err = m.provider.Up(ctx)
+		return err
+	})
+	return res, err
 }
 
 // UpTo aplica as migrations pendentes até a versão informada (inclusive).
-func (m *Migrator) UpTo(ctx context.Context, version int64) ([]*goose.MigrationResult, error) {
-	return m.provider.UpTo(ctx, version)
+func (m *Migrator) UpTo(ctx context.Context, version int64) (res []*goose.MigrationResult, err error) {
+	err = m.exclusive(ctx, func(ctx context.Context) error {
+		res, err = m.provider.UpTo(ctx, version)
+		return err
+	})
+	return res, err
 }
 
 // scheduleMigration é a migration que cria a agenda das pendências (00005). Reverter essa migration apaga a
@@ -66,39 +105,48 @@ func (m *Migrator) UpTo(ctx context.Context, version int64) ([]*goose.MigrationR
 const scheduleMigration = 5
 
 // Down reverte a última migration aplicada. Se ela for a 00005, antes preserva a agenda das pendências (ver
-// preserveSchedule); a reaplicação a restaura com os valores originais.
-func (m *Migrator) Down(ctx context.Context) (*goose.MigrationResult, error) {
-	current, err := m.provider.GetDBVersion(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if current == scheduleMigration {
-		if err := m.preserveSchedule(ctx); err != nil {
-			return nil, err
+// preserveSchedule) ou recusa, sem alterar nada, se não puder preservá-la; a reaplicação a restaura com os valores originais.
+func (m *Migrator) Down(ctx context.Context) (res *goose.MigrationResult, err error) {
+	err = m.exclusive(ctx, func(ctx context.Context) error {
+		current, err := m.provider.GetDBVersion(ctx)
+		if err != nil {
+			return err
 		}
-	}
-	return m.provider.Down(ctx)
+		var restore func() error
+		if current == scheduleMigration {
+			if restore, err = m.preserveSchedule(ctx); err != nil {
+				return err
+			}
+		}
+		res, err = m.provider.Down(ctx)
+		return withRestoredGrants(err, restore)
+	})
+	return res, err
 }
 
 // DownTo reverte até a versão informada.
 //
 // Reversão operacional (version > 0): se o percurso inclui a 00005, a agenda das pendências é preservada antes (a
-// reaplicação a restaura). version = 0 é o reset DELIBERADAMENTE destrutivo — apaga todas as tabelas e os dados, como
-// sempre — e descarta também a cópia preservada da agenda.
-func (m *Migrator) DownTo(ctx context.Context, version int64) ([]*goose.MigrationResult, error) {
-	current, err := m.provider.GetDBVersion(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if version > 0 && version < scheduleMigration && current >= scheduleMigration {
-		if err := m.preserveSchedule(ctx); err != nil {
-			return nil, err
+// reaplicação a restaura) ou o rollback é recusado antes de qualquer perda. version = 0 é o reset DELIBERADAMENTE
+// destrutivo — apaga todas as tabelas e os dados, como sempre — e descarta também a cópia preservada da agenda.
+func (m *Migrator) DownTo(ctx context.Context, version int64) (res []*goose.MigrationResult, err error) {
+	err = m.exclusive(ctx, func(ctx context.Context) error {
+		current, err := m.provider.GetDBVersion(ctx)
+		if err != nil {
+			return err
 		}
-	}
-	res, err := m.provider.DownTo(ctx, version)
-	if err == nil && version == 0 {
-		err = m.dropPreservedSchedule(ctx)
-	}
+		var restore func() error
+		if version > 0 && version < scheduleMigration && current >= scheduleMigration {
+			if restore, err = m.preserveSchedule(ctx); err != nil {
+				return err
+			}
+		}
+		res, err = m.provider.DownTo(ctx, version)
+		if err == nil && version == 0 {
+			err = m.dropPreservedSchedule(ctx)
+		}
+		return withRestoredGrants(err, restore)
+	})
 	return res, err
 }
 

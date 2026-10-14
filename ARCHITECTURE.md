@@ -258,12 +258,17 @@ continuidade durável.
   Encontrar o alvo `PROCESSED` não dispensa saldo, tipo/escopo/valor nem a unicidade da reversão. Uma rejeição por expiração já confirmada
   é terminal e não é reaberta por uma chegada tardia nem por replay. **Falha de consulta não prova ausência**: a tentativa é abortada (erro
   transitório), nada é gravado e o prazo original segue valendo.
-* **Varredura limitada, paginada e justa entre carteiras** (`Service.ProcessDue`): a leitura de candidatos (só uma leitura, sem locks) é paginada
-  por chave `(próxima tentativa, id)` — sem `OFFSET` — e uma carteira que se mostra ocupada (`SKIP LOCKED`) é **excluída das páginas seguintes**: um prefixo de
-  candidatos todo em carteiras ocupadas não impede a varredura de chegar às carteiras independentes (aumentar apenas o lote só deslocaria o defeito). O
-  trabalho é limitado: no máximo `BatchSize` tentativas efetivas por varredura (as puladas por carteira ocupada ou ainda não vencidas custam uma verificação barata
-  e não contam) e 50 páginas; o cancelamento é respeitado entre candidatos; uma varredura toda ocupada termina sem tentar nada e **sem tocar** nenhuma agenda
-  (o prazo não é renovado por estar ocupada), e o worker só varre de novo depois do intervalo de espera, sem laço ativo.
+* **Varredura limitada que alcança as carteiras independentes** (`Service.ProcessDue`): a leitura de candidatos é paginada por chave `(próxima tentativa, id)` — sem
+  `OFFSET` — e **pula, dentro da própria consulta, as carteiras que outra transação segura** (`JOIN wallets … FOR KEY SHARE OF w SKIP LOCKED`, o mesmo conflito que
+  `TryLockForUpdate` enxerga): um prefixo de candidatos todo em carteiras ocupadas, por maior que seja (a prova usa 120 carteiras distintas com `BatchSize=1`),
+  não esconde as carteiras independentes que vêm depois dele, e **nenhum estado entre varreduras** é necessário — portanto vale para várias chamadas e instâncias.
+  Aumentar apenas o lote ou o número de páginas só deslocaria o limiar; aqui o tamanho do prefixo ocupado não importa. A consulta é só uma leitura: o lock de linha dura o
+  tempo da consulta (sem espera e sem lock durante o backoff) e a carteira e a elegibilidade são revalidadas sob os locks da tentativa. Uma carteira que fica ocupada
+  **entre** a seleção e a tentativa é excluída das páginas seguintes da mesma varredura. O trabalho é limitado: no máximo `BatchSize` tentativas efetivas por varredura
+  (as puladas ou ainda não vencidas custam uma verificação barata e não contam) e 50 páginas; o cancelamento é respeitado entre candidatos; uma varredura toda ocupada
+  termina sem tentar nada e **sem tocar** nenhuma agenda (o prazo não é renovado por estar ocupada), e o worker só varre de novo depois do intervalo de espera, sem laço
+  ativo. Limite conhecido: uma pendência cuja tentativa **falha sempre com erro** (não por carteira ocupada) não é reagendada, continua no início da ordem e consome parte
+  do orçamento de cada varredura; o worker não a isola.
 * **Elegibilidade temporal sob os locks**: depois de travar a carteira e a agenda, a tentativa compara o `next_attempt_at` **recarregado** com o relógio; uma seleção
   antiga não autoriza a tentativa que outra instância já reagendou para o futuro (o backoff persistido vale para todas). Não existe caminho "forçado" no worker:
   os testes avançam o relógio de propósito. A elegibilidade não é um prazo rígido de validade: uma referência `PROCESSED` ainda resolve depois do TTL.
@@ -312,9 +317,10 @@ continuidade durável.
   do Keycloak na API HTTP. Princípios:
   * **Uma identidade por responsabilidade, sem curingas**: produtor interno (só `SendMessage` na entrada), runtime (ciclo de vida da
     mensagem na entrada + envio à DLQ), publisher (`Publish`/`GetTopicAttributes` no tópico de saída), inspeção (observar e preparar cenários
-    na DLQ e na auditoria) e um principal sem políticas (para comprovar `AccessDenied`). A aplicação recebe **só** o perfil de runtime
-    (`AWS_PROFILE`/`AWS_SHARED_CREDENTIALS_FILE`, cadeia padrão do SDK); as credenciais de provisionamento (a raiz do emulador) ficam só no
-    one-shot e na prova. O publisher já tem principal, mas não há worker.
+    na DLQ e na auditoria) e um principal sem políticas (para comprovar `AccessDenied`). A aplicação **seleciona** o perfil de runtime
+    (`AWS_PROFILE`/`AWS_SHARED_CREDENTIALS_FILE`, cadeia padrão do SDK) e não recebe as credenciais de provisionamento (a raiz do emulador), que ficam só no
+    one-shot e na prova; o arquivo montado, porém, contém os cinco perfis e todos são legíveis pelo processo — não há isolamento físico entre eles (distribuir a cada
+    processo só o perfil necessário é uma recomendação técnica de endurecimento). O publisher já tem principal, mas não há worker.
   * **Modelo de confiança** (decisão da mentoria): a fila compartilhada é para **produtores internos confiáveis**; provedores externos não têm
     `SendMessage` direto. O produtor vincula a origem autenticada (token, ou configuração controlada) ao `providerId` permitido antes de
     publicar; o consumidor valida o envelope e o escopo, mas não trata um campo do corpo como autenticação. Ainda **não implementado** (inbox e consumidor são o incremento 4).
@@ -415,22 +421,37 @@ Limitações: `LOSS` não tem lançamento, então seu `result_balance` (saldo ob
 lançamento de `ROLLBACK` é imposto desde a 00005 (direção oposta à do alvo, §10); o dono do schema e
 superusuários ainda podem desabilitar triggers (a aplicação nunca roda com eles).
 
-#### Rollback e a agenda das pendências (achado da auditoria do incremento 2)
+#### Rollback e a agenda das pendências (achados da auditoria e da reauditoria do incremento 2)
 
 A agenda é dado durável (início, vencimento, próxima tentativa, tentativas, diagnóstico, agendas concluídas). O `Down` publicado da 00005
 apaga a tabela e o seu `Up` reconstrói linhas com `now() + 15 min` — o que renovaria um prazo vencido e zeraria tentativas. Documentar essa
-perda **não** a corrige; como a 00005 não pode ser reescrita, a correção é composta e compatível com o histórico:
+perda **não** a corrige; como a 00005 não pode ser reescrita, a correção é composta e compatível com o histórico. O procedimento é do migrador
+(`Migrator`, interfaces de `cmd/migrate up|down|down-to`) e **preserva ou recusa antes de qualquer perda**:
 
-* **Preparação de rollback** (`Migrator.Down`/`DownTo`, interfaces de `cmd/migrate down` e `down-to`): ao reverter a 00005, sob exclusão dos
-  escritores (`LOCK TABLE wallets, wager_transactions, pending_references IN SHARE ROW EXCLUSIVE MODE`), **revoga toda escrita** na agenda de
-  qualquer papel que não seja o dono (o runtime falha em voz alta em vez de gravar o que seria apagado; a janela entre a preparação e o `DROP` fica
-  coberta) e grava `pending_references_preserved` (cópia integral). A agenda original continua intacta até o `DROP`.
+* **Coordenação.** Cada operação do migrador roda sob um advisory lock próprio (`MigratorLockID`), mantido numa conexão dedicada, e só então o provider adquire o lock do
+  goose (outra chave, sempre depois: a ordem é única e não há deadlock). Decisão de versão, preparação, reversão e restauração não se intercalam com as de outro migrador.
+* **Preparação de rollback**, ao reverter a 00005 (por `Down` na versão 5 ou `DownTo(N)`, `0 < N < 5`), numa transação sob exclusão dos escritores (`LOCK TABLE wallets,
+  wager_transactions, pending_references IN SHARE ROW EXCLUSIVE MODE`): (a) lê os privilégios sobre a agenda **de tabela e de coluna** (`pg_class.relacl` e
+  `pg_attribute.attacl`, inclusive `PUBLIC`) e os revoga de todo papel que não seja o dono (o `REVOKE` de tabela remove também os de coluna); (b) **verifica no catálogo**:
+  qualquer papel de login — fora superusuários, o dono e a sessão do migrador — que ainda tenha escrita, direta, herdada ou por pertencer (`pg_has_role(..., 'MEMBER')`) a um
+  papel com escrita (p.ex. `pg_write_all_data`), **recusa** a preparação com os nomes e a transação é desfeita (nada muda); (c) grava `pending_references_preserved`
+  (cópia integral, sem acesso de `PUBLIC`), marcada, junto com a tabela viva, por um token em `COMMENT`.
+* **A cópia original nunca é substituída por um estado reconstruído.** Com uma cópia já existente: se a agenda viva é a tabela que foi copiada (mesmo token, ou conteúdo idêntico) — um
+  `down` anterior falhou ou foi cancelado depois da preparação —, a cópia é renovada a partir da agenda viva, que contém também o que o runtime confirmou depois da devolução dos
+  grants; se a agenda viva é a reconstrução do `Up` da 00005 (reaplicação parcial, `DownTo(4) → UpTo(5) → Down`), a cópia **original é mantida** e a preparação só prossegue se a
+  agenda viva for a reconstrução intacta (toda linha existe na cópia, sem tentativas, diagnóstico nem conclusão); caso contrário o rollback é **recusado** com contagem e primeiros
+  ids, sem alterar versão, agenda, cópia nem privilégios. A API recusa partir no schema intermediário, então essa recusa só ocorre por escrita manual (dono/superusuário).
+* **Devolução dos privilégios**: se a reversão falhar ou for cancelada depois da preparação (inclusive esperando o lock do goose), o migrador devolve os privilégios capturados quando a
+  agenda ainda existe (contexto próprio, não o cancelado); se o processo morrer antes, `migrate grants` os devolve. A agenda original fica intacta.
 * **Restauração** (00006, na reaplicação): substitui as linhas reconstruídas pelo `Up` da 00005 pelos valores originais, inclusive as concluídas,
   desabilitando o gatilho de imutabilidade só durante a restauração (dono, sob exclusão dos escritores), dispara as verificações deferidas e remove a cópia.
-  Uma cópia sem transação correspondente é recusada com contagem e ids (preflight), não descartada.
+  Uma cópia sem transação correspondente é recusada com contagem e ids (preflight), não descartada; uma restauração que falha deixa a cópia (a migration é transacional).
 * **Reset destrutivo ≠ rollback operacional**: `down-to 0` apaga tudo, como sempre, e descarta também a cópia; `down`/`down-to N>0` preservam.
-* Dados que nunca tiveram agenda (um `PENDING_REFERENCE` criado por SQL antes da 00005) recebem a agenda reconstruída da 00005 — não há valor original.
-* Testes: `audit_regressions_test.go` (ciclo preservando prazo vencido, tentativas, diagnóstico e concluídas; janela observada com o `DROP` retido por uma leitura aberta; banco ainda na versão 5; `down-to 0`; cópia órfã).
+* Limites: a exclusão é por privilégio — dono e superusuários (o operador) não são excluídos, e uma visão/função `SECURITY DEFINER` de outro dono que escreva na agenda não é detectada;
+  o `Down` da 00005 executado direto pelo goose não é protegido; dados que nunca tiveram agenda (um `PENDING_REFERENCE` criado por SQL antes da 00005) recebem a agenda reconstruída da 00005.
+* Testes: `audit_regressions_test.go` (ciclo preservando prazo vencido, tentativas, diagnóstico e concluídas; janela observada com o `DROP` retido por uma leitura aberta; banco ainda na versão 5;
+  `down-to 0`; cópia órfã) e `reaudit_regressions_test.go` (reaplicação parcial; `Down` cancelado com o lock do goose retido; repetição; recusa por perda de dados e por escritor não excluível, também
+  pelo binário; grants por coluna, `PUBLIC` e herança; concorrência entre migradores).
 
 ### 10.3. Upgrade com escritores ativos: a janela entre validar e instalar, e como foi fechada
 
@@ -541,7 +562,7 @@ espera/retenção pelo lock, dados preservados, reversão/reaplicação e partid
    válido para uma FK; é determinístico e corrigível).
 4. `WALLET_ALREADY_EXISTS` devolve o `walletId` existente: `POST /wallets` não tem chave de idempotência no
    enunciado, então este é o caminho de recuperação após erro de commit incerto.
-5. Operações síncronas: transação gravada já terminal; `202` previsto, não alcançável.
+5. Operações que dependem de uma referência ainda indisponível respondem `202` (`PENDING_REFERENCE`, sem saldo, com retomada durável, §8); `200`/`422` quando a transação é gravada já terminal.
 6. Replay de `REJECTED` responde `422` com `idempotentReplay:true` (mesmo status do original).
 7. Serviço interno pode ler qualquer transação; provedor só as suas.
 8. `GET …/ledger` e `POST …/reconciliation` respondem `501` após autorização.
@@ -560,6 +581,6 @@ nunca roda com eles (§10.1); o `result_balance` de `LOSS` não é verificável 
 é recusada pelo domínio e tratada por quem chama a transição (§3, §8); a rotação de chaves do IdP pode causar 401 por até 30 s (§9). Da
 política de reversões (§8): o `ROLLBACK` da BET depois do `ROLLBACK` do REFUND é recusado (escolha de contrato, não de viabilidade
 financeira). Das pendências: o TTL e o backoff usam o relógio da aplicação (diferença entre instâncias desloca o prazo, nunca o renova); uma
-uma carteira continuamente ocupada adia apenas a retomada das pendências dela (a varredura a pula e segue para as demais, `SKIP LOCKED`); o worker não tem lease (a exclusão é pelos locks
+uma carteira continuamente ocupada adia apenas a retomada das pendências dela (a consulta de candidatos a pula, `SKIP LOCKED`, e a varredura segue para as demais); o worker não tem lease (a exclusão é pelos locks
 e pela revalidação). Dos testes: o harness de processos reais compila o binário **sem `-race`** — `go test -race` do processo pai não
-instrumenta os filhos (adaptação prevista para a consolidação final). A proteção da agenda no rollback está no migrador (`Migrator`), não no SQL publicado da 00005: o `Down` da 00005 executado diretamente pelo goose, sem o migrador, não preserva a agenda.
+instrumenta os filhos (adaptação prevista para a consolidação final). A proteção da agenda no rollback está no migrador (`Migrator`), não no SQL publicado da 00005: o `Down` da 00005 executado diretamente pelo goose, sem o migrador, não preserva a agenda; a exclusão dos escritores é por privilégio (dono e superusuários não são excluídos).
