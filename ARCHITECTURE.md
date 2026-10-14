@@ -1,6 +1,6 @@
 # ARCHITECTURE
 
-Este documento registra as decisões do **primeiro incremento**. Cada decisão aponta se é
+Este documento registra as decisões de arquitetura e o estado de cada incremento entregue. Cada decisão aponta se é
 **requisito explícito** do enunciado (`descricao-desafio/README.md`), **interpretação** adotada, **decisão
 técnica** ou **pendência**. O estado de implementação está no fim e no README.
 
@@ -133,10 +133,23 @@ técnica** ou **pendência**. O estado de implementação está no fim e no READ
    legítimo não depende da carteira nem da configuração atual de moedas. A busca é sempre no escopo do provedor autenticado
    (autenticação e autorização antecedem tudo e não mudam).
 2b. **Políticas de operação nova** (só se a identidade não existe), nesta ordem: moeda habilitada (422 `CURRENCY_NOT_SUPPORTED`) e tipo
-   com processamento implementado (501 `KIND_NOT_SUPPORTED`, nada é gravado).
+   com processamento implementado (501 `KIND_NOT_SUPPORTED`, nada é gravado). Implementados: `BET`, `WIN` **sem** referência e `LOSS`.
+   `WIN` com `referenceExternalTransactionId` é 501 até a resolução de referências: a referência recebida nunca é ignorada.
 3. `GetForUpdate(walletId)`; inexistente → 404; jogador/moeda divergentes → 422 (erros de **entrada**, não gravados).
 4. Com a carteira travada, repete o passo 2 (uma operação concorrente da mesma carteira pode ter confirmado entre os passos).
-5. Aplica a regra (débito ou rejeição), grava carteira (CAS), transação, ledger e outbox, e confirma.
+5. Aplica a regra do tipo, grava carteira (CAS), transação, ledger e outbox, e confirma:
+   * `BET`: débito, ou rejeição `INSUFFICIENT_FUNDS` sem movimentação;
+   * `WIN`: crédito (uma linha de ledger `CREDIT`, `WagerTransactionProcessed` + `WalletBalanceChanged`); um crédito que estouraria o
+     limite de `Money` (`ErrAmountOverflow`) interrompe a tentativa, pois a carteira só muda depois de a movimentação ser validada
+     por inteiro — nada é gravado (HTTP 400 `INVALID_AMOUNT`);
+   * `LOSS`: o valor é exatamente `0.00`; a carteira é travada para observar o saldo, que vira o `result_balance` (e o que o replay
+     devolve), a transação nasce `PROCESSED` e só gera `WagerTransactionProcessed` — **sem** lançamento, sem alterar saldo ou versão
+     e sem `WalletBalanceChanged`.
+
+   **Núcleo compartilhável.** Os passos 2–5 vivem em `Service.processExternal`, que recebe os repositórios da tentativa (todos na mesma
+   `pgx.Tx`) e **não abre nem confirma** transação: `Submit` abre a `UnitOfWork`, chama o núcleo e deixa o commit para a `UnitOfWork`.
+   Outras entradas (consumidor SQS com inbox, worker de referências) podem chamar o mesmo núcleo dentro da *sua* transação, de modo
+   que a inbox e o efeito financeiro compartilhem o commit.
 6. Se uma unicidade do banco dispara no INSERT (mesma identidade aplicada a **outra** carteira, portanto sem disputar o lock),
    a tentativa é desfeita e **refeita em nova transação** (até 3×), que então enxerga o commit vencedor e responde
    replay/conflito. Violações de unicidade não viram erro genérico: `classify` as mapeia por **nome de constraint**.
@@ -168,7 +181,7 @@ conflito de idempotência = `409`; indisponibilidade = `503` + `Retry-After`; co
 nesta versão (não há aceite assíncrono).
 
 `failureCode` implementados: `INSUFFICIENT_FUNDS` (BET). Reservados para o incremento de reversões, **ainda não
-emitidos**: ver §8.
+emitidos**: ver §8. `WIN` e `LOSS` não têm código de rejeição próprio: o crédito não depende de saldo e `LOSS` apenas registra o resultado.
 
 Processamento é **síncrono**: a transação é inserida já no estado final, sem commit intermediário de `PENDING`
 (permitido pelo enunciado para operações sem dependências). Por isso não há o que retomar após queda; o `PENDING`
@@ -195,7 +208,7 @@ só passará a ser persistido junto com a retomada durável (worker de referênc
 ## 8. Reversões, referências pendentes e `PENDING_REFERENCE` — **decisões em aberto**
 
 Não implementados (HTTP 501). O enunciado exige documentar a política; **não foi inventada nenhuma regra silenciosa**.
-Já garantido pelo schema: `reference_external_transaction_id` obrigatório para `REFUND/ROLLBACK`, opcional para `WIN`,
+`WIN`/`LOSS` já estão implementados (§5). Já garantido pelo schema: `reference_external_transaction_id` obrigatório para `REFUND/ROLLBACK`, opcional para `WIN`,
 proibido nos demais (CHECK); `reference_transaction_id` para a referência resolvida.
 
 Proposta para aprovação (não aplicada):
@@ -409,7 +422,7 @@ espera/retenção pelo lock, dados preservados, reversão/reaplicação e partid
 
 ## 14. Limitações e trabalho não concluído
 
-Ver "Escopo e pendências" no README. Em síntese: `WIN/LOSS/REFUND/ROLLBACK`, política de reversões (§8), SQS + inbox,
+Ver "Escopo e pendências" no README. Em síntese: `REFUND/ROLLBACK` e `WIN` com referência, política de reversões (§8), SQS + inbox,
 publicador de outbox, worker de referências, paginação do ledger, reconciliação, métricas, e a prova com três processos
 para fluxos SQS/outbox. A prova com três processos **existe para o fluxo HTTP implementado** (`multiprocess_test.go`).
 
