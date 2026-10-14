@@ -13,35 +13,45 @@ import (
 	"desafio-tecnico-go/internal/infra/postgres"
 )
 
+// scratchAt cria um banco auxiliar (removido ao fim) e o migra até a versão indicada.
+func scratchAt(t *testing.T, purpose string, version int64) (string, *postgres.Migrator, *pgx.Conn) {
+	t.Helper()
+	ctx := context.Background()
+	url := createScratchDatabase(t, purpose)
+	mig, err := postgres.NewMigrator(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { mig.Close() })
+	if _, err := mig.UpTo(ctx, version); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close(ctx) })
+	return url, mig, conn
+}
+
+func schemaVersion(t *testing.T, conn *pgx.Conn) int64 {
+	t.Helper()
+	var v int64
+	if err := conn.QueryRow(context.Background(), `SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
 // A migration corretiva 00002 é aplicável a um banco já inicializado (versão 1) sem
 // apagar dados; e recusa, sem alterar nada, um histórico inconsistente.
 func TestCorrectiveMigrationPreservesDataAndRefusesInconsistentHistory(t *testing.T) {
 	ctx := context.Background()
 
 	newV1 := func(t *testing.T, purpose string) (string, *postgres.Migrator, *pgx.Conn) {
-		url := createScratchDatabase(t, purpose)
-		mig, err := postgres.NewMigrator(url)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { mig.Close() })
-		if _, err := mig.UpTo(ctx, 1); err != nil {
-			t.Fatal(err)
-		}
-		conn, err := pgx.Connect(ctx, url)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { conn.Close(ctx) })
-		return url, mig, conn
+		return scratchAt(t, purpose, 1)
 	}
-	version := func(conn *pgx.Conn) int64 {
-		var v int64
-		if err := conn.QueryRow(ctx, `SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&v); err != nil {
-			t.Fatal(err)
-		}
-		return v
-	}
+	version := func(conn *pgx.Conn) int64 { return schemaVersion(t, conn) }
 	// Dados coerentes da versão 1: abertura de 100,00 e um débito de 10,00.
 	populate := func(conn *pgx.Conn, brokenChain, nullResult bool) (wallet uuid.UUID) {
 		wallet = uuid.New()
@@ -97,10 +107,14 @@ func TestCorrectiveMigrationPreservesDataAndRefusesInconsistentHistory(t *testin
 		if after := counts(); after != before {
 			t.Fatalf("data changed: %v -> %v", before, after)
 		}
-		if v := version(conn); v < 2 {
-			t.Fatalf("version %d", v)
+		want, err := postgres.ExpectedVersion()
+		if err != nil {
+			t.Fatal(err)
 		}
-		// E a reversão da corretiva também preserva os dados.
+		if v := version(conn); v != want {
+			t.Fatalf("version %d, want %d", v, want)
+		}
+		// E a reversão da última migration também preserva os dados.
 		if _, err := mig.Down(ctx); err != nil {
 			t.Fatal(err)
 		}

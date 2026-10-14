@@ -239,16 +239,17 @@ func TestLedgerEntryIsBoundToItsWalletAndTransaction(t *testing.T) {
 		w := seedCommitted(t, 10000)
 		return inTx(func(ctx context.Context, tx pgx.Tx) error {
 			id := uuid.New()
-			var result any = int64(0)
+			after := int64(10000) - entryAmount
+			if direction == "CREDIT" {
+				after = 10000 + entryAmount
+			}
+			// O resultado é o saldo posterior do lançamento da própria operação (nulo enquanto PENDING).
+			var result any = after
 			if status == "PENDING" {
 				result = nil
 			}
 			if _, err := tx.Exec(ctx, insBet, id, w.id, w.player, txAmount, kind, status, id.String(), result); err != nil {
 				return err
-			}
-			after := int64(10000) - entryAmount
-			if direction == "CREDIT" {
-				after = 10000 + entryAmount
 			}
 			if _, err := tx.Exec(ctx, insEntry, uuid.New(), w.id, id, direction, entryAmount, 10000, after); err != nil {
 				return err
@@ -280,10 +281,14 @@ func TestTerminalStatesRequireAnExplicitResult(t *testing.T) {
 	w := seedCommitted(t, 10000)
 	insert := func(status string, failure, result any, kind string, ref any) error {
 		id := uuid.New()
+		amount := 100
+		if kind == "LOSS" {
+			amount = 0
+		}
 		return sqlExec(`INSERT INTO wager_transactions (id, origin, kind, status, wallet_id, player_id, amount, currency, provider_id, external_transaction_id,
 			idempotency_key, payload_hash, round_id, game_id, reference_external_transaction_id, failure_code, result_balance, created_at, updated_at)
-			VALUES ($1,'EXTERNAL',$2,$3,$4,$5,100,'BRL','results',$6,$6,'h','r','g',$7,$8,$9,now(),now())`,
-			id, kind, status, w.id, w.player, id.String(), ref, failure, result)
+			VALUES ($1,'EXTERNAL',$2,$3,$4,$5,$10,'BRL','results',$6,$6,'h','r','g',$7,$8,$9,now(),now())`,
+			id, kind, status, w.id, w.player, id.String(), ref, failure, result, amount)
 	}
 	const shape = "ck_wager_tx_status_shape"
 
@@ -304,7 +309,8 @@ func TestTerminalStatesRequireAnExplicitResult(t *testing.T) {
 
 	// Combinações válidas continuam aceitas.
 	for name, err := range map[string]error{
-		"PROCESSED":         insert("PROCESSED", nil, 0, "BET", nil), // zero é um resultado válido, distinto de NULL
+		// zero é um resultado válido, distinto de NULL; LOSS é a conclusão sem movimento (uma BET PROCESSED exige lançamento)
+		"PROCESSED":         insert("PROCESSED", nil, 0, "LOSS", nil),
 		"REJECTED":          insert("REJECTED", "INSUFFICIENT_FUNDS", 100, "BET", nil),
 		"PENDING":           insert("PENDING", nil, nil, "BET", nil),
 		"PENDING_REFERENCE": insert("PENDING_REFERENCE", nil, nil, "REFUND", "ref"),

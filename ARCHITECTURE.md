@@ -238,7 +238,7 @@ Proposta para aprovação (não aplicada):
 
 ## 10. Garantias impostas pelo PostgreSQL (§5.3, §5.8)
 
-Migration `00001_init.sql` — verificadas por tentativas **diretas de SQL** em `constraints_test.go`:
+Migrations `00001_init.sql`, `00002_…` e `00003_…` — verificadas por tentativas **diretas de SQL** (inclusive pelo papel restrito de runtime) em `constraints_test.go`, `db_integrity_test.go` e `completed_movement_test.go`:
 
 | Garantia | Mecanismo |
 | --- | --- |
@@ -250,6 +250,8 @@ Migration `00001_init.sql` — verificadas por tentativas **diretas de SQL** em 
 | **Cadeia contínua do ledger** (migration 00002) | trigger `BEFORE INSERT` `ledger_enforce_chain`: `balance_before` = `balance_after` do lançamento anterior da carteira (0 no primeiro). Ele **trava a linha da carteira** (`FOR NO KEY UPDATE`, mesmo nível do UPDATE de saldo): escritores da mesma carteira se serializam — inclusive em SQL direto —, carteiras diferentes não se bloqueiam, e vários lançamentos numa transação são validados em sequência. Escrita fora de ordem (`seq` menor que o último) falha como `40001`, tratada como transitória |
 | Saldo = créditos − débitos | cadeia contínua + a constraint deferida abaixo (saldo = `balance_after` do último lançamento) ⇒, por indução, saldo = Σ créditos − Σ débitos |
 | Lançamento vinculado à carteira e à transação financeira | FK composta `(transaction_id, wallet_id)` → `wager_transactions(id, wallet_id)`; constraint deferida `ledger_entry_matches_transaction`: transação `PROCESSED`, mesmo valor, sentido coerente com o tipo (`BET` = débito; `OPENING/WIN/REFUND` = crédito; `LOSS` nunca tem lançamento) |
+| **Transação concluída exige o seu movimento** (migration 00003) | *constraint trigger* **deferido** `ctrg_wager_tx_requires_movement` em `wager_transactions` (`AFTER INSERT OR UPDATE ... WHEN status = 'PROCESSED' AND kind <> 'LOSS'`): no COMMIT, toda transação `PROCESSED` (`OPENING`, `BET`, `WIN`, `REFUND`, `ROLLBACK`) tem o lançamento da própria carteira. `LOSS` e `REJECTED`/`FAILED`/`PENDING*` não têm — e um lançamento para eles é recusado pelo lado do ledger. A transação e o lançamento podem ser inseridos em qualquer ordem, e várias operações podem ser confirmadas na mesma transação SQL |
+| **Resultado = saldo posterior do seu lançamento** (00003) | no mesmo trigger e, espelhado, em `ledger_entry_matches_transaction`: `result_balance = balance_after` **do lançamento da própria operação**. Não é comparado com o saldo atual da carteira (outras operações, inclusive da mesma transação SQL, podem tê-lo alterado); por isso um replay devolve exatamente o saldo observado no processamento original |
 | Aritmética e sinal do ledger | `CHECK` (`CREDIT`: after = before + amount; `DEBIT`: after = before − amount; amount > 0; saldos ≥ 0) |
 | Um lançamento por `(wallet_id, transaction_id)` | `UNIQUE` |
 | Moeda/jogador consistentes entre carteira, transação e ledger | FKs compostas `(wallet_id, currency)` e `(wallet_id, player_id)` |
@@ -275,12 +277,31 @@ Migration `00001_init.sql` — verificadas por tentativas **diretas de SQL** em 
 * Limitação restante: o dono e superusuários continuam podendo desabilitar triggers — por isso a aplicação nunca roda com
   esses papéis. Em produção, crie o papel de runtime fora do pipeline de migrations se o papel das migrations não tiver `CREATEROLE`.
 
-### 10.2. Aplicar a correção a bancos já inicializados
+### 10.2. Aplicar as correções a bancos já inicializados
 
-`00002_ledger_chain_and_result_integrity.sql` é aplicada por `migrate up` **sem apagar dados**. Ela começa por uma verificação
-prévia (cadeia, vínculo, resultados nulos, saldos×ledger) que **aborta com a contagem do problema** se o histórico estiver
-inconsistente, sem corrigir nada automaticamente — a decisão sobre registros históricos é humana. Testado: histórico válido é
-preservado (inclusive na reversão); histórico com cadeia quebrada ou resultado nulo é recusado e o schema permanece na versão 1.
+As migrations 00001 e 00002 já foram publicadas e executadas: **não são reescritas**; cada correção é uma migration nova.
+`migrate up` aplica as pendentes **sem apagar dados**, e cada uma começa por uma verificação prévia (*preflight*) do histórico que
+**aborta com a contagem do problema** — e, na 00003, os primeiros ids — se houver registros incompatíveis com a garantia que ela
+instala, sem corrigir nada automaticamente (a decisão sobre registros financeiros históricos é humana; o schema permanece na
+versão anterior).
+
+| Migration | Preflight (aborta se houver...) | Instala | Reversão (`migrate down`, um passo) |
+| --- | --- | --- | --- |
+| `00002_ledger_chain_and_result_integrity` | cadeia do ledger quebrada; lançamento incoerente com sua transação; `PROCESSED`/`REJECTED` com resultado nulo; `failure_code` inválido; saldo ≠ ledger | cadeia contínua, FK composta, resultado explícito | remove o que instalou |
+| `00003_completed_movement_requires_ledger` | transação `PROCESSED` (≠ `LOSS`) **sem lançamento**; `result_balance` ≠ `balance_after` do lançamento | trigger deferido da transação e verificação de resultado no lado do ledger | remove o trigger e restaura a função de 00002; **não toca nos dados** (após a reversão a lacuna volta a existir) |
+
+Mecanismo da 00003 (por que um *constraint trigger* deferido): um `CHECK` não enxerga outra tabela; uma FK da transação para o
+ledger seria circular com a FK do ledger para a transação; um trigger imediato exigiria uma ordem de inserção. O deferido é avaliado
+no COMMIT sobre o estado final, é somente leitura (não trava nada, não afeta a concorrência por carteira) e consulta o lançamento
+pelo índice único `(wallet_id, transaction_id)`; o `WHEN` limita o custo às transações `PROCESSED` com movimento.
+
+Testado (`migration_test.go`, `migration_movement_test.go`): histórico válido é preservado (inclusive na reversão); histórico com
+cadeia quebrada, resultado nulo, transação concluída sem lançamento ou resultado divergente é recusado, com o schema na versão
+anterior e os registros intactos; aplicar → reverter → reaplicar funciona.
+
+Limitações: `LOSS` não tem lançamento, então seu `result_balance` (saldo observado) não é verificável contra o ledger; o sentido do
+lançamento de `ROLLBACK` depende da operação original e só será imposto com o processamento de reversões; o dono do schema e
+superusuários ainda podem desabilitar triggers (a aplicação nunca roda com eles).
 
 ## 11. Composição Fx, ciclo de vida e shutdown (§4)
 
