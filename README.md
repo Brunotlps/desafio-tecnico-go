@@ -148,7 +148,7 @@ partida; todos os problemas são reportados de uma vez.
 | `OIDC_AUDIENCE` | — (obrigatória) | audiência exigida (`wager-api`) |
 | `OIDC_CLOCK_SKEW` | `5s` | tolerância de relógio na validação do token |
 | `AWS_REGION`, `AWS_ENDPOINT_URL` | `us-east-1`, vazio | SQS (MiniStack localmente); credenciais pela cadeia padrão do SDK |
-| `AWS_SHARED_CREDENTIALS_FILE`, `AWS_PROFILE` | — | a API usa o principal de **runtime** do broker: perfil `wager-runtime` do arquivo de credenciais escrito pelo `broker-provision` (no Compose: `/run/broker/credentials`). Não defina `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (prevalecem sobre o perfil) |
+| `AWS_SHARED_CREDENTIALS_FILE`, `AWS_PROFILE` | — | a API **seleciona** o principal de **runtime** do broker: perfil `wager-runtime` do arquivo de credenciais escrito pelo `broker-provision` (no Compose: `/run/broker/credentials`). O arquivo montado contém os **cinco** perfis, legíveis pelo processo; separá-los por processo é uma recomendação técnica de endurecimento, não algo que este ambiente local isole. Não defina `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (prevalecem sobre o perfil) |
 | `SQS_WAGER_QUEUE_NAME` | `wager-transactions.fifo` | fila verificada na readiness |
 | `ALLOWED_CURRENCIES` | `BRL` | moedas aceitas (códigos de 3 letras maiúsculas) |
 | `HTTP_ADDR` | `:8080` | endereço do servidor |
@@ -190,7 +190,7 @@ reler o arquivo).
 | Principal (usuário IAM = perfil) | Permissões (por ação e recurso, sem curingas) |
 | --- | --- |
 | `wager-producer` (produtor interno) | `SendMessage`, `GetQueueUrl` na entrada. Sem consumo, remoção, DLQ ou SNS |
-| `wager-runtime` (consumidor; **usado pela API**) | na entrada: `GetQueueUrl`, `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility`; na DLQ: `GetQueueUrl`, `SendMessage` |
+| `wager-runtime` (consumidor; **selecionado pela API**) | na entrada: `GetQueueUrl`, `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility`; na DLQ: `GetQueueUrl`, `SendMessage` |
 | `wager-publisher` (futuro publicador da outbox) | `sns:Publish` e `sns:GetTopicAttributes` no tópico de eventos. Não consome a entrada |
 | `wager-inspector` (testes/diagnóstico) | observa e prepara cenários na DLQ e na fila de auditoria; atributos da entrada; assinaturas do tópico |
 | `wager-nobody` | nenhuma política (comprova `AccessDenied`) |
@@ -292,21 +292,34 @@ troque `DATABASE_URL` da API para ele (o Compose já faz isso).
 
 A agenda (`pending_references`: início, vencimento, próxima tentativa, tentativas, diagnóstico e as agendas concluídas) é **dado durável**,
 não estado descartável: reverter e reaplicar não pode apagá-la nem renovar um prazo vencido. Como a 00005 já foi publicada, o `Down`
-dela (que remove a tabela) e o `Up` (que reconstrói linhas com prazo novo) **não foram reescritos**; a solução compatível é:
+dela (que remove a tabela) e o `Up` (que reconstrói linhas com prazo novo) **não foram reescritos**; a solução compatível é um procedimento do
+migrador (`Migrator`, usado por `cmd/migrate`) que **preserva ou recusa antes de qualquer perda**:
 
-1. **Reversão operacional** — `migrate down` (um passo) e `migrate down-to N` com `N > 0`, pela interface do migrador (`Migrator.Down`/`DownTo`):
-   antes de reverter a 00005, o migrador executa a **preparação do rollback** sob exclusão dos escritores (`LOCK TABLE … SHARE ROW EXCLUSIVE`, mesma ordem
-   das migrations): revoga a escrita na agenda para todo papel que não seja o dono (o runtime passa a falhar em voz alta, nada é gravado para depois ser
-   apagado) e guarda uma **cópia integral** em `pending_references_preserved`. Reverter a 00006 e as posteriores não toca em dados.
+0. **Coordenação.** Toda operação do migrador (`up`, `down`, `down-to`) roda sob um advisory lock próprio (`MigratorLockID`, distinto do lock do goose, que
+   o provider adquire por dentro, sempre depois: ordem única, sem deadlock). A leitura da versão, a preparação, a reversão e a restauração não se
+   intercalam com as de outro migrador.
+1. **Reversão operacional** — `migrate down` (um passo) e `migrate down-to N` com `N > 0`: antes de reverter a 00005, o migrador executa a **preparação**
+   sob exclusão dos escritores (`LOCK TABLE … SHARE ROW EXCLUSIVE`, mesma ordem das migrations), numa única transação:
+   * captura e **revoga** os privilégios sobre a agenda de todo papel que não seja o dono — de tabela **e de coluna**, inclusive os concedidos a `PUBLIC`
+     (`pg_class.relacl` e `pg_attribute.attacl`) — e **verifica no catálogo** o efeito: se algum papel de login (que não seja superusuário, o dono nem a sessão do
+     migrador) ainda conseguir escrever, direta, herdada ou por pertencer a um papel com escrita (p.ex. `pg_write_all_data`), o rollback é **recusado**,
+     com os nomes, sem alterar nada;
+   * guarda uma **cópia integral** em `pending_references_preserved` (acessível só ao dono). A cópia **original nunca é substituída por uma reconstrução**:
+     se já existe uma cópia e a agenda viva é a mesma tabela que foi copiada (um `down` anterior falhou ou foi cancelado), a cópia é renovada a partir da agenda viva;
+     se a agenda viva é a reconstrução criada pelo `Up` da 00005 (reaplicação parcial), a cópia original é mantida e o rollback só prossegue se a agenda viva for
+     a reconstrução **intacta** (nenhuma linha fora da cópia, sem tentativas, diagnóstico nem conclusão) — caso contrário é **recusado**, com contagem e ids, sem alterar nada.
+   Reverter a 00006 e as posteriores não toca em dados.
 2. **Reaplicação** — `migrate up`: o `Up` da 00005 reconstrói, com prazo renovado, uma linha para cada `PENDING_REFERENCE` (comportamento publicado);
    a **00006 restaura por cima delas a cópia preservada** — valores originais, inclusive as agendas concluídas — e a remove. Uma cópia que não
-   corresponde a nenhuma transação (p.ex. após um reset) **bloqueia a restauração** com contagem e ids, sem descartá-la em silêncio.
+   corresponde a nenhuma transação (p.ex. após um reset) **bloqueia a restauração** com contagem e ids, sem descartá-la em silêncio; se a restauração falhar, a cópia permanece.
 3. **Reset deliberadamente destrutivo** — `migrate down-to 0` (e a suíte de testes): apaga todas as tabelas e dados, como sempre, **inclusive** a cópia preservada.
-4. Se a reversão da 00005 falhar depois da preparação, a agenda original continua íntegra; `migrate grants` devolve a escrita ao runtime.
+4. **Falha ou cancelamento depois da preparação**: a agenda original continua íntegra e o próprio migrador **devolve os privilégios** capturados (se a agenda
+   ainda existe). Se o processo morrer antes disso, `migrate grants` (ou um `migrate up` com `RUNTIME_DB_ROLE`) os devolve.
 
-Limite: a proteção está no migrador (`cmd/migrate`, `Migrator`); executar o `Down` da 00005 diretamente pelo goose, sem passar por ele, não é protegido.
-Pare as instâncias da API antes de um rollback (como no upgrade). Pendências que nunca tiveram agenda (criadas por SQL numa versão anterior à 00005) recebem,
-no `Up` da 00005, a agenda reconstruída publicada — não há dado original a restaurar.
+Limites: a proteção está no migrador; executar o `Down` da 00005 diretamente pelo goose, sem passar por ele, não é protegido. A exclusão dos escritores é por
+privilégio: o papel **dono** e superusuários não são excluídos (são o operador), e uma visão ou função `SECURITY DEFINER` de outro dono que escreva na agenda não é detectada. Pare as
+instâncias da API antes de um rollback (como no upgrade) — a revogação impede que escrevam, mas elas falharão em voz alta até a restauração. Pendências que nunca tiveram agenda
+(criadas por SQL numa versão anterior à 00005) recebem, no `Up` da 00005, a agenda reconstruída publicada — não há dado original a restaurar.
 
 ## Executar a aplicação sem Docker para a API
 
@@ -353,7 +366,7 @@ Variáveis opcionais (padrões coincidem com o Compose): `TEST_DATABASE_URL`, `T
 | Casos de uso | `service_test.go` | abertura de carteira e BET direto no serviço (sem HTTP): replay, conflitos com precedência da identidade, rejeição, 50 reenvios e 2×80,00 sobre 100,00 |
 | Verificador JWT | `auth_verifier_test.go` | identidades derivadas do token do Keycloak; adulterado, forjado, `alg:none`, HS256, emissor/audiência diferentes, expirado; `Start` falha com IdP inacessível |
 | Fluxo | `flow_test.go` | abertura positiva (OPENING, ledger, 2 eventos, versão 1), zero, duplicada (409), parsing estrito de dinheiro por HTTP, BET aceita/rejeitada, tipos não suportados, validação de entrada |
-| WIN e LOSS | `win_loss_test.go` | `WIN` credita uma vez (ledger `CREDIT`, `WagerTransactionProcessed` + `WalletBalanceChanged` com causalidade e `walletVersion`); overflow sem efeitos parciais; `LOSS` sem ledger, sem alterar saldo/versão e só com `WagerTransactionProcessed`; replays com o saldo original; 50 reenvios de `WIN`/`LOSS` em paralelo; `LOSS` espera o lock da carteira; `WIN` com referência segue 501; **3 processos reais** (reenvios e créditos distintos sem perda) |
+| WIN e LOSS | `win_loss_test.go` | `WIN` credita uma vez (ledger `CREDIT`, `WagerTransactionProcessed` + `WalletBalanceChanged` com causalidade e `walletVersion`); overflow sem efeitos parciais; `LOSS` sem ledger, sem alterar saldo/versão e só com `WagerTransactionProcessed`; replays com o saldo original; 50 reenvios de `WIN`/`LOSS` em paralelo; `LOSS` espera o lock da carteira; `WIN` com referência é processado como as reversões (200 ou 202, ver as linhas Reversões e Referências pendentes); **3 processos reais** (reenvios e créditos distintos sem perda) |
 | Idempotência | `idempotency_test.go` | replay devolve o saldo original após outras movimentações; rejeição terminal não é reavaliada após crédito; conflito de payload; mesma operação externa com outra chave; chaves por provedor; **conflito tem precedência sobre carteira inexistente/jogador/moeda divergentes**; disputa da mesma identidade entre carteiras diferentes |
 | Precedência da identidade | `identity_precedence_test.go` | caso de uso e HTTP: chave ou id externo já registrado com **moeda não habilitada ou tipo diferente (WIN/LOSS/REFUND/ROLLBACK)** → 409; entradas estruturalmente inválidas continuam 400/422; operações novas continuam 422/501; escopo por provedor; 401/403 antes de tudo; nada é persistido |
 | Concorrência | `concurrency_test.go` | 50 reenvios paralelos → 1 débito; 2×80,00 sobre 100,00 (com reenvios) → 1 processada, 1 rejeitada, saldo 20,00; sem lost update; carteiras independentes não se bloqueiam; várias carteiras em paralelo |
@@ -369,6 +382,7 @@ Variáveis opcionais (padrões coincidem com o Compose): `TEST_DATABASE_URL`, `T
 | Pendências | `pending_references_test.go`, `shutdown_test.go` | aceite com agenda e evento únicos, prazo que não renova no replay/tentativa, resolução pela mesma operação, resolução **depois do TTL**, expiração terminal que não reabre, `REFERENCE_PENDING_TIMEOUT`, referência que termina sem sucesso, falha de consulta que **não** vira `REFERENCE_NOT_FOUND`, falha antes/depois do commit (resultado desconhecido) sem duplicar, 10 executores na mesma pendência, carteira ocupada pulada e outras progredem, relógio atrasado; o TTL é atravessado com **relógio injetado** (sem dormir) |
 | Garantias das referências no banco | `reference_constraints_test.go`, `migration_references_test.go` | SQL direto pelo **papel restrito**: referência fora do escopo/tipo/estado/valor, formas `NULL`/incompletas, segunda reversão (índice único), `ROLLBACK` com lançamento no sentido errado (no COMMIT), colunas imutáveis (privilégio e trigger), `PENDING`/`PENDING_REFERENCE` sem agenda, agenda sem exclusão/alteração de prazo; migration 00005: dados preservados, histórico incompatível recusado (5 formas), reversão/reaplicação, pendências sobreviventes |
 | Correções da auditoria do incremento 2 | `audit_regressions_test.go` | (1) carteira ocupada no início da varredura não impede o avanço de outra (≥ `BatchSize` pendências na ocupada; várias instâncias; varredura toda ocupada termina com poucas consultas, sem tocar nenhuma agenda); (2) candidato antigo não contorna o backoff reagendado por outra instância (sincronização pelos canais do decorador de leitura); (3) rollback/reaplicação preservam a agenda (inclusive concluídas e prazo vencido), a janela da reversão da 00005 é observada (escrita revogada, cópia completa), `down-to 0` é destrutivo, cópia órfã bloqueia a restauração; (4) o banco recusa `PENDING_REFERENCE` de BET/LOSS/OPENING/WIN sem referência e referências com formas inválidas (NULL, vazia, espaços, controle, longa), aceita as válidas e as retoma, e a migration recusa histórico inválido com ids. As varreduras usam **bancos exclusivos** do teste |
+| Correções da reauditoria do incremento 2 | `reaudit_regressions_test.go` | (1) uma carteira livre avança atrás de **120 carteiras ocupadas distintas** com `BatchSize=1` (muito além de qualquer orçamento de páginas), sem tocar nas ocupadas, e várias instâncias concorrentes a avançam **uma só vez**; (2) `DownTo(4) → UpTo(5) → Down → Up` e `Down` cancelado com o lock do goose retido por outra sessão **preservam a cópia original** (TTL de 7 min, vencida, 7 tentativas e diagnóstico, agenda concluída; todas as colunas), a escrita do runtime é devolvida pelo migrador, uma repetição renova a cópia a partir da agenda viva, um rollback que perderia dados é **recusado sem alterar nada** (API e binário `migrate`) e um segundo migrador espera o primeiro; (3) papel só com grants **por coluna**, `PUBLIC` por coluna e papel que herda de um grupo ficam sem escrita durante a janela, o runtime padrão continua bloqueado e recupera os grants ao cancelar, e um escritor que não pode ser excluído recusa o rollback antes de qualquer alteração |
 | Shutdown coordenado | `internal/lifecycle/coordinator_test.go`, `shutdown_test.go` | ordem (admissão em todos → drenagem → cancelamento → confirmação), término incompleto, falha de partida; com infraestrutura real: requisição presa no lock é recusada/drenada/cancelada e o **pool só fecha depois**, tentativa do worker presa é cancelada e outra instância conclui, partida com porta ocupada sem vazar conexões, configuração incoerente recusada |
 | Multiprocesso | `multiprocess_test.go`, `win_loss_test.go`, `references_multiprocess_test.go` | **3 processos do binário real**: 50 reenvios espalhados, disputa 2×80,00 entre processos, conexões próprias, `SIGTERM` com saída 0; `SIGKILL` de um processo no meio da carga sem duplicar nem perder débito; reenvios de `WIN`/`LOSS`; **reversões pendentes resolvidas pelos executores dos três processos** (por carteira: uma processada, uma rejeitada, um crédito), `SIGKILL` do processo que aceitou a pendência, expiração com três executores (uma rejeição, um evento). O binário dos filhos é compilado **sem `-race`** (pendência registrada) |
 
@@ -439,5 +453,5 @@ replay/conflito (409) antes das políticas de operação nova (moeda, tipo).
 | Limites das garantias atuais | o dono do schema e superusuários podem desabilitar triggers (a API roda com papel restrito); o `result_balance` de `LOSS` (saldo observado, sem lançamento) não é verificável contra o ledger; o sentido do lançamento de `ROLLBACK` é imposto no banco desde a 00005 (ARCHITECTURE §10); a regressão de relógio entre instâncias é recusada pelo domínio e tratada por quem chama a transição (ARCHITECTURE §3); rotação de chaves do IdP pode causar 401 por até 30 s |
 
 **Próximo incremento recomendado:** publicador da outbox (reserva com lease e token, publicação fora da transação, SNS FIFO); em seguida a
-inbox + consumidor SQS sobre o mesmo núcleo financeiro (`Service.processExternal`), precedidos da decisão sobre a infraestrutura do broker.
+inbox + consumidor SQS sobre o mesmo núcleo financeiro (`Service.processExternal`). A infraestrutura do broker já está decidida e provada (MiniStack 1.5.27, `AUTH=true`; ver "Broker").
 Detalhes em `ARCHITECTURE.md`.
