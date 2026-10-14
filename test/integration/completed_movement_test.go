@@ -162,12 +162,15 @@ func TestProcessedMovementWithoutLedgerEntryIsRejected(t *testing.T) {
 		}
 	})
 
-	t.Run("PENDING stays valid without a ledger entry", func(t *testing.T) {
+	t.Run("PENDING needs no movement but is never committed", func(t *testing.T) {
 		w := openWallet(t, a, "100.00")
 		bet := newDirectBet("provider-a", id("k4"), id("t4"), 1000)
+		// Dentro da transação, PENDING não exige lançamento; confirmado, ele é recusado: não há aceite
+		// assíncrono, e uma pendência só existe como PENDING_REFERENCE com agenda (pending_references_test.go).
 		err := rtInTx(t, rt, func(ctx context.Context, tx pgx.Tx) error { return bet.insert(t, ctx, tx, w, "PENDING", nil, nil) })
-		if err != nil {
-			t.Fatalf("PENDING needs no movement: %v", err)
+		expectPgMessage(t, "committed PENDING", err, "23514", "cannot be committed as PENDING")
+		if n := countRows(t, "wager_transactions", "id = $1", bet.ID); n != 0 {
+			t.Fatal("the PENDING transaction was persisted")
 		}
 	})
 }

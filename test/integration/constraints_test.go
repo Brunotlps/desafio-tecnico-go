@@ -55,11 +55,13 @@ func sqlExec(sql string, args ...any) error {
 	return err
 }
 
-// insertPending grava uma transação externa PENDING (sem resultado): válida sem lançamento.
-const insertPending = `INSERT INTO wager_transactions
+// insertRejected grava uma transação externa REJECTED (terminal, sem movimento nem lançamento): um registro
+// existente e válido, usado como fixture. (Antes era PENDING; PENDING deixou de poder ser confirmado sem
+// retomada durável — ver pending_references_test.go.)
+const insertRejected = `INSERT INTO wager_transactions
 	(id, origin, kind, status, wallet_id, player_id, amount, currency, provider_id, external_transaction_id, idempotency_key,
-	 payload_hash, round_id, game_id, created_at, updated_at)
-	VALUES ($1,'EXTERNAL',$2,'PENDING',$3,$4,$5,'BRL',$6,$7,$8,'h','r','g',now(),now())`
+	 payload_hash, round_id, game_id, failure_code, result_balance, created_at, updated_at)
+	VALUES ($1,'EXTERNAL',$2,'REJECTED',$3,$4,$5,'BRL',$6,$7,$8,'h','r','g','FIXTURE',0,now(),now())`
 
 // insertTx grava uma transação externa PROCESSED. Uma operação com movimento só é confirmada com o
 // lançamento no mesmo commit; nos testes que não o gravam, o erro esperado vem de uma constraint imediata.
@@ -118,8 +120,8 @@ func TestDatabaseConstraintsAndLedgerProtection(t *testing.T) {
 		err = sqlExec(`INSERT INTO wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at)
 			VALUES ($1,$2,$3,'CREDIT',0,'BRL',10000,10000,now())`, uuid.New(), w.ID, uuid.New())
 		expectPg(t, "zero amount", err, "23514", "ck_ledger_amount")
-		freeTx := uuid.New() // transação existente (PENDING), ainda sem lançamento
-		if err := sqlExec(insertPending, freeTx, "WIN", w.ID, playerID, 10, "p-ledger", "e-ledger", "k-ledger"); err != nil {
+		freeTx := uuid.New() // transação existente (REJECTED), sem lançamento
+		if err := sqlExec(insertRejected, freeTx, "WIN", w.ID, playerID, 10, "p-ledger", "e-ledger", "k-ledger"); err != nil {
 			t.Fatal(err)
 		}
 		err = sqlExec(`INSERT INTO wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at)
@@ -171,13 +173,14 @@ func TestDatabaseConstraintsAndLedgerProtection(t *testing.T) {
 		expectPg(t, "zero BET", extTx("BET", 0, "p", "e0", "k0"), "23514", "ck_wager_tx_amount")
 		expectPg(t, "non-zero LOSS", extTx("LOSS", 5, "p", "e1", "k1"), "23514", "ck_wager_tx_amount")
 		expectPg(t, "negative BET", extTx("BET", -5, "p", "e2", "k2"), "23514", "ck_wager_tx_amount")
-		expectPg(t, "REFUND without reference", extTx("REFUND", 5, "p", "e3", "k3"), "23514", "ck_wager_tx_reference")
+		expectPg(t, "REFUND without reference", sqlExec(insertRejected, uuid.New(), "REFUND", w.ID, playerID, 5, "p", "e3", "k3"), "23514", "ck_wager_tx_reference")
+		expectPg(t, "PROCESSED REFUND without a resolved reference", extTx("REFUND", 5, "p", "e3b", "k3b"), "23514", "ck_wager_tx_processed_reference")
 	})
 	t.Run("financial identity uniqueness", func(t *testing.T) {
 		pid := "constraint-" + uuid.NewString()
-		// Transações PENDING (sem movimento) bastam para exercitar a unicidade.
+		// Transações REJECTED (sem movimento) bastam para exercitar a unicidade.
 		pending := func(provider, ext, key string) error {
-			return sqlExec(insertPending, uuid.New(), "WIN", w.ID, playerID, 5, provider, ext, key)
+			return sqlExec(insertRejected, uuid.New(), "WIN", w.ID, playerID, 5, provider, ext, key)
 		}
 		if err := pending(pid, "ext-1", "key-1"); err != nil {
 			t.Fatal(err)

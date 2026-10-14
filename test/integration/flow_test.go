@@ -199,22 +199,12 @@ func TestBetAcceptedAndRejected(t *testing.T) {
 	assertLedgerMatchesBalance(t, w.ID)
 }
 
-func TestUnsupportedAndForbiddenKinds(t *testing.T) {
+func TestForbiddenKinds(t *testing.T) {
 	a := startApp(t, testConfig())
 	w := openWallet(t, a, "100.00")
 	before := countRows(t, "wager_transactions", "wallet_id = $1", w.ID)
 
-	// WIN e LOSS sem referência são processados (win_loss_test.go); WIN com referência,
-	// REFUND e ROLLBACK ainda não, e a referência recebida nunca é ignorada.
-	for _, kind := range []string{"WIN", "REFUND", "ROLLBACK"} {
-		body := betBody(w, "provider-a", uniqueID("tx"), "10.00")
-		body["kind"] = kind
-		body["referenceExternalTransactionId"] = "some-bet"
-		r := submit(t, a, "provider-a", uniqueID("k"), body)
-		if r.Status != http.StatusNotImplemented || r.str("code") != "KIND_NOT_SUPPORTED" {
-			t.Errorf("%s: %d %s", kind, r.Status, r.Raw)
-		}
-	}
+	// Todos os tipos externos são processados (win_loss_test.go, reversal_test.go); aqui ficam os recusados.
 	// OPENING nunca é aceito por HTTP.
 	body := betBody(w, "provider-a", uniqueID("tx"), "10.00")
 	body["kind"] = "OPENING"
@@ -226,7 +216,7 @@ func TestUnsupportedAndForbiddenKinds(t *testing.T) {
 		t.Errorf("TRANSFER: %d %s", r.Status, r.Raw)
 	}
 	if after := countRows(t, "wager_transactions", "wallet_id = $1", w.ID); after != before {
-		t.Fatalf("unsupported kinds persisted %d rows", after-before)
+		t.Fatalf("forbidden kinds persisted %d rows", after-before)
 	}
 	if bal, _ := walletState(t, w.ID); bal != 10000 {
 		t.Fatalf("balance changed to %d", bal)

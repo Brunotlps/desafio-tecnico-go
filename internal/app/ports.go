@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -15,6 +16,7 @@ type Repositories struct {
 	Transactions TransactionRepository
 	Ledger       LedgerRepository
 	Outbox       OutboxRepository
+	Pending      PendingReferenceRepository
 }
 
 // UnitOfWork delimita a transação SQL de uma operação financeira.
@@ -34,6 +36,10 @@ type WalletRepository interface {
 	// GetForUpdate lê a carteira e trava a linha até o fim da transação.
 	GetForUpdate(ctx context.Context, id uuid.UUID) (*domain.Wallet, error)
 	FindByPlayerAndCurrency(ctx context.Context, playerID uuid.UUID, currency domain.Currency) (*domain.Wallet, error)
+	// TryLockForUpdate trava a linha como GetForUpdate, mas sem esperar: devolve
+	// ErrWalletBusy se outra transação a mantém travada (o worker de referências
+	// não fica atrás de uma carteira ocupada).
+	TryLockForUpdate(ctx context.Context, id uuid.UUID) (*domain.Wallet, error)
 	// UpdateBalance grava saldo e versão; falha com ErrConcurrentModification se
 	// a versão persistida não for expectedVersion.
 	UpdateBalance(ctx context.Context, w *domain.Wallet, expectedVersion int64) error
@@ -49,6 +55,13 @@ type TransactionRepository interface {
 	// máximo uma por identidade. Lista vazia se nenhuma existe.
 	FindByIdentity(ctx context.Context, providerID, idempotencyKey, externalID string) ([]*domain.WagerTransaction, error)
 	FindByExternalID(ctx context.Context, providerID, externalID string) (*domain.WagerTransaction, error)
+	// Update grava a transição de uma transação não terminal (estado, código de
+	// falha, resultado, referência resolvida e instante); nenhum outro campo é
+	// atualizável. Falha com ErrConcurrentModification se a transação não estiver
+	// mais no estado `from`.
+	Update(ctx context.Context, t *domain.WagerTransaction, from domain.Status) error
+	// HasProcessedReversal informa se o alvo já recebeu uma REFUND ou ROLLBACK PROCESSED.
+	HasProcessedReversal(ctx context.Context, targetID uuid.UUID) (bool, error)
 }
 
 type LedgerRepository interface {
@@ -57,4 +70,30 @@ type LedgerRepository interface {
 
 type OutboxRepository interface {
 	Append(ctx context.Context, events []domain.Event) error
+}
+
+// PendingReference é a agenda durável de uma operação em PENDING_REFERENCE.
+// FirstPersistedAt e ExpiresAt são fixados na primeira persistência e nunca mudam.
+type PendingReference struct {
+	TransactionID    uuid.UUID
+	WalletID         uuid.UUID
+	FirstPersistedAt time.Time
+	ExpiresAt        time.Time
+	NextAttemptAt    time.Time
+	Attempts         int
+	LastAttemptAt    *time.Time
+	LastError        string
+}
+
+type PendingReferenceRepository interface {
+	Insert(ctx context.Context, p PendingReference) error
+	// GetOpenForUpdate lê e trava a agenda aberta; ErrPendingNotFound se não existe
+	// ou já foi concluída.
+	GetOpenForUpdate(ctx context.Context, txID uuid.UUID) (PendingReference, error)
+	// Reschedule registra uma verificação concluída sem resultado definitivo.
+	Reschedule(ctx context.Context, txID uuid.UUID, next, attemptedAt time.Time) error
+	// Complete encerra a agenda (a transação passou a um estado terminal).
+	Complete(ctx context.Context, txID uuid.UUID, at time.Time) error
+	// Due lista agendas abertas com próxima tentativa vencida, por ordem de vencimento.
+	Due(ctx context.Context, now time.Time, limit int) ([]PendingReference, error)
 }

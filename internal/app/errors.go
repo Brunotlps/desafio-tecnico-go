@@ -42,6 +42,13 @@ var (
 	ErrDuplicateIdempotencyKey      = errors.New("duplicate idempotency key")
 	ErrDuplicateExternalTransaction = errors.New("duplicate external transaction")
 	ErrConcurrentModification       = errors.New("wallet was modified concurrently")
+	// ErrReversalTargetTaken: a unicidade do banco (uma reversão PROCESSED por alvo) revelou
+	// uma reversão concorrente já confirmada; uma nova tentativa a enxerga e rejeita.
+	ErrReversalTargetTaken = errors.New("reversal target already reversed")
+	// ErrWalletBusy: a carteira está travada por outra transação (TryLockForUpdate).
+	ErrWalletBusy = errors.New("wallet is locked by another transaction")
+	// ErrPendingNotFound: não há agenda aberta para a transação.
+	ErrPendingNotFound = errors.New("no open pending reference schedule")
 )
 
 // WalletExistsError acompanha ErrWalletAlreadyExists com o id da carteira

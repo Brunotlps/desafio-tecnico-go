@@ -310,11 +310,11 @@ func TestTerminalStatesRequireAnExplicitResult(t *testing.T) {
 	// Combinações válidas continuam aceitas.
 	for name, err := range map[string]error{
 		// zero é um resultado válido, distinto de NULL; LOSS é a conclusão sem movimento (uma BET PROCESSED exige lançamento)
-		"PROCESSED":         insert("PROCESSED", nil, 0, "LOSS", nil),
-		"REJECTED":          insert("REJECTED", "INSUFFICIENT_FUNDS", 100, "BET", nil),
-		"PENDING":           insert("PENDING", nil, nil, "BET", nil),
-		"PENDING_REFERENCE": insert("PENDING_REFERENCE", nil, nil, "REFUND", "ref"),
-		"FAILED":            insert("FAILED", "PERSISTENCE_FAILED", nil, "BET", nil),
+		"PROCESSED": insert("PROCESSED", nil, 0, "LOSS", nil),
+		"REJECTED":  insert("REJECTED", "INSUFFICIENT_FUNDS", 100, "BET", nil),
+		// PENDING e PENDING_REFERENCE seguem válidos pelas CHECK de forma; o que muda é que só podem ser
+		// confirmados com a agenda (pending_references_test.go).
+		"FAILED": insert("FAILED", "PERSISTENCE_FAILED", nil, "BET", nil),
 	} {
 		if err != nil {
 			t.Errorf("valid %s rejected: %v", name, err)

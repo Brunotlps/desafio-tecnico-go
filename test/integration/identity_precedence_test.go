@@ -50,7 +50,6 @@ func TestServiceIdentityPrecedenceOverNewOperationPolicies(t *testing.T) {
 	refund := func(r *domain.RawExternalRequest) { r.Kind, r.ReferenceExternalTransactionID = "REFUND", "bet-x" }
 	rollback := func(r *domain.RawExternalRequest) { r.Kind, r.ReferenceExternalTransactionID = "ROLLBACK", "bet-x" }
 	winEUR := func(r *domain.RawExternalRequest) { win(r); eur(r) }
-	winRef := func(r *domain.RawExternalRequest) { r.Kind, r.ReferenceExternalTransactionID = "WIN", "bet-x" }
 
 	t.Run("same key, different content is a conflict", func(t *testing.T) {
 		for name, mutate := range map[string]func(*domain.RawExternalRequest){
@@ -106,16 +105,13 @@ func TestServiceIdentityPrecedenceOverNewOperationPolicies(t *testing.T) {
 		}
 	})
 
-	t.Run("operations that are really new keep receiving the policy errors", func(t *testing.T) {
+	t.Run("operations that are really new keep receiving the currency policy", func(t *testing.T) {
 		for name, tc := range map[string]struct {
 			mutate func(*domain.RawExternalRequest)
 			want   error
 		}{
-			"currency not enabled":                      {eur, app.ErrCurrencyNotSupported},
-			"WIN with a reference is not processed yet": {winRef, app.ErrKindNotSupported},
-			"REFUND is not processed yet":               {refund, app.ErrKindNotSupported},
-			"ROLLBACK is not processed yet":             {rollback, app.ErrKindNotSupported},
-			"currency policy comes before kind":         {winEUR, app.ErrCurrencyNotSupported},
+			"currency not enabled":              {eur, app.ErrCurrencyNotSupported},
+			"currency policy comes before kind": {winEUR, app.ErrCurrencyNotSupported},
 		} {
 			if _, err := svc.Submit(ctx, variant(id("new-k-"+name), id("new-t-"+name), tc.mutate), "c"); !errors.Is(err, tc.want) {
 				t.Errorf("%s: %v, want %v", name, err, tc.want)
@@ -131,9 +127,6 @@ func TestServiceIdentityPrecedenceOverNewOperationPolicies(t *testing.T) {
 		}
 		if _, err := svc.Submit(ctx, other(eur), "c"); !errors.Is(err, app.ErrCurrencyNotSupported) {
 			t.Errorf("other provider, EUR: %v", err)
-		}
-		if _, err := svc.Submit(ctx, other(winRef), "c"); !errors.Is(err, app.ErrKindNotSupported) {
-			t.Errorf("other provider, WIN with a reference: %v", err)
 		}
 	})
 
@@ -178,7 +171,6 @@ func TestHTTPIdentityPrecedenceOverNewOperationPolicies(t *testing.T) {
 	refund := func(b map[string]any) { b["kind"], b["referenceExternalTransactionId"] = "REFUND", "bet-x" }
 	rollback := func(b map[string]any) { b["kind"], b["referenceExternalTransactionId"] = "ROLLBACK", "bet-x" }
 	winEUR := func(b map[string]any) { win(b); eur(b) }
-	winRef := func(b map[string]any) { b["kind"], b["referenceExternalTransactionId"] = "WIN", "bet-x" }
 	changes := map[string]func(map[string]any){
 		"currency not enabled (EUR)": eur, "BET changed to WIN": win, "BET changed to LOSS": loss,
 		"BET changed to REFUND": refund, "BET changed to ROLLBACK": rollback, "WIN in a disabled currency": winEUR,
@@ -220,9 +212,6 @@ func TestHTTPIdentityPrecedenceOverNewOperationPolicies(t *testing.T) {
 		code   string
 	}{
 		"new operation, currency not enabled": {eur, 422, "CURRENCY_NOT_SUPPORTED"},
-		"new WIN with a reference":            {winRef, 501, "KIND_NOT_SUPPORTED"},
-		"new REFUND":                          {refund, 501, "KIND_NOT_SUPPORTED"},
-		"new ROLLBACK":                        {rollback, 501, "KIND_NOT_SUPPORTED"},
 		"new WIN in a disabled currency":      {winEUR, 422, "CURRENCY_NOT_SUPPORTED"},
 	} {
 		if r := submit(t, a, "provider-a", id("nk-"+name), body(id("nt-"+name), tc.mutate)); r.Status != tc.status || r.str("code") != tc.code {
@@ -238,9 +227,6 @@ func TestHTTPIdentityPrecedenceOverNewOperationPolicies(t *testing.T) {
 	}
 	if r := submit(t, a, "provider-b", key, otherBody(eur)); r.Status != 422 || r.str("code") != "CURRENCY_NOT_SUPPORTED" {
 		t.Errorf("provider-b, same key, EUR: %d %s", r.Status, r.Raw)
-	}
-	if r := submit(t, a, "provider-b", key, otherBody(winRef)); r.Status != 501 || r.str("code") != "KIND_NOT_SUPPORTED" {
-		t.Errorf("provider-b, same key, WIN with a reference: %d %s", r.Status, r.Raw)
 	}
 
 	// Autenticação e autorização antecedem tudo: sem token 401; providerId do corpo diferente do token 403.

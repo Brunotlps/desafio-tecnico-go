@@ -173,24 +173,6 @@ func TestServiceLossRecordsTheOutcomeWithoutMovement(t *testing.T) {
 	assertLedgerMatchesBalance(t, wallet)
 }
 
-// WIN com referência não é processado nem tem a referência ignorada nesta versão.
-func TestServiceWinWithReferenceIsNotProcessedYet(t *testing.T) {
-	svc := newService(t)
-	id := scoped()
-	wallet, player := svcOpen(t, svc, "100.00")
-	raw := rawKind(wallet, player, id("k"), id("t"), "WIN", "10.00")
-	raw.ReferenceExternalTransactionID = "some-bet"
-	if _, err := svc.Submit(context.Background(), raw, "c"); !errors.Is(err, app.ErrKindNotSupported) {
-		t.Fatalf("WIN with reference: %v, want ErrKindNotSupported", err)
-	}
-	if bal, ver := walletState(t, wallet); bal != 100_00 || ver != 1 {
-		t.Fatalf("wallet changed: %d/%d", bal, ver)
-	}
-	if n := countRows(t, "wager_transactions", "wallet_id = $1 AND kind <> 'OPENING'", wallet); n != 0 {
-		t.Fatalf("persisted %d rows", n)
-	}
-}
-
 func TestFiftyParallelWinAndLossResendsApplyOnce(t *testing.T) {
 	svc := newService(t)
 	ctx := context.Background()
@@ -321,13 +303,17 @@ func TestWinAndLossOverHTTP(t *testing.T) {
 		t.Fatalf("query: %d %s", q.Status, q.Raw)
 	}
 
-	// WIN com referência: não é ignorada; continua sem processamento (501) e nada é gravado.
+	// WIN com referência ausente não é ignorada nem creditada: fica pendente (reversal_test.go cobre o resto).
 	before := countRows(t, "wager_transactions", "wallet_id = $1", w.ID)
 	ref := winBody(id("winref-t"), "5.00")
 	ref["referenceExternalTransactionId"] = "some-bet"
-	if rr := submit(t, a, "provider-a", id("winref-k"), ref); rr.Status != http.StatusNotImplemented || rr.str("code") != "KIND_NOT_SUPPORTED" {
-		t.Fatalf("WIN with reference: %d %s", rr.Status, rr.Raw)
+	if rr := submit(t, a, "provider-a", id("winref-k"), ref); rr.Status != http.StatusAccepted || rr.str("status") != "PENDING_REFERENCE" || rr.Body["balance"] != nil {
+		t.Fatalf("WIN with an absent reference: %d %s", rr.Status, rr.Raw)
 	}
+	if bal, _ := walletState(t, w.ID); bal != 140_00 {
+		t.Fatalf("a pending WIN changed the balance to %d", bal)
+	}
+	before++ // a pendência é persistida
 	// LOSS com valor e WIN zerado continuam recusados na entrada.
 	bad := lossBody(id("bad-t"))
 	bad["money"] = money("1.00")

@@ -31,6 +31,15 @@ func (r walletRepo) GetForUpdate(ctx context.Context, id uuid.UUID) (*domain.Wal
 	return r.get(ctx, `SELECT `+walletColumns+` FROM wallets WHERE id = $1 FOR UPDATE`, id)
 }
 
+// TryLockForUpdate usa SKIP LOCKED: sem linha devolvida, a carteira existe (FK) e está ocupada.
+func (r walletRepo) TryLockForUpdate(ctx context.Context, id uuid.UUID) (*domain.Wallet, error) {
+	w, err := r.get(ctx, `SELECT `+walletColumns+` FROM wallets WHERE id = $1 FOR UPDATE SKIP LOCKED`, id)
+	if errors.Is(err, app.ErrWalletNotFound) {
+		return nil, app.ErrWalletBusy
+	}
+	return w, err
+}
+
 func (r walletRepo) FindByPlayerAndCurrency(ctx context.Context, playerID uuid.UUID, currency domain.Currency) (*domain.Wallet, error) {
 	return r.get(ctx, `SELECT `+walletColumns+` FROM wallets WHERE player_id = $1 AND currency = $2`, playerID, string(currency))
 }

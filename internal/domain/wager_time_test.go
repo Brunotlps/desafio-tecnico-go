@@ -54,6 +54,24 @@ func newPendingRefund(t *testing.T, createdAt time.Time) *WagerTransaction {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Uma reversão só é concluída com a referência resolvida: resolve contra a BET
+	// processada que ela referencia (mesmo instante da criação, sem alterar updatedAt).
+	betRaw := rawBet()
+	betRaw.ExternalTransactionID, betRaw.IdempotencyKey = "bet-1", "key-bet-1"
+	betReq, err := NewExternalRequest(betRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bet, err := NewExternalTransaction(uuid.New(), betReq, createdAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bet.Process(mustMoney(t, "10.00", "BRL"), createdAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.ResolveReference(bet, createdAt); err != nil {
+		t.Fatal(err)
+	}
 	return tx
 }
 

@@ -176,6 +176,9 @@ func (f externalFields) validate() error {
 		}
 	}
 	if f.referenceExternalID != "" {
+		if f.referenceExternalID == f.externalID {
+			return fmt.Errorf("%w: referenceExternalTransactionId must not be the operation's own externalTransactionId", ErrInvalidRequest)
+		}
 		return validateToken("referenceExternalTransactionId", f.referenceExternalID, maxExternalIDLen)
 	}
 	return nil
