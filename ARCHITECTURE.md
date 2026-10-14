@@ -74,6 +74,15 @@ técnica** ou **pendência**. O estado de implementação está no fim e no READ
   `RehydrateWagerTransaction` valida o estado completo — tipo, política de valor por tipo, moeda e sinal do resultado,
   metadados externos, política de referência, **recálculo do hash a partir dos campos** e a relação entre estado,
   `failureCode` e resultado (PROCESSED/REJECTED exigem resultado; PENDING* não o têm) — sem reaplicar movimentos.
+  **Política temporal única** (criação, transições e reidratação, `checkTimestamps`): `createdAt` e `updatedAt` não são nulos,
+  `updatedAt >= createdAt` e `updatedAt` **nunca regride**. `Process`, `Reject`, `Fail` e `AwaitReference` validam estado de
+  origem, destino, argumentos e instante **antes** de alterar qualquer campo; um instante zero, anterior à criação ou anterior à
+  última atualização é recusado com `ErrInvalidTimestamp` (que também é `ErrInvalidTransaction`) e a entidade permanece intacta
+  (status, resultado, código, referência e timestamps). O mesmo instante da última atualização é válido, pois etapas do mesmo
+  commit usam o mesmo relógio. Decisão sobre regressão do relógio: o domínio **não ajusta** o instante silenciosamente; uma
+  instância com relógio atrasado em relação à última atualização gravada por outra deve repetir mais tarde ou informar o maior
+  entre o seu relógio e `UpdatedAt()`. Como o estado persistido só guarda a última atualização, a reidratação verifica apenas
+  `updatedAt >= createdAt`. A regra cronológica é uma decisão de domínio, não uma exigência literal do enunciado.
   Referências (`*uuid.UUID`) são copiadas na entrada da reidratação e em cada leitura (`ReferenceTransactionID()`,
   `External()`), então nenhum chamador consegue alterar uma transação terminal por alias.
 * **LedgerEntry**: `balanceAfter = balanceBefore ± money` validado na construção (e por `CHECK` no banco).

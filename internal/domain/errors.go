@@ -29,6 +29,9 @@ var (
 	ErrInvalidTransition   = errors.New("invalid state transition")
 	ErrTerminalTransaction = errors.New("transaction is in a terminal state")
 	ErrInvalidTransaction  = errors.New("invalid transaction")
+	// ErrInvalidTimestamp: instante zero ou que faria o histórico da transação
+	// regredir. É sempre devolvido junto com ErrInvalidTransaction.
+	ErrInvalidTimestamp = errors.New("invalid timestamp")
 
 	// Eventos.
 	ErrInvalidEvent = errors.New("invalid event")
