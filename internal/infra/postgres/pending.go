@@ -66,6 +66,13 @@ func (r pendingRepo) Complete(ctx context.Context, txID uuid.UUID, at time.Time)
 	return nil
 }
 
+func (r pendingRepo) Defer(ctx context.Context, txID uuid.UUID, next, at time.Time, reason string) error {
+	_, err := r.q.Exec(ctx, `UPDATE pending_references
+		SET next_attempt_at = $2, attempts = attempts + 1, last_attempt_at = $3, last_error = $4
+		WHERE transaction_id = $1 AND completed_at IS NULL AND next_attempt_at <= $3`, txID, next, at, reason)
+	return classify(err)
+}
+
 func (r pendingRepo) Due(ctx context.Context, q app.DueQuery) ([]app.PendingReference, error) {
 	var afterAt *time.Time
 	afterID := uuid.Nil
@@ -76,18 +83,20 @@ func (r pendingRepo) Due(ctx context.Context, q app.DueQuery) ([]app.PendingRefe
 	if exclude == nil {
 		exclude = []uuid.UUID{}
 	}
-	// Candidatos: pendências vencidas em ordem estável, SEM as carteiras travadas por outra transação. `FOR KEY SHARE ... SKIP
-	// LOCKED` na carteira faz o banco pular, dentro da própria consulta, as carteiras que uma transação segura com FOR UPDATE
-	// (o mesmo conflito que TryLockForUpdate enxerga), de modo que um prefixo ocupado, por maior que seja, não esconde as
-	// carteiras independentes que vêm depois dele. É só uma leitura: o lock dura o tempo da consulta (não há espera, nem lock
-	// durante o backoff) e a elegibilidade e a carteira são revalidadas sob os locks da tentativa.
+	// Candidatos: pendências vencidas em ordem estável, SEM as carteiras travadas por outra transação. `FOR UPDATE ... SKIP LOCKED`
+	// na carteira é EXATAMENTE o lock que a tentativa pede (TryLockForUpdate): FOR UPDATE conflita com todos os outros modos
+	// (FOR KEY SHARE, FOR SHARE, FOR NO KEY UPDATE — o de um UPDATE de coluna não chave —, FOR UPDATE), e só ele garante que uma carteira
+	// que a seleção devolve não será "ocupada" para a tentativa por um modo que a seleção não enxergou. Assim um prefixo ocupado, de qualquer
+	// tamanho e por qualquer escritor, não esconde as carteiras independentes que vêm depois dele, sem estado entre varreduras. É só uma
+	// leitura: o lock de linha dura o tempo da consulta (sem espera e sem lock durante o backoff) e a carteira e a elegibilidade são
+	// revalidadas sob os locks da tentativa.
 	rows, err := r.q.Query(ctx, `SELECT `+pendingColumnsP+` FROM pending_references p
 		JOIN wallets w ON w.id = p.wallet_id
 		WHERE p.completed_at IS NULL AND p.next_attempt_at <= $1
 		  AND ($3::timestamptz IS NULL OR (p.next_attempt_at, p.transaction_id) > ($3, $4))
 		  AND NOT (p.wallet_id = ANY($5::uuid[]))
 		ORDER BY p.next_attempt_at, p.transaction_id LIMIT $2
-		FOR KEY SHARE OF w SKIP LOCKED`, q.Now, q.Limit, afterAt, afterID, exclude)
+		FOR UPDATE OF w SKIP LOCKED`, q.Now, q.Limit, afterAt, afterID, exclude)
 	if err != nil {
 		return nil, classify(err)
 	}
