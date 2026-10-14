@@ -353,3 +353,9 @@ superusuários ainda podem desabilitar triggers (a aplicação nunca roda com el
 Ver "Escopo e pendências" no README. Em síntese: `WIN/LOSS/REFUND/ROLLBACK`, política de reversões (§8), SQS + inbox,
 publicador de outbox, worker de referências, paginação do ledger, reconciliação, métricas, e a prova com três processos
 para fluxos SQS/outbox. A prova com três processos **existe para o fluxo HTTP implementado** (`multiprocess_test.go`).
+
+Limites das garantias atuais (detalhes nas seções indicadas): dono do schema e superusuários podem desabilitar triggers — a aplicação
+nunca roda com eles (§10.1); o `result_balance` de `LOSS` não é verificável contra o ledger e o sentido do lançamento de `ROLLBACK`
+só será imposto com o processamento de reversões (§10.2); a regressão de relógio entre instâncias é recusada pelo domínio e tratada
+por quem chama a transição (§3); a rotação de chaves do IdP pode causar 401 por até 30 s (§9). A política de combinações
+`REFUND`/`ROLLBACK` continua **em aberto** (§8).

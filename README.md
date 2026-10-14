@@ -281,7 +281,11 @@ test/integration   testes com infraestrutura real (build tag `integration`)
 LocalStack provisionados; migrations; health checks reais; Money; Wallet; WagerTransaction (máquina
 de estados completa no domínio); LedgerEntry; abertura de carteira; `BET` com idempotência
 persistente, rejeição por saldo, ledger e outbox atômicos; consultas com isolamento por provedor;
-autenticação/autorização reais.
+autenticação/autorização reais. **Garantias do banco** (migrations 00001–00003, verificadas por SQL direto pelo papel
+restrito): ledger append-only e de cadeia contínua; saldo = último `balance_after`; toda transação `PROCESSED` com movimento
+exige, no COMMIT, o lançamento da própria carteira e `result_balance` = `balance_after` dele (`LOSS` e rejeições não têm
+lançamento); unicidade de identidade; terminais imutáveis. **Precedência da identidade:** chave ou id externo já registrado é
+replay/conflito (409) antes das políticas de operação nova (moeda, tipo).
 
 **Não implementado (explícito):**
 
@@ -296,6 +300,7 @@ autenticação/autorização reais.
 | Testes SQS/HTTP cruzados, DLQ, interrupção de consumidor, dois publishers | dependem dos itens acima |
 | Prova com 3 processos para SQS/outbox | só para o fluxo HTTP implementado |
 | Testes de carga, OpenTelemetry, partidas dobradas | opcionais, não feitos |
+| Limites das garantias atuais | o dono do schema e superusuários podem desabilitar triggers (a API roda com papel restrito); o `result_balance` de `LOSS` (saldo observado, sem lançamento) não é verificável contra o ledger; o sentido do lançamento de `ROLLBACK` só será imposto com o processamento de reversões; a regressão de relógio entre instâncias é recusada pelo domínio e tratada por quem chama a transição (ARCHITECTURE §3); rotação de chaves do IdP pode causar 401 por até 30 s |
 
 **Próximo incremento recomendado:** `WIN`/`LOSS` sem referência + `REFUND`/`ROLLBACK` com a política
 de reversões decidida; em seguida inbox + consumidor SQS reutilizando `app.Service.Submit` e o
