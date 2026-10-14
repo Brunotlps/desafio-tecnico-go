@@ -13,24 +13,25 @@ real, ledger, idempotência persistente e eventos gravados na outbox.
 | Ferramenta     | Versão testada | Uso                                   |
 | -------------- | -------------- | ------------------------------------- |
 | Go             | 1.26.1         | build e testes (declarado em `go.mod` e no `Dockerfile`) |
-| Docker + Compose v2 | 29.x / 5.x | PostgreSQL, Keycloak, LocalStack, API |
+| Docker + Compose v2 | 29.x / 5.x | PostgreSQL, Keycloak, MiniStack (broker), API |
 | curl, python3  | —              | exemplos deste README                 |
 
-Memória: Keycloak + LocalStack + PostgreSQL usam ~2 GB. Portas publicadas (somente em `127.0.0.1`):
-PostgreSQL **5433**, Keycloak **8081**, LocalStack **4566**, API **8080** (sobrescreva com
-`POSTGRES_PORT`, `KEYCLOAK_PORT`, `LOCALSTACK_PORT`, `API_PORT`).
+Memória: Keycloak + MiniStack + PostgreSQL usam ~2 GB. Portas publicadas (somente em `127.0.0.1`):
+PostgreSQL **5433**, Keycloak **8081**, broker (MiniStack) **4566**, API **8080** (sobrescreva com
+`POSTGRES_PORT`, `KEYCLOAK_PORT`, `BROKER_PORT`, `API_PORT`).
 
 ## Início rápido
 
 ```sh
-docker compose up --build        # postgres, keycloak, localstack, migrate (one-shot) e api
+docker compose up --build        # postgres, keycloak, ministack, broker-provision e migrate (one-shot) e api
 curl -s localhost:8080/health/ready
 # {"checks":{"postgres":"ok","sqs":"ok"},"status":"ok"}
 ```
 
-A primeira subida importa o realm do Keycloak (`deploy/keycloak/wager-realm.json`), provisiona as filas
-e o destino dos eventos (`deploy/localstack/provision.sh`) e aplica as migrations (`migrate up`).
-Para recomeçar do zero: `docker compose down -v`.
+A primeira subida importa o realm do Keycloak (`deploy/keycloak/wager-realm.json`), provisiona o broker (filas, tópico, identidades,
+políticas e credenciais — serviço one-shot `broker-provision`, ver [Broker](#broker-minestack-com-auth-true)) e aplica as migrations
+(`migrate up`). A API só inicia depois de os dois one-shots terminarem com sucesso. Para recomeçar do zero: `docker compose down -v`
+(o diretório `.local/broker`, com credenciais sintéticas, é do host e fica; o provisionamento o reconcilia).
 
 ### Identidades de teste (Keycloak, realm `wager`, `client_credentials`)
 
@@ -146,7 +147,8 @@ partida; todos os problemas são reportados de uma vez.
 | `OIDC_JWKS_URL` | — (obrigatória) | onde buscar as chaves públicas (pode diferir do issuer na rede do Compose) |
 | `OIDC_AUDIENCE` | — (obrigatória) | audiência exigida (`wager-api`) |
 | `OIDC_CLOCK_SKEW` | `5s` | tolerância de relógio na validação do token |
-| `AWS_REGION`, `AWS_ENDPOINT_URL` | `us-east-1`, vazio | SQS (LocalStack localmente); credenciais pela cadeia padrão do SDK |
+| `AWS_REGION`, `AWS_ENDPOINT_URL` | `us-east-1`, vazio | SQS (MiniStack localmente); credenciais pela cadeia padrão do SDK |
+| `AWS_SHARED_CREDENTIALS_FILE`, `AWS_PROFILE` | — | a API usa o principal de **runtime** do broker: perfil `wager-runtime` do arquivo de credenciais escrito pelo `broker-provision` (no Compose: `/run/broker/credentials`). Não defina `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (prevalecem sobre o perfil) |
 | `SQS_WAGER_QUEUE_NAME` | `wager-transactions.fifo` | fila verificada na readiness |
 | `ALLOWED_CURRENCIES` | `BRL` | moedas aceitas (códigos de 3 letras maiúsculas) |
 | `HTTP_ADDR` | `:8080` | endereço do servidor |
@@ -160,19 +162,61 @@ partida; todos os problemas são reportados de uma vez.
 | `REFERENCE_WORKERS` | `1` | executores de referências por processo (`0` desliga) |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
-## Filas e eventos (LocalStack)
+## Broker (MiniStack com AUTH=true)
 
-`deploy/localstack/provision.sh` roda quando o LocalStack fica pronto (idempotente):
+O broker local é o **MiniStack 1.5.27** (imagem fixada) com `AUTH=true`, que avalia as políticas IAM do principal identificado pela access key
+(o enunciado §4 permite LocalStack ou MiniStack, e §2 exige acesso à mensageria controlado por credenciais e políticas do broker).
+
+> **Limite do emulador:** o MiniStack **não valida assinaturas SigV4** — a access key só identifica o principal, e o segredo não é conferido.
+> `AUTH=true` demonstra **autorização emulada por políticas**, não autenticação AWS completa. A autenticação real do projeto é a do
+> Keycloak na API HTTP; no SQS o vínculo entre origem e `providerId` é responsabilidade do produtor interno confiável (provedores
+> externos **não** recebem `SendMessage` direto). O broker é exposto só em `127.0.0.1`, para desenvolvimento. Em produção na AWS, confira: assinatura
+> SigV4 e segredos reais, papéis IAM (não usuários com chave estática), políticas de recurso das filas e do tópico, criptografia (KMS) e
+> endpoints privados — nada disso é provado aqui.
+
+**Provisionamento** (`cmd/broker-provision`, SDK Go v2, serviço one-shot do Compose; sem `awslocal` nem hooks do emulador): cria ou converge,
+de forma idempotente, os recursos abaixo, as identidades e as políticas, e escreve as credenciais por responsabilidade em
+`.local/broker/credentials` (ignorado pelo git; chaves **sintéticas locais**). Reexecutar não duplica recursos, não duplica a assinatura e
+**reaproveita as chaves ainda válidas** (credenciais em uso não quebram); uma chave que o emulador perdeu é reemitida (reinicie a API para ela
+reler o arquivo).
 
 | Recurso | Configuração |
 | --- | --- |
 | `wager-transactions.fifo` | FIFO, `ContentBasedDeduplication=false`, `VisibilityTimeout=60`, redrive: `maxReceiveCount=5` → DLQ |
 | `wager-transactions-dlq.fifo` | FIFO, retenção de 14 dias |
 | `wager-events.fifo` (SNS FIFO) | destino dos eventos de saída (publicador de outbox: incremento futuro) |
-| `wager-events-audit.fifo` (SQS) | assinante do tópico (entrega raw) para auditoria/testes |
+| `wager-events-audit.fifo` (SQS FIFO) | assinante do tópico (`RawMessageDelivery=true`) para auditoria/testes; política que só admite o serviço SNS **a partir do tópico de eventos** (`aws:SourceArn`) |
 
-Reprovisionar manualmente: `docker compose exec localstack bash /etc/localstack/init/ready.d/10-provision.sh`.
-Inspecionar: `docker compose exec localstack awslocal sqs list-queues`.
+| Principal (usuário IAM = perfil) | Permissões (por ação e recurso, sem curingas) |
+| --- | --- |
+| `wager-producer` (produtor interno) | `SendMessage`, `GetQueueUrl` na entrada. Sem consumo, remoção, DLQ ou SNS |
+| `wager-runtime` (consumidor; **usado pela API**) | na entrada: `GetQueueUrl`, `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility`; na DLQ: `GetQueueUrl`, `SendMessage` |
+| `wager-publisher` (futuro publicador da outbox) | `sns:Publish` e `sns:GetTopicAttributes` no tópico de eventos. Não consome a entrada |
+| `wager-inspector` (testes/diagnóstico) | observa e prepara cenários na DLQ e na fila de auditoria; atributos da entrada; assinaturas do tópico |
+| `wager-nobody` | nenhuma política (comprova `AccessDenied`) |
+
+O principal de **provisionamento** é a raiz do emulador (access key `test`, ou um id de conta de 12 dígitos), usado só por `broker-provision`
+e pela prova; nunca pela aplicação. **Estado:** o MiniStack roda sem `PERSIST_STATE`: filas, mensagens, tópico e identidades são **efêmeros** e
+somem quando o contêiner `ministack` é recriado (`docker compose down`/`up` recria; um `restart` também reinicia o processo). Depois disso, `docker compose up -d`
+reexecuta o `broker-provision`; reinicie a `api` para ela reler as credenciais. Nenhuma durabilidade é prometida (nem após `SIGKILL`).
+
+```sh
+mkdir -p .local/broker                           # dono: você (o provisionamento entrega o arquivo ao dono do diretório)
+docker compose up -d --wait postgres keycloak ministack
+docker compose run --rm broker-provision        # idempotente (make broker-provision)
+scripts/check-infra.sh                            # recursos, redrive, política de entrega, políticas dos principais, arquivo de credenciais
+docker compose exec ministack awslocal sqs list-queues    # inspeção com a raiz do emulador
+```
+
+**Prova de autorização** (`test/integration/broker_test.go`, executada na CI): com o **SDK Go v2 e as credenciais reais de cada principal**, em recursos
+isolados por prefixo (`proof-<id>-`, criados e removidos pelo teste; nunca tocam as filas de desenvolvimento) — produtor envia, runtime recebe/altera
+visibilidade/remove, publisher publica e o assinante recebe o conteúdo **raw** com grupo e deduplicação rastreáveis; 20 negativas tipadas
+(`AccessDenied`/403, não erro de endpoint) cobrindo cada principal e **a mesma ação em outro recurso**, com ausência de efeito comprovada
+(mensagem em voo intacta, filas vazias); FIFO (deduplicação de transporte — janela temporária do broker, **não** a garantia financeira da aplicação — e grupos
+distintos em paralelo); visibilidade e redrive com conteúdo e grupo preservados na DLQ (aqui com 1 s e 2 recebimentos, só nesse teste isolado; os padrões 60 s e 5
+são verificados em outro teste e no `check-infra`); SNS→SQS **efetivamente entregue**, e **não** entregue quando o tópico não é o autorizado ou quando a política da fila é removida
+(um `Publish` aceito não prova entrega); provisionamento repetido e reemissão de chave perdida; partida da API com o principal sem permissão falha com `AccessDenied`.
+Observação do emulador: o redrive é aplicado quando o consumidor tenta receber de novo (a AWS o faz em segundo plano), e as ausências de entrega são observações limitadas (long polling de 3 s).
 
 ## Migrations
 
@@ -247,8 +291,8 @@ troque `DATABASE_URL` da API para ele (o Compose já faz isso).
 ## Executar a aplicação sem Docker para a API
 
 ```sh
-docker compose up -d --wait postgres keycloak localstack   # ou: make infra
-set -a; . ./.env.example; set +a
+docker compose up -d --wait postgres keycloak ministack && docker compose run --rm broker-provision   # ou: make infra
+set -a; . ./.env.example; set +a   # AWS_PROFILE=wager-runtime + .local/broker/credentials
 go run ./cmd/migrate up      # como dono do schema; cria o papel wager_app
 go run ./cmd/api             # como wager_app (DATABASE_URL)
 ```
@@ -261,9 +305,9 @@ go test -race ./...
 go vet ./...
 ```
 
-### Integração (PostgreSQL, Keycloak e LocalStack reais)
+### Integração (PostgreSQL, Keycloak e MiniStack reais)
 
-Preparação — `make infra` (ou `docker compose up -d --wait postgres keycloak localstack`). Os testes usam o banco de
+Preparação — `make infra` (ou `docker compose up -d --wait postgres keycloak ministack && docker compose run --rm broker-provision`). A suíte lê as credenciais em `BROKER_CREDENTIALS_FILE` (padrão `.local/broker/credentials`), roda a aplicação com o perfil `wager-runtime` e **recusa** executar se o endpoint (`AWS_ENDPOINT_URL`) não for um MiniStack. Os testes usam o banco de
 `TEST_DATABASE_URL` (padrão `wager_test`; **qualquer nome**), aplicando `down-to 0` + `up` a cada execução (o que também
 exercita as migrations), e criam o papel de runtime próprio da suíte (`wager_test_app`; papéis valem para o servidor inteiro, então ela nunca reutiliza o `wager_app` da aplicação). A aplicação sob teste roda com esse papel restrito.
 
@@ -314,15 +358,15 @@ Variáveis opcionais (padrões coincidem com o Compose): `TEST_DATABASE_URL`, `T
 | Job | O que executa |
 | --- | --- |
 | `verify` | `gofmt`, `go mod verify`, `go mod tidy` sem diferenças, `go vet` (com e sem `-tags integration`), `go test -race` |
-| `infra` | `docker compose up --wait` de PostgreSQL, Keycloak e LocalStack + `scripts/check-infra.sh` (tokens, papéis, `provider_id`, filas, redrive, destino dos eventos) |
-| `integration` | os testes de integração com `-race` contra PostgreSQL, Keycloak e LocalStack reais |
+| `infra` | `docker compose up --wait` de PostgreSQL, Keycloak e MiniStack, `broker-provision` (duas vezes: as credenciais não mudam) + `scripts/check-infra.sh` (tokens, papéis, `provider_id`, filas, redrive, destino dos eventos, política de entrega, políticas dos principais) |
+| `integration` | os testes de integração com `-race` contra PostgreSQL, Keycloak e MiniStack reais, inclusive a prova de autorização do broker |
 | `stack` | `docker compose up --build` (imagem, migrations, papel de runtime, API), espera a API ficar `healthy` (`scripts/wait-healthy.sh`: estado estruturado do `docker inspect`, comparação exata, com prazo e diagnóstico) + `scripts/smoke.sh` |
 
 Os mesmos scripts rodam localmente: `scripts/check-infra.sh` (com a infraestrutura de pé), `scripts/wait-healthy.sh <serviço> [segundos]` e `scripts/smoke.sh` (com o stack de pé).
 Para validar o Compose sem mexer no seu ambiente, use outro projeto e outras portas:
 
 ```sh
-export POSTGRES_PORT=15433 KEYCLOAK_PORT=18081 LOCALSTACK_PORT=14566 API_PORT=18080
+export POSTGRES_PORT=15433 KEYCLOAK_PORT=18081 BROKER_PORT=14566 API_PORT=18080 BROKER_DIR=/tmp/wager-check-broker   # credenciais do broker isoladas
 docker compose -p wager-check up --build -d
 API_URL=http://localhost:18080 KEYCLOAK_URL=http://localhost:18081 scripts/smoke.sh
 docker compose -p wager-check down -v      # remove apenas o projeto de verificação
@@ -338,7 +382,9 @@ internal/lifecycle coordenador de shutdown (admissão, drenagem, cancelamento, c
 internal/infra/    postgres (pgx, unit of work, repositórios, migrations) · auth (JWT/JWKS) ·
                    httpapi (handlers, erros, health, servidor) · sqs (readiness)
 internal/bootstrap composição com fx.Module e fx.Lifecycle
-deploy/            realm do Keycloak, provisionamento do LocalStack
+deploy/            realm do Keycloak
+cmd/broker-provision provisionamento idempotente do broker (filas, tópico, identidades, políticas, credenciais)
+internal/infra/broker provisionamento e credenciais por responsabilidade
 scripts/           check-infra.sh (ambiente) e smoke.sh (fluxo ponta a ponta pela API)
 .github/workflows  CI
 test/integration   testes com infraestrutura real (build tag `integration`)
@@ -347,7 +393,7 @@ test/integration   testes com infraestrutura real (build tag `integration`)
 ## Escopo e pendências
 
 **Implementado e testado (HTTP):** configuração validada; Fx com lifecycle e **shutdown coordenado**; Docker Compose; Keycloak e
-LocalStack provisionados; migrations; health checks reais; Money; Wallet; WagerTransaction (máquina
+MiniStack provisionados; migrations; health checks reais; Money; Wallet; WagerTransaction (máquina
 de estados completa no domínio); LedgerEntry; abertura de carteira; **`REFUND`, `ROLLBACK` e `WIN` com referência**, **referências pendentes
 (`PENDING_REFERENCE`) com agenda durável, TTL, backoff e worker**, uma reversão por alvo imposta no banco; `BET` com idempotência
 persistente, rejeição por saldo, ledger e outbox atômicos; `WIN` (sem referência) e `LOSS`; consultas com isolamento por provedor;
@@ -365,11 +411,11 @@ replay/conflito (409) antes das políticas de operação nova (moeda, tipo).
 | Publicador de outbox (múltiplas instâncias, backoff, recuperação) | ausente; eventos ficam gravados em `outbox_events` com colunas de tentativas/próximo envio |
 | `GET /wallets/{id}/ledger` (cursor) e `POST /wallets/{id}/reconciliation` | 501 |
 | Métricas (resultados, duplicatas, retries, DLQ, atraso da outbox, reconciliação) | ausentes; há logs JSON com `correlationId`, `transactionId`, `walletId`, `providerId` |
-| Controle de acesso do broker (credenciais e políticas) | **sem enforcement no LocalStack atual**. Um piloto isolado do MiniStack 1.5.27 com `AUTH=true` foi bem-sucedido (autorização por usuário/ação/recurso, FIFO, visibilidade, redrive, SNS→SQS com política de fila), mas **a troca da infraestrutura aguarda decisão** e o piloto ainda não está versionado na CI; o MiniStack **não valida assinaturas SigV4** (autorização emulada, não autenticação AWS completa) |
+| Controle de acesso do broker (credenciais e políticas) | **provado como autorização emulada** (MiniStack 1.5.27, `AUTH=true`; prova na CI). O MiniStack **não valida assinaturas SigV4**: não é autenticação AWS completa nem prova de produção (ver [Broker](#broker-minestack-com-auth-true)). O produtor/consumidor SQS ainda **não** existem |
 | Testes SQS/HTTP cruzados, DLQ, interrupção de consumidor, dois publishers | dependem dos itens acima |
 | Prova com 3 processos para SQS/outbox | HTTP, reversões e pendências já têm; SQS/outbox dependem dos itens acima |
 | Testes de carga, OpenTelemetry, partidas dobradas | opcionais, não feitos |
-| Limites das garantias atuais | o dono do schema e superusuários podem desabilitar triggers (a API roda com papel restrito); o `result_balance` de `LOSS` (saldo observado, sem lançamento) não é verificável contra o ledger; o sentido do lançamento de `ROLLBACK` só será imposto com o processamento de reversões; a regressão de relógio entre instâncias é recusada pelo domínio e tratada por quem chama a transição (ARCHITECTURE §3); rotação de chaves do IdP pode causar 401 por até 30 s |
+| Limites das garantias atuais | o dono do schema e superusuários podem desabilitar triggers (a API roda com papel restrito); o `result_balance` de `LOSS` (saldo observado, sem lançamento) não é verificável contra o ledger; o sentido do lançamento de `ROLLBACK` é imposto no banco desde a 00005 (ARCHITECTURE §10); a regressão de relógio entre instâncias é recusada pelo domínio e tratada por quem chama a transição (ARCHITECTURE §3); rotação de chaves do IdP pode causar 401 por até 30 s |
 
 **Próximo incremento recomendado:** publicador da outbox (reserva com lease e token, publicação fora da transação, SNS FIFO); em seguida a
 inbox + consumidor SQS sobre o mesmo núcleo financeiro (`Service.processExternal`), precedidos da decisão sobre a infraestrutura do broker.

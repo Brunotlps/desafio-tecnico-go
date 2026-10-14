@@ -1,6 +1,7 @@
 .git
 .github
 .env
+.local
 descricao-desafio
 *.md
 test

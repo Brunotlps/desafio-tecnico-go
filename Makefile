@@ -1,10 +1,15 @@
 # Atalhos. Os comandos "reais" estão documentados no README.md.
-.PHONY: infra infra-down test race vet fmt integration integration-race migrate-up migrate-down migrate-status
+.PHONY: infra infra-down broker-provision test race vet fmt integration integration-race migrate-up migrate-down migrate-status
 
 ENV_FILE ?= .env.example
 
-infra:            ## sobe PostgreSQL, Keycloak e LocalStack e espera ficarem saudáveis
-	docker compose up -d --wait postgres keycloak localstack
+infra:            ## sobe PostgreSQL, Keycloak e o broker (MiniStack), e provisiona filas, tópico, identidades e credenciais
+	mkdir -p .local/broker
+	docker compose up -d --wait postgres keycloak ministack
+	docker compose run --rm broker-provision
+
+broker-provision: ## (re)provisiona o broker; idempotente
+	docker compose run --rm broker-provision
 
 infra-down:       ## derruba o ambiente e apaga os volumes
 	docker compose down -v
@@ -21,7 +26,7 @@ test:             ## testes unitários
 race:
 	go test -race ./...
 
-integration:      ## integração com PostgreSQL, Keycloak e LocalStack reais (make infra antes)
+integration:      ## integração com PostgreSQL, Keycloak e MiniStack reais (make infra antes)
 	go test -tags integration -count=1 ./test/integration/...
 
 integration-race:

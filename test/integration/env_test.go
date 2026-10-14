@@ -1,14 +1,16 @@
 //go:build integration
 
-// Testes de integração: exigem PostgreSQL, Keycloak e LocalStack em execução
-// (docker compose up -d postgres keycloak localstack). Veja README.md.
+// Testes de integração: exigem PostgreSQL, Keycloak e o broker (MiniStack com AUTH=true) em execução e provisionado
+// (docker compose up -d --wait postgres keycloak ministack && docker compose run --rm broker-provision). Veja README.md.
 package integration
 
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -35,6 +37,11 @@ var env struct {
 	issuer      string
 	jwksURL     string
 	awsEndpoint string
+	region      string
+	// brokerCreds é o arquivo de credenciais por responsabilidade escrito pelo provisionamento do broker;
+	// os testes selecionam o perfil de cada principal. Administrador: só o provisionamento da prova.
+	brokerCreds                 string
+	adminAccessKey, adminSecret string
 }
 
 var testPool *pgxpool.Pool
@@ -63,9 +70,34 @@ func TestMain(m *testing.M) {
 	env.issuer = getenv("OIDC_ISSUER", "http://localhost:8081/realms/wager")
 	env.jwksURL = getenv("OIDC_JWKS_URL", "http://localhost:8081/realms/wager/protocol/openid-connect/certs")
 	env.awsEndpoint = getenv("AWS_ENDPOINT_URL", "http://localhost:4566")
-	os.Setenv("AWS_ACCESS_KEY_ID", getenv("AWS_ACCESS_KEY_ID", "test"))
-	os.Setenv("AWS_SECRET_ACCESS_KEY", getenv("AWS_SECRET_ACCESS_KEY", "test"))
-	os.Setenv("AWS_REGION", getenv("AWS_REGION", "us-east-1"))
+	env.region = getenv("AWS_REGION", "us-east-1")
+	os.Setenv("AWS_REGION", env.region)
+	env.adminAccessKey, env.adminSecret = getenv("BROKER_ADMIN_ACCESS_KEY_ID", "test"), getenv("BROKER_ADMIN_SECRET_ACCESS_KEY", "test")
+	creds, err := filepath.Abs(getenv("BROKER_CREDENTIALS_FILE", "../../.local/broker/credentials"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	env.brokerCreds = creds
+	if _, err := os.Stat(creds); err != nil {
+		fmt.Fprintf(os.Stderr, "broker credentials not found (%v): run `docker compose run --rm broker-provision` first\n", err)
+		os.Exit(1)
+	}
+	// Guarda: a prova cria e remove recursos no broker; só roda contra um MiniStack (nunca contra outro
+	// emulador ou ambiente que por acaso escute na porta padrão).
+	if resp, err := http.Get(env.awsEndpoint + "/_ministack/health"); err != nil || resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "no MiniStack answers at %s (%v): start it with `docker compose up -d --wait ministack` and set AWS_ENDPOINT_URL if the port differs\n", env.awsEndpoint, err)
+		os.Exit(1)
+	} else {
+		resp.Body.Close()
+	}
+	// A aplicação sob teste (e os processos filhos) usa o principal de RUNTIME do broker pela cadeia padrão
+	// do SDK; chaves estáticas no ambiente prevaleceriam sobre o perfil e são removidas.
+	for _, k := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"} {
+		os.Unsetenv(k)
+	}
+	os.Setenv("AWS_SHARED_CREDENTIALS_FILE", creds)
+	os.Setenv("AWS_PROFILE", "wager-runtime")
 
 	ctx := context.Background()
 	fail := func(what string, err error) {
@@ -82,7 +114,6 @@ func TestMain(m *testing.M) {
 	if err := postgres.ProvisionRuntimeRole(ctx, env.dbURL, postgres.RuntimeRole{Name: env.runtimeRole, Password: env.runtimePass}); err != nil {
 		fail("provision runtime role", err)
 	}
-	var err error
 	if env.runtimeURL, err = withCredentials(env.dbURL, env.runtimeRole, env.runtimePass); err != nil {
 		fail("runtime url", err)
 	}

@@ -41,7 +41,7 @@ type Config struct {
 	OIDCClockSkew time.Duration
 
 	AWSRegion         string
-	AWSEndpointURL    string // vazio em AWS real; aponta para o LocalStack localmente
+	AWSEndpointURL    string // vazio em AWS real; aponta para o MiniStack localmente
 	SQSWagerQueue     string
 	AllowedCurrencies []domain.Currency
 }

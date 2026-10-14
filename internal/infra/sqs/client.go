@@ -14,7 +14,7 @@ import (
 // Config parametriza o cliente.
 type Config struct {
 	Region      string
-	EndpointURL string // vazio na AWS; LocalStack localmente
+	EndpointURL string // vazio na AWS; MiniStack localmente
 	QueueName   string
 }
 

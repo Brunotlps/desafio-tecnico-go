@@ -198,11 +198,11 @@ continuidade durável.
   `causationId` de `WalletBalanceChanged` = `eventId` do `WagerTransactionProcessed` da mesma operação.
 * **Pendente** (não implementado): publicador com `SELECT … FOR UPDATE SKIP LOCKED` + lease (colunas de lock serão
   adicionadas por migration), backoff exponencial, recuperação de trabalho abandonado, republicação com mesmo `eventId`.
-  **Roteamento previsto** (destino já provisionado): SNS FIFO `wager-events.fifo`; `MessageGroupId = walletId`
-  (presente em `data` dos eventos de carteira e de transação) e `MessageDeduplicationId = eventId`. O broker preserva a ordem das publicações
-  aceitas no mesmo grupo, mas **o publicador não promete reproduzir a ordem original da outbox** (vários publicadores, retries e recuperação
-  podem reordenar e republicar): consumidores deduplicam por `eventId` e projeções de saldo aplicam `balanceAfter` só se `walletVersion` for maior;
-  os consumidores devem deduplicar por `eventId`, pois a entrega é *at-least-once*.
+  **Roteamento previsto** (destino provisionado, §9): SNS FIFO `wager-events.fifo`; `MessageGroupId` = o **`walletId` do payload** (não o
+  `aggregateId`: nos eventos de transação o agregado é a transação) e `MessageDeduplicationId = eventId`. O SNS FIFO preserva a ordem das
+  publicações **aceitas** no mesmo grupo, mas **o publicador não promete reproduzir a ordem original da outbox** (vários publicadores, retries e
+  recuperação podem reordenar e republicar): consumidores deduplicam por `eventId` (a entrega é *at-least-once*; a deduplicação do broker é
+  temporária) e projeções de saldo aplicam `balanceAfter` só se `walletVersion` for maior.
 * **Inbox**: tabela e consumidor **não criados** (sem schema fictício). Desenho previsto: `UNIQUE(consumer_name,
   message_id)` + hash, inserida na mesma transação do caso de uso; `Submit` já é reutilizável pela entrada SQS
   (a chave é `data.idempotencyKey`). Fila: `MessageGroupId = walletId`, `MessageDeduplicationId = messageId`,
@@ -294,8 +294,34 @@ continuidade durável.
   `/providers/{outro}/…` → 403. `OPENING` (interna) é invisível aos provedores.
 * Acessos negados não têm efeito: testes comparam contagens de carteiras/transações/ledger/outbox antes e depois.
 * `/health/*` são públicos e não expõem detalhes de erro (o motivo vai para o log).
-* Mensageria: o controle de acesso ao SQS é do broker (credenciais/políticas AWS); o consumidor continuará validando o
-  domínio (pendente).
+* **Mensageria — controle de acesso do broker** (enunciado §2): o acesso é controlado por credenciais e **políticas do broker**, não pelo
+  código. Ambiente local: **MiniStack 1.5.27 com `AUTH=true`** (imagem fixada), que avalia as políticas IAM do principal identificado pela
+  access key. Escolha: o LocalStack não aplica IAM sem plano pago, e não há conta AWS de teste; o enunciado permite o MiniStack. **Limite
+  assumido: o MiniStack não valida assinaturas SigV4** — a access key identifica o principal, mas o segredo não é conferido. Logo, o que se
+  prova é **autorização emulada por políticas**, não autenticação AWS completa nem adequação de produção; a autenticação real do projeto é a
+  do Keycloak na API HTTP. Princípios:
+  * **Uma identidade por responsabilidade, sem curingas**: produtor interno (só `SendMessage` na entrada), runtime (ciclo de vida da
+    mensagem na entrada + envio à DLQ), publisher (`Publish`/`GetTopicAttributes` no tópico de saída), inspeção (observar e preparar cenários
+    na DLQ e na auditoria) e um principal sem políticas (para comprovar `AccessDenied`). A aplicação recebe **só** o perfil de runtime
+    (`AWS_PROFILE`/`AWS_SHARED_CREDENTIALS_FILE`, cadeia padrão do SDK); as credenciais de provisionamento (a raiz do emulador) ficam só no
+    one-shot e na prova. O publisher já tem principal, mas não há worker.
+  * **Modelo de confiança** (decisão da mentoria): a fila compartilhada é para **produtores internos confiáveis**; provedores externos não têm
+    `SendMessage` direto. O produtor vincula a origem autenticada (token, ou configuração controlada) ao `providerId` permitido antes de
+    publicar; o consumidor valida o envelope e o escopo, mas não trata um campo do corpo como autenticação. Ainda **não implementado** (inbox e consumidor são o incremento 4).
+  * **Entrega SNS→SQS** controlada pela política da fila de auditoria: só o serviço SNS, só a partir do tópico de eventos (`aws:SourceArn`).
+    Sem a política — ou com outro tópico — a mensagem **não** é entregue, ainda que o `Publish` seja aceito (testado).
+  * **Provisionamento idempotente** (`cmd/broker-provision`, SDK Go v2, one-shot do Compose; também usado pela prova): converge recursos,
+    não duplica a assinatura, reaplica políticas e reaproveita as chaves ainda válidas; o arquivo de credenciais (formato de credenciais
+    compartilhadas da AWS, um perfil por usuário, chaves sintéticas locais, fora do git) é escrito de forma atômica.
+  * **Estado efêmero**: sem `PERSIST_STATE`, recriar o contêiner do emulador apaga filas, mensagens e identidades; o provisionamento as
+    recria e a API deve ser reiniciada para reler as credenciais. Nenhuma durabilidade do broker é prometida (nem após `SIGKILL`).
+  * **Prova** (`test/integration/broker_test.go`, na CI): com as credenciais reais de cada principal e recursos isolados por prefixo — fluxos
+    positivos, 20 negativas tipadas (`AccessDenied`/403, inclusive a mesma ação em outro recurso, com ausência de efeito), FIFO, visibilidade e
+    redrive com conteúdo preservado, SNS→SQS entregue e **não** entregue sem a política, provisionamento repetido e partida da API sem permissão.
+    Não há testes de "segredo inválido": o emulador não os rejeitaria. A deduplicação do FIFO é de **transporte** (janela temporária do
+    broker); a garantia financeira é da aplicação (idempotência e inbox no banco).
+  * **Para a AWS real** (não provado aqui): assinatura SigV4 e segredos de verdade; papéis IAM no lugar de usuários com chave estática; políticas de
+    recurso e criptografia (KMS) das filas e do tópico; endpoints privados e o redrive em segundo plano (o MiniStack o aplica na próxima tentativa de recebimento).
 
 ## 10. Garantias impostas pelo PostgreSQL (§5.3, §5.8)
 
@@ -374,7 +400,7 @@ cadeia quebrada, resultado nulo, transação concluída sem lançamento ou resul
 anterior e os registros intactos; aplicar → reverter → reaplicar funciona.
 
 Limitações: `LOSS` não tem lançamento, então seu `result_balance` (saldo observado) não é verificável contra o ledger; o sentido do
-lançamento de `ROLLBACK` depende da operação original e só será imposto com o processamento de reversões; o dono do schema e
+lançamento de `ROLLBACK` é imposto desde a 00005 (direção oposta à do alvo, §10); o dono do schema e
 superusuários ainda podem desabilitar triggers (a aplicação nunca roda com eles).
 
 ### 10.3. Upgrade com escritores ativos: a janela entre validar e instalar, e como foi fechada
@@ -496,8 +522,8 @@ espera/retenção pelo lock, dados preservados, reversão/reaplicação e partid
 ## 14. Limitações e trabalho não concluído
 
 Ver "Escopo e pendências" no README. Em síntese, **ainda ausentes**: SQS + inbox (consumidor, retry/DLQ, produtor autorizado), publicador
-de outbox, paginação do ledger, reconciliação, métricas, o controle de acesso do broker (a troca de LocalStack por MiniStack está
-**pendente de decisão**, ver README), e a prova com três processos para os fluxos SQS/outbox. A prova com três processos **existe** para
+de outbox, paginação do ledger, reconciliação, métricas, e a prova com três processos para os fluxos SQS/outbox. O controle de acesso do
+broker está **provado como autorização emulada** (§9), com o limite de não validar SigV4. A prova com três processos **existe** para
 HTTP (apostas, WIN/LOSS) e para reversões e pendências com o worker real (`references_multiprocess_test.go`).
 
 Limites das garantias atuais (detalhes nas seções indicadas): dono do schema e superusuários podem desabilitar triggers — a aplicação
