@@ -238,9 +238,9 @@ Variáveis opcionais (padrões coincidem com o Compose): `TEST_DATABASE_URL`, `T
 | `verify` | `gofmt`, `go mod verify`, `go mod tidy` sem diferenças, `go vet` (com e sem `-tags integration`), `go test -race` |
 | `infra` | `docker compose up --wait` de PostgreSQL, Keycloak e LocalStack + `scripts/check-infra.sh` (tokens, papéis, `provider_id`, filas, redrive, destino dos eventos) |
 | `integration` | os testes de integração com `-race` contra PostgreSQL, Keycloak e LocalStack reais |
-| `stack` | `docker compose up --build` (imagem, migrations, papel de runtime, API) + `scripts/smoke.sh` |
+| `stack` | `docker compose up --build` (imagem, migrations, papel de runtime, API), espera a API ficar `healthy` (`scripts/wait-healthy.sh`: estado estruturado do `docker inspect`, comparação exata, com prazo e diagnóstico) + `scripts/smoke.sh` |
 
-Os mesmos scripts rodam localmente: `scripts/check-infra.sh` (com a infraestrutura de pé) e `scripts/smoke.sh` (com o stack de pé).
+Os mesmos scripts rodam localmente: `scripts/check-infra.sh` (com a infraestrutura de pé), `scripts/wait-healthy.sh <serviço> [segundos]` e `scripts/smoke.sh` (com o stack de pé).
 Para validar o Compose sem mexer no seu ambiente, use outro projeto e outras portas:
 
 ```sh
