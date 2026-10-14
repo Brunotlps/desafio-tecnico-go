@@ -1,0 +1,62 @@
+# Ambiente local: PostgreSQL, Keycloak (IdP) e LocalStack (SQS/SNS).
+# Todas as credenciais abaixo são valores de desenvolvimento, não segredos reais.
+name: wager
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: wager
+      POSTGRES_PASSWORD: wager
+      POSTGRES_DB: wager
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wager -d wager"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # Fixa o issuer (claim iss) independentemente do host usado na requisição.
+      KC_HOSTNAME: http://localhost:${KEYCLOAK_PORT:-8081}
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "127.0.0.1:${KEYCLOAK_PORT:-8081}:8080"
+    volumes:
+      - ./deploy/keycloak/wager-realm.json:/opt/keycloak/data/import/wager-realm.json:ro
+    healthcheck:
+      # A imagem não tem curl; testa o endpoint de saúde (porta de gestão 9000) via /dev/tcp.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '\"status\": \"UP\"' <&3"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  localstack:
+    image: localstack/localstack:4.9
+    environment:
+      SERVICES: sqs,sns
+      DEFAULT_REGION: us-east-1
+    ports:
+      - "127.0.0.1:${LOCALSTACK_PORT:-4566}:4566"
+    volumes:
+      # Provisiona filas, redrive e o destino dos eventos quando o LocalStack fica pronto.
+      - ./deploy/localstack/provision.sh:/etc/localstack/init/ready.d/10-provision.sh:ro
+    healthcheck:
+      # Pronto quando os scripts de init (provision.sh) terminaram com sucesso.
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/init/ready | grep -q '\"completed\": true' && curl -sf http://localhost:4566/_localstack/init/ready | grep -q '\"state\": \"SUCCESSFUL\"'"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+volumes:
+  pgdata:

@@ -37,3 +37,22 @@ jobs:
           go vet -tags integration ./...
       - name: unit tests (race detector)
         run: go test -race -count=1 ./...
+
+  infra:
+    name: infrastructure (compose, Keycloak realm, queues)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: compose file is valid
+        run: docker compose config --quiet
+      - name: start PostgreSQL, Keycloak and LocalStack
+        run: docker compose up -d --wait postgres keycloak localstack
+      - name: verify identities, queues, redrive and event destination
+        run: scripts/check-infra.sh
+      - name: logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail 200
+      - name: tear down
+        if: always()
+        run: docker compose down -v
