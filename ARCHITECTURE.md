@@ -133,8 +133,9 @@ técnica** ou **pendência**. O estado de implementação está no fim e no READ
    legítimo não depende da carteira nem da configuração atual de moedas. A busca é sempre no escopo do provedor autenticado
    (autenticação e autorização antecedem tudo e não mudam).
 2b. **Políticas de operação nova** (só se a identidade não existe), nesta ordem: moeda habilitada (422 `CURRENCY_NOT_SUPPORTED`) e tipo
-   com processamento implementado (501 `KIND_NOT_SUPPORTED`, nada é gravado). Implementados: `BET`, `WIN` **sem** referência e `LOSS`.
-   `WIN` com `referenceExternalTransactionId` é 501 até a resolução de referências: a referência recebida nunca é ignorada.
+   com processamento implementado (501 `KIND_NOT_SUPPORTED`, nada é gravado; hoje todos os tipos externos têm processamento, então esse ramo
+   é só uma defesa). Implementados: `BET`, `WIN` (com ou sem referência), `LOSS`, `REFUND` e `ROLLBACK`. Uma referência recebida nunca é
+   ignorada: ou é resolvida e validada, ou a operação espera por ela como `PENDING_REFERENCE` (§8).
 3. `GetForUpdate(walletId)`; inexistente → 404; jogador/moeda divergentes → 422 (erros de **entrada**, não gravados).
 4. Com a carteira travada, repete o passo 2 (uma operação concorrente da mesma carteira pode ter confirmado entre os passos).
 5. Aplica a regra do tipo, grava carteira (CAS), transação, ledger e outbox, e confirma:
@@ -257,6 +258,15 @@ continuidade durável.
   Encontrar o alvo `PROCESSED` não dispensa saldo, tipo/escopo/valor nem a unicidade da reversão. Uma rejeição por expiração já confirmada
   é terminal e não é reaberta por uma chegada tardia nem por replay. **Falha de consulta não prova ausência**: a tentativa é abortada (erro
   transitório), nada é gravado e o prazo original segue valendo.
+* **Varredura limitada, paginada e justa entre carteiras** (`Service.ProcessDue`): a leitura de candidatos (só uma leitura, sem locks) é paginada
+  por chave `(próxima tentativa, id)` — sem `OFFSET` — e uma carteira que se mostra ocupada (`SKIP LOCKED`) é **excluída das páginas seguintes**: um prefixo de
+  candidatos todo em carteiras ocupadas não impede a varredura de chegar às carteiras independentes (aumentar apenas o lote só deslocaria o defeito). O
+  trabalho é limitado: no máximo `BatchSize` tentativas efetivas por varredura (as puladas por carteira ocupada ou ainda não vencidas custam uma verificação barata
+  e não contam) e 50 páginas; o cancelamento é respeitado entre candidatos; uma varredura toda ocupada termina sem tentar nada e **sem tocar** nenhuma agenda
+  (o prazo não é renovado por estar ocupada), e o worker só varre de novo depois do intervalo de espera, sem laço ativo.
+* **Elegibilidade temporal sob os locks**: depois de travar a carteira e a agenda, a tentativa compara o `next_attempt_at` **recarregado** com o relógio; uma seleção
+  antiga não autoriza a tentativa que outra instância já reagendou para o futuro (o backoff persistido vale para todas). Não existe caminho "forçado" no worker:
+  os testes avançam o relógio de propósito. A elegibilidade não é um prazo rígido de validade: uma referência `PROCESSED` ainda resolve depois do TTL.
 * **Retomada** (`Service.ProcessPending`): transação curta (fase financeira de até 10 s, incluindo locks e commit) que recarrega e revalida a
   operação **original** — mesmo id, hash e chave; não recria nada nem usa reidratação como mutação — e conclui estado, saldo, ledger, outbox e
   agenda no mesmo commit; ou apenas reagenda (`next_attempt_at`, `attempts`), sem repetir o evento inicial. Backoff **persistido**:
@@ -325,7 +335,7 @@ continuidade durável.
 
 ## 10. Garantias impostas pelo PostgreSQL (§5.3, §5.8)
 
-Migrations `00001_init.sql` a `00005_…` — verificadas por tentativas **diretas de SQL** (inclusive pelo papel restrito de runtime) em `constraints_test.go`, `db_integrity_test.go` e `completed_movement_test.go`:
+Migrations `00001_init.sql` a `00006_…` — verificadas por tentativas **diretas de SQL** (inclusive pelo papel restrito de runtime) em `constraints_test.go`, `db_integrity_test.go` e `completed_movement_test.go`:
 
 | Garantia | Mecanismo |
 | --- | --- |
@@ -354,6 +364,7 @@ Migrations `00001_init.sql` a `00005_…` — verificadas por tentativas **diret
 | **Uma reversão por alvo** | índice único parcial `uq_wager_tx_one_reversal_per_target (reference_transaction_id) WHERE kind IN ('REFUND','ROLLBACK') AND status = 'PROCESSED'`: vale para `REFUND` e `ROLLBACK` em conjunto; `WIN` com referência não o consome; rejeições/falhas/pendências também não |
 | **Sentido do lançamento de `ROLLBACK`** | `ledger_entry_matches_transaction` (deferida): alvo `BET` ⇒ `CREDIT`; alvo `WIN`/`REFUND` ⇒ `DEBIT`; `ROLLBACK` sem alvo resolvido é recusado |
 | **Mutabilidade das não terminais** | `wager_transactions_guard` (substituída): rodada, jogo, referência externa e criação passam a ser imutáveis, a referência interna não muda depois de resolvida, só transições `PENDING→*` e `PENDING_REFERENCE→PROCESSED|REJECTED|FAILED`, `updated_at` não regride |
+| **Forma de `PENDING_REFERENCE`** (migration 00006) | `CHECK ck_wager_tx_pending_reference_shape`: só origem externa, tipo `WIN`/`REFUND`/`ROLLBACK` e referência externa preenchida; `CHECK ck_wager_tx_reference_form` (em qualquer estado): a referência externa, quando existe, não é vazia, tem ≤ 128 caracteres, nenhum caractere de controle, nenhum espaço nas pontas e difere do próprio id externo — as formas que a reidratação rejeita. O domínio não foi enfraquecido |
 | **Pendência com retomada** | `pending_references` + constraint triggers deferidos: **nenhum `PENDING` é confirmado**; `PENDING_REFERENCE` exige agenda aberta; transação terminal não deixa agenda aberta; a agenda tem identidade e prazo imutáveis, `attempts` não diminui e nunca é apagada |
 
 ### 10.1. Papéis de banco: migrations × runtime
@@ -368,7 +379,7 @@ Migrations `00001_init.sql` a `00005_…` — verificadas por tentativas **diret
   identidade imutáveis, sem `DELETE`); carteiras `SELECT, INSERT` e `UPDATE (balance, version, updated_at)`; `goose_db_version` `SELECT`. Sem `UPDATE/DELETE/TRUNCATE` no ledger, sem `DISABLE TRIGGER` (exige posse), sem
   `session_replication_role` (exige superusuário), sem `DROP`/`ALTER`. Testado com tentativas reais (`role_test.go`) e com o fluxo
   financeiro completo e a verificação de schema rodando com esse papel. Ampliar privilégios (p.ex. `UPDATE` da outbox pelo publicador) é uma mudança explícita nessa lista; a 00005 ampliou
-  só as colunas de transição das transações e da agenda. `migrate grants` omite a agenda em um banco ainda anterior à 00005.
+  só as colunas de transição das transações e da agenda. `migrate grants` omite a agenda em um banco ainda anterior à 00005. A preparação de rollback revoga a escrita na agenda (§10.2).
 * Limitação restante: o dono e superusuários continuam podendo desabilitar triggers — por isso a aplicação nunca roda com
   esses papéis. Em produção, crie o papel de runtime fora do pipeline de migrations se o papel das migrations não tiver `CREATEROLE`.
 
@@ -384,7 +395,8 @@ versão anterior).
 | --- | --- | --- | --- |
 | `00002_ledger_chain_and_result_integrity` | cadeia do ledger quebrada; lançamento incoerente com sua transação; `PROCESSED`/`REJECTED` com resultado nulo; `failure_code` inválido; saldo ≠ ledger | cadeia contínua, FK composta, resultado explícito | remove o que instalou |
 | `00003_completed_movement_requires_ledger` | transação `PROCESSED` (≠ `LOSS`) **sem lançamento**; `result_balance` ≠ `balance_after` do lançamento | trigger deferido da transação e verificação de resultado no lado do ledger | remove o trigger e restaura a função de 00002; **não toca nos dados** (após a reversão a lacuna volta a existir) |
-| `00005_references_and_reversals` | **exclusão dos escritores** (mesmo `LOCK TABLE` da 00004) e, com eles excluídos: transação confirmada como `PENDING`; reversão/`WIN` com referência `PROCESSED` sem a referência interna; referência interna incoerente com a externa, o escopo, o tipo, o estado ou o valor; alvo com mais de uma reversão `PROCESSED`; lançamento de `ROLLBACK` no sentido errado (contagem e primeiros ids) | tudo o que está em §10 na linha "Referência coerente" em diante, mais a agenda `pending_references` | remove as garantias, restaura as funções da 00001/00003 e **descarta a agenda** (transações e ledger intactos; uma pendência aberta segue `PENDING_REFERENCE`, sem retomada, até um novo `migrate up`, que recria a agenda dela com prazo renovado — caso excepcional, pois antes da 00005 nenhuma pendência era gravada) |
+| `00006_pending_shape_and_schedule_preservation` | **exclusão dos escritores**; recusa, com contagem e primeiros ids: `PENDING_REFERENCE` irretomável (não externo, tipo que não espera referência, ou referência ausente/inválida), referência externa com forma que a reidratação rejeita (vazia, > 128, controle, espaços nas pontas, igual ao próprio id) e cópia preservada sem transação correspondente | `CHECK ck_wager_tx_reference_form` (qualquer estado) e `ck_wager_tx_pending_reference_shape`, função `wager_valid_external_reference`; **restaura** a agenda preservada por um rollback anterior (valores originais, inclusive as concluídas) sobre as linhas que o `Up` da 00005 reconstruiu, e remove a cópia | remove os dois `CHECK` e a função; não toca em dados |
+| `00005_references_and_reversals` | **exclusão dos escritores** (mesmo `LOCK TABLE` da 00004) e, com eles excluídos: transação confirmada como `PENDING`; reversão/`WIN` com referência `PROCESSED` sem a referência interna; referência interna incoerente com a externa, o escopo, o tipo, o estado ou o valor; alvo com mais de uma reversão `PROCESSED`; lançamento de `ROLLBACK` no sentido errado (contagem e primeiros ids) | tudo o que está em §10 na linha "Referência coerente" em diante, mais a agenda `pending_references` | remove as garantias, restaura as funções da 00001/00003 e `DROP`a a agenda (transações e ledger intactos). **O migrador preserva a agenda antes dessa reversão e a 00006 a restaura na reaplicação** — ver "Rollback e a agenda das pendências" abaixo |
 | `00004_revalidate_history_under_writer_exclusion` | **exclusão dos escritores** (`LOCK TABLE` em `wallets`, `wager_transactions`, `wallet_ledger_entries`) e, com eles excluídos: triggers das garantias ausentes ou desabilitados; cadeia do ledger quebrada; lançamento incoerente com a transação; saldo ≠ ledger; transação concluída sem lançamento; resultado ≠ `balance_after` (com contagem e primeiros ids) | nada (só valida; é a versão final esperada pela aplicação) | vazia: apenas retrocede a versão, sem tocar em dados nem garantias |
 
 Mecanismo da 00003 (por que um *constraint trigger* deferido): um `CHECK` não enxerga outra tabela; uma FK da transação para o
@@ -402,6 +414,23 @@ anterior e os registros intactos; aplicar → reverter → reaplicar funciona.
 Limitações: `LOSS` não tem lançamento, então seu `result_balance` (saldo observado) não é verificável contra o ledger; o sentido do
 lançamento de `ROLLBACK` é imposto desde a 00005 (direção oposta à do alvo, §10); o dono do schema e
 superusuários ainda podem desabilitar triggers (a aplicação nunca roda com eles).
+
+#### Rollback e a agenda das pendências (achado da auditoria do incremento 2)
+
+A agenda é dado durável (início, vencimento, próxima tentativa, tentativas, diagnóstico, agendas concluídas). O `Down` publicado da 00005
+apaga a tabela e o seu `Up` reconstrói linhas com `now() + 15 min` — o que renovaria um prazo vencido e zeraria tentativas. Documentar essa
+perda **não** a corrige; como a 00005 não pode ser reescrita, a correção é composta e compatível com o histórico:
+
+* **Preparação de rollback** (`Migrator.Down`/`DownTo`, interfaces de `cmd/migrate down` e `down-to`): ao reverter a 00005, sob exclusão dos
+  escritores (`LOCK TABLE wallets, wager_transactions, pending_references IN SHARE ROW EXCLUSIVE MODE`), **revoga toda escrita** na agenda de
+  qualquer papel que não seja o dono (o runtime falha em voz alta em vez de gravar o que seria apagado; a janela entre a preparação e o `DROP` fica
+  coberta) e grava `pending_references_preserved` (cópia integral). A agenda original continua intacta até o `DROP`.
+* **Restauração** (00006, na reaplicação): substitui as linhas reconstruídas pelo `Up` da 00005 pelos valores originais, inclusive as concluídas,
+  desabilitando o gatilho de imutabilidade só durante a restauração (dono, sob exclusão dos escritores), dispara as verificações deferidas e remove a cópia.
+  Uma cópia sem transação correspondente é recusada com contagem e ids (preflight), não descartada.
+* **Reset destrutivo ≠ rollback operacional**: `down-to 0` apaga tudo, como sempre, e descarta também a cópia; `down`/`down-to N>0` preservam.
+* Dados que nunca tiveram agenda (um `PENDING_REFERENCE` criado por SQL antes da 00005) recebem a agenda reconstruída da 00005 — não há valor original.
+* Testes: `audit_regressions_test.go` (ciclo preservando prazo vencido, tentativas, diagnóstico e concluídas; janela observada com o `DROP` retido por uma leitura aberta; banco ainda na versão 5; `down-to 0`; cópia órfã).
 
 ### 10.3. Upgrade com escritores ativos: a janela entre validar e instalar, e como foi fechada
 
@@ -429,7 +458,7 @@ mecanismo. Justificativa:
 * A 00003 já foi publicada e não é reescrita; sua janela é tratada **depois do fato**: a 00004 detecta e recusa o histórico
   incompatível, inclusive em bancos onde a janela já ocorreu (e no upgrade 2→4 com um escritor aberto, que deixa o schema em 3).
 
-**Portão da versão final.** Um upgrade só termina bem na versão final (hoje 5). Se uma migration recusar (p.ex. a 00004 ou a 00005), o schema fica na versão anterior, **nada é apagado
+**Portão da versão final.** Um upgrade só termina bem na versão final (hoje 6). Se uma migration recusar (p.ex. a 00004 ou a 00005), o schema fica na versão anterior, **nada é apagado
 nem reescrito**, e a aplicação (que compara a versão do schema com a embutida no binário) **recusa iniciar**: o estado é visível e
 não é tratado como sucesso. A correção dos registros é manual; depois, `migrate up` conclui.
 
@@ -531,6 +560,6 @@ nunca roda com eles (§10.1); o `result_balance` de `LOSS` não é verificável 
 é recusada pelo domínio e tratada por quem chama a transição (§3, §8); a rotação de chaves do IdP pode causar 401 por até 30 s (§9). Da
 política de reversões (§8): o `ROLLBACK` da BET depois do `ROLLBACK` do REFUND é recusado (escolha de contrato, não de viabilidade
 financeira). Das pendências: o TTL e o backoff usam o relógio da aplicação (diferença entre instâncias desloca o prazo, nunca o renova); uma
-carteira continuamente ocupada pode adiar a retomada (a varredura a pula, `SKIP LOCKED`); o worker não tem lease (a exclusão é pelos locks
+uma carteira continuamente ocupada adia apenas a retomada das pendências dela (a varredura a pula e segue para as demais, `SKIP LOCKED`); o worker não tem lease (a exclusão é pelos locks
 e pela revalidação). Dos testes: o harness de processos reais compila o binário **sem `-race`** — `go test -race` do processo pai não
-instrumenta os filhos (adaptação prevista para a consolidação final). A reversão da migration 00005 descarta a agenda de pendências.
+instrumenta os filhos (adaptação prevista para a consolidação final). A proteção da agenda no rollback está no migrador (`Migrator`), não no SQL publicado da 00005: o `Down` da 00005 executado diretamente pelo goose, sem o migrador, não preserva a agenda.

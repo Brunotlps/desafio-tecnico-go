@@ -63,9 +63,21 @@ func (r pendingRepo) Complete(ctx context.Context, txID uuid.UUID, at time.Time)
 	return nil
 }
 
-func (r pendingRepo) Due(ctx context.Context, now time.Time, limit int) ([]app.PendingReference, error) {
+func (r pendingRepo) Due(ctx context.Context, q app.DueQuery) ([]app.PendingReference, error) {
+	var afterAt *time.Time
+	afterID := uuid.Nil
+	if q.After != nil {
+		afterAt, afterID = &q.After.NextAttemptAt, q.After.TransactionID
+	}
+	exclude := q.ExcludeWallets
+	if exclude == nil {
+		exclude = []uuid.UUID{}
+	}
 	rows, err := r.q.Query(ctx, `SELECT `+pendingColumns+` FROM pending_references
-		WHERE completed_at IS NULL AND next_attempt_at <= $1 ORDER BY next_attempt_at, transaction_id LIMIT $2`, now, limit)
+		WHERE completed_at IS NULL AND next_attempt_at <= $1
+		  AND ($3::timestamptz IS NULL OR (next_attempt_at, transaction_id) > ($3, $4))
+		  AND NOT (wallet_id = ANY($5::uuid[]))
+		ORDER BY next_attempt_at, transaction_id LIMIT $2`, q.Now, q.Limit, afterAt, afterID, exclude)
 	if err != nil {
 		return nil, classify(err)
 	}

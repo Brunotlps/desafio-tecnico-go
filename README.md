@@ -107,7 +107,7 @@ Respostas de erro: `{"code":"...","message":"..."}`.
 | Referência ainda indisponível (ausente, ou existente e pendente) em `REFUND`, `ROLLBACK` ou `WIN` com `referenceExternalTransactionId` | 202 | corpo `{"status":"PENDING_REFERENCE",...}` **sem saldo**; a operação é persistida com a agenda e retomada pelo worker; o replay devolve o mesmo 202; consulte a transação (`GET`) para o resultado |
 | Referência com a própria operação (`referenceExternalTransactionId` = `externalTransactionId`) | 400 | `INVALID_REQUEST` |
 | Crédito de `WIN` que ultrapassaria o limite de `Money` | 400 | `INVALID_AMOUNT` — nada é persistido |
-| Aceito sem resultado (`PENDING*`; **inalcançável nesta versão**) | 202 | corpo com `status`                       |
+| Aceito sem resultado (`PENDING_REFERENCE`, ver acima) | 202 | corpo com `status` e **sem** saldo; o replay devolve o mesmo 202 |
 | Indisponibilidade transitória                          | 503  | `TEMPORARILY_UNAVAILABLE` (+ `Retry-After`) |
 | Resultado do commit desconhecido                       | 503  | `COMMIT_OUTCOME_UNKNOWN` — repita com a **mesma** chave |
 
@@ -230,13 +230,13 @@ go run ./cmd/migrate up                # aplica as pendentes e, se RUNTIME_DB_RO
 go run ./cmd/migrate status
 go run ./cmd/migrate grants            # só (re)aplica os privilégios mínimos do papel de runtime
 go run ./cmd/migrate down              # reverte a última
-go run ./cmd/migrate down-to 0         # reverte todas (apaga os dados!)
+go run ./cmd/migrate down-to 0         # RESET destrutivo: reverte todas (apaga os dados, inclusive a cópia preservada da agenda)
 # no Compose: docker compose run --rm migrate up | down | status | grants
 ```
 
 A API **recusa iniciar** se o schema não estiver na versão esperada pelo binário.
 
-### Bancos já inicializados (migrations 00002 a 00005)
+### Bancos já inicializados (migrations 00002 a 00006)
 
 As migrations já publicadas (00001, 00002) **não são reescritas**; as correções são migrations novas. Para um banco criado
 por versões anteriores, **não apague nada**: rode `migrate up` (no Compose: `docker compose up -d --build migrate api`).
@@ -247,14 +247,14 @@ por versões anteriores, **não apague nada**: rode `migrate up` (no Compose: `d
   `REFUND`, `ROLLBACK`) precisa, no COMMIT, do lançamento da própria carteira, e `result_balance` tem de ser o `balance_after`
   desse lançamento (`LOSS` e rejeições não têm lançamento).
 
-* `00005_references_and_reversals.sql` — **versão final esperada pela aplicação (5)**. Instala no banco as garantias das reversões e das
+* `00006_pending_shape_and_schedule_preservation.sql` — **versão final esperada pela aplicação (6)**; corrige dois achados da auditoria sem reescrever a 00005. (1) **Forma de `PENDING_REFERENCE` imposta no schema**: a referência externa, quando existe, precisa ter uma forma que a reidratação aceita (não vazia, ≤ 128 caracteres, sem caracteres de controle nem espaços nas pontas, diferente do próprio id externo) e `PENDING_REFERENCE` só existe para origem externa, tipo `WIN`/`REFUND`/`ROLLBACK` e com referência externa; o histórico incompatível é **recusado** (contagem e primeiros ids, sob exclusão dos escritores), nunca corrigido. (2) **Restaura a agenda preservada** por um rollback anterior (ver abaixo). Reversão: remove as garantias; não toca em dados.
+* `00005_references_and_reversals.sql` — Instala no banco as garantias das reversões e das
   pendências (referência interna coerente com a externa e o escopo, alvo `PROCESSED` de tipo elegível, valor integral, sentido do
   `ROLLBACK`, referência resolvida para concluir, **uma reversão por alvo**, mutabilidade restrita das transações não terminais, e a agenda
   `pending_references`: `PENDING` nunca é confirmado e `PENDING_REFERENCE` sempre tem agenda aberta). Faz o mesmo `LOCK TABLE` da 00004 e, com os
   escritores excluídos, **recusa** (contagem e primeiros ids, nada alterado) transação confirmada como `PENDING`, reversão ou `WIN` com
   referência concluída sem a referência interna, referência incoerente, alvo com mais de uma reversão ou `ROLLBACK` com lançamento no sentido
-  errado. Reversão (`migrate down`): remove as garantias e **descarta a agenda**; transações e ledger não são tocados (uma pendência aberta
-  segue `PENDING_REFERENCE`; o próximo `migrate up` recria a agenda dela). Os privilégios do papel de runtime ganham `UPDATE` só nas colunas de
+  errado. O `Down` publicado dela remove as garantias e `DROP`a a agenda; por isso o migrador a **preserva antes** (ver "Rollback e a agenda das pendências"). Os privilégios do papel de runtime ganham `UPDATE` só nas colunas de
   transição (`migrate up` ou `migrate grants`).
 * `00004_revalidate_history_under_writer_exclusion.sql` — janela entre validar e instalar fechada. Trava as tabelas financeiras
   (`LOCK TABLE ... SHARE ROW EXCLUSIVE`: espera escritores abertos, retém os novos, não bloqueia leituras), relê **todo** o
@@ -272,7 +272,7 @@ instala nada: reverter só retrocede a versão) e **não altera dados**.
 ```sh
 docker compose stop api                 # recomendado: parar todos os escritores (todas as instâncias da API)
 docker compose run --rm migrate up      # papel dono do schema; espera escritores abertos e valida sob exclusão
-docker compose run --rm migrate status  # a versão final (00005) precisa constar como aplicada
+docker compose run --rm migrate status  # a versão final (00006) precisa constar como aplicada
 docker compose up -d --build api        # a API só inicia na versão final do schema
 ```
 
@@ -280,13 +280,33 @@ docker compose up -d --build api        # a API só inicia na versão final do s
   `LOCK TABLE` da 00004. Mesmo com a API ativa o resultado é correto para escritores do papel de runtime; parar os escritores
   reduz a retenção e é a precondição para qualquer outro escritor (manutenção manual, ETL, outro papel).
 * Se a 00004 ou a 00005 abortar (histórico incompatível, trigger ausente/desabilitado ou escritor aberto por mais de 30 s), o schema fica na
-  versão anterior (p.ex. 4), nada é apagado e **a API recusa iniciar** (`schema is at version 4, application expects 5`). Corrija os registros
+  versão anterior (p.ex. 4), nada é apagado e **a API recusa iniciar** (`schema is at version 5, application expects 6`). Corrija os registros
   indicados manualmente (contagem e primeiros ids na mensagem) ou repita sem escritores abertos, e rode `migrate up` de novo.
 * Limites: um escritor com privilégio de dono/superusuário pode ignorar triggers (só a validação o enxerga, e só no instante da
   migration); upgrade online sem nenhuma retenção não é objetivo.
 
 Papel de runtime em bancos antigos: o primeiro `migrate up` desta versão (com `RUNTIME_DB_ROLE`) cria o `wager_app`; depois
 troque `DATABASE_URL` da API para ele (o Compose já faz isso).
+
+### Rollback e a agenda das pendências
+
+A agenda (`pending_references`: início, vencimento, próxima tentativa, tentativas, diagnóstico e as agendas concluídas) é **dado durável**,
+não estado descartável: reverter e reaplicar não pode apagá-la nem renovar um prazo vencido. Como a 00005 já foi publicada, o `Down`
+dela (que remove a tabela) e o `Up` (que reconstrói linhas com prazo novo) **não foram reescritos**; a solução compatível é:
+
+1. **Reversão operacional** — `migrate down` (um passo) e `migrate down-to N` com `N > 0`, pela interface do migrador (`Migrator.Down`/`DownTo`):
+   antes de reverter a 00005, o migrador executa a **preparação do rollback** sob exclusão dos escritores (`LOCK TABLE … SHARE ROW EXCLUSIVE`, mesma ordem
+   das migrations): revoga a escrita na agenda para todo papel que não seja o dono (o runtime passa a falhar em voz alta, nada é gravado para depois ser
+   apagado) e guarda uma **cópia integral** em `pending_references_preserved`. Reverter a 00006 e as posteriores não toca em dados.
+2. **Reaplicação** — `migrate up`: o `Up` da 00005 reconstrói, com prazo renovado, uma linha para cada `PENDING_REFERENCE` (comportamento publicado);
+   a **00006 restaura por cima delas a cópia preservada** — valores originais, inclusive as agendas concluídas — e a remove. Uma cópia que não
+   corresponde a nenhuma transação (p.ex. após um reset) **bloqueia a restauração** com contagem e ids, sem descartá-la em silêncio.
+3. **Reset deliberadamente destrutivo** — `migrate down-to 0` (e a suíte de testes): apaga todas as tabelas e dados, como sempre, **inclusive** a cópia preservada.
+4. Se a reversão da 00005 falhar depois da preparação, a agenda original continua íntegra; `migrate grants` devolve a escrita ao runtime.
+
+Limite: a proteção está no migrador (`cmd/migrate`, `Migrator`); executar o `Down` da 00005 diretamente pelo goose, sem passar por ele, não é protegido.
+Pare as instâncias da API antes de um rollback (como no upgrade). Pendências que nunca tiveram agenda (criadas por SQL numa versão anterior à 00005) recebem,
+no `Up` da 00005, a agenda reconstruída publicada — não há dado original a restaurar.
 
 ## Executar a aplicação sem Docker para a API
 
@@ -348,6 +368,7 @@ Variáveis opcionais (padrões coincidem com o Compose): `TEST_DATABASE_URL`, `T
 | Reversões | `reversal_test.go`, `reversal_http_test.go` | cadeia `BET → REFUND → ROLLBACK do REFUND` (saldo, ledger, eventos, replays após novas movimentações) e novas reversões `ALREADY_REVERSED` sem ledger; `ROLLBACK` de `BET`/`WIN`; `WIN` com referência de valor diferente sem consumir a reversão; reversão sem saldo (`REVERSAL_INSUFFICIENT_FUNDS`, a rejeição não consome o alvo); referências incompatíveis (valor, tipo, rodada, carteira, `LOSS`, `REJECTED`); **`REFUND` × `ROLLBACK` simultâneos**: um sucesso, uma rejeição, um crédito (15 rodadas); contrato HTTP (200/202/422) |
 | Pendências | `pending_references_test.go`, `shutdown_test.go` | aceite com agenda e evento únicos, prazo que não renova no replay/tentativa, resolução pela mesma operação, resolução **depois do TTL**, expiração terminal que não reabre, `REFERENCE_PENDING_TIMEOUT`, referência que termina sem sucesso, falha de consulta que **não** vira `REFERENCE_NOT_FOUND`, falha antes/depois do commit (resultado desconhecido) sem duplicar, 10 executores na mesma pendência, carteira ocupada pulada e outras progredem, relógio atrasado; o TTL é atravessado com **relógio injetado** (sem dormir) |
 | Garantias das referências no banco | `reference_constraints_test.go`, `migration_references_test.go` | SQL direto pelo **papel restrito**: referência fora do escopo/tipo/estado/valor, formas `NULL`/incompletas, segunda reversão (índice único), `ROLLBACK` com lançamento no sentido errado (no COMMIT), colunas imutáveis (privilégio e trigger), `PENDING`/`PENDING_REFERENCE` sem agenda, agenda sem exclusão/alteração de prazo; migration 00005: dados preservados, histórico incompatível recusado (5 formas), reversão/reaplicação, pendências sobreviventes |
+| Correções da auditoria do incremento 2 | `audit_regressions_test.go` | (1) carteira ocupada no início da varredura não impede o avanço de outra (≥ `BatchSize` pendências na ocupada; várias instâncias; varredura toda ocupada termina com poucas consultas, sem tocar nenhuma agenda); (2) candidato antigo não contorna o backoff reagendado por outra instância (sincronização pelos canais do decorador de leitura); (3) rollback/reaplicação preservam a agenda (inclusive concluídas e prazo vencido), a janela da reversão da 00005 é observada (escrita revogada, cópia completa), `down-to 0` é destrutivo, cópia órfã bloqueia a restauração; (4) o banco recusa `PENDING_REFERENCE` de BET/LOSS/OPENING/WIN sem referência e referências com formas inválidas (NULL, vazia, espaços, controle, longa), aceita as válidas e as retoma, e a migration recusa histórico inválido com ids. As varreduras usam **bancos exclusivos** do teste |
 | Shutdown coordenado | `internal/lifecycle/coordinator_test.go`, `shutdown_test.go` | ordem (admissão em todos → drenagem → cancelamento → confirmação), término incompleto, falha de partida; com infraestrutura real: requisição presa no lock é recusada/drenada/cancelada e o **pool só fecha depois**, tentativa do worker presa é cancelada e outra instância conclui, partida com porta ocupada sem vazar conexões, configuração incoerente recusada |
 | Multiprocesso | `multiprocess_test.go`, `win_loss_test.go`, `references_multiprocess_test.go` | **3 processos do binário real**: 50 reenvios espalhados, disputa 2×80,00 entre processos, conexões próprias, `SIGTERM` com saída 0; `SIGKILL` de um processo no meio da carga sem duplicar nem perder débito; reenvios de `WIN`/`LOSS`; **reversões pendentes resolvidas pelos executores dos três processos** (por carteira: uma processada, uma rejeitada, um crédito), `SIGKILL` do processo que aceitou a pendência, expiração com três executores (uma rejeição, um evento). O binário dos filhos é compilado **sem `-race`** (pendência registrada) |
 

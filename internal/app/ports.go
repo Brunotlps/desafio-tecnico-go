@@ -94,6 +94,22 @@ type PendingReferenceRepository interface {
 	Reschedule(ctx context.Context, txID uuid.UUID, next, attemptedAt time.Time) error
 	// Complete encerra a agenda (a transação passou a um estado terminal).
 	Complete(ctx context.Context, txID uuid.UUID, at time.Time) error
-	// Due lista agendas abertas com próxima tentativa vencida, por ordem de vencimento.
-	Due(ctx context.Context, now time.Time, limit int) ([]PendingReference, error)
+	// Due lista, por ordem de vencimento, agendas abertas cuja próxima tentativa já venceu. É só uma
+	// leitura para escolher candidatos: não autoriza movimento (a tentativa revalida tudo sob os locks).
+	Due(ctx context.Context, q DueQuery) ([]PendingReference, error)
+}
+
+// DueQuery parametriza uma página de candidatos. After continua depois do último candidato examinado (paginação
+// por chave, sem OFFSET); ExcludeWallets deixa de fora carteiras já conhecidas como ocupadas na varredura.
+type DueQuery struct {
+	Now            time.Time
+	Limit          int
+	After          *DueCursor
+	ExcludeWallets []uuid.UUID
+}
+
+// DueCursor é a posição (próxima tentativa, transação) do último candidato examinado.
+type DueCursor struct {
+	NextAttemptAt time.Time
+	TransactionID uuid.UUID
 }

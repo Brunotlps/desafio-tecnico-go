@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"desafio-tecnico-go/internal/infra/postgres"
 	"strings"
 	"testing"
 
@@ -75,8 +76,8 @@ func TestReferencesMigrationPreservesValidDataAndIsReversible(t *testing.T) {
 	if _, err := mig.Up(ctx); err != nil {
 		t.Fatalf("migration failed on valid data: %v", err)
 	}
-	if v := schemaVersion(t, conn); v != 5 {
-		t.Fatalf("version %d", v)
+	if v, _ := postgres.ExpectedVersion(); schemaVersion(t, conn) != v {
+		t.Fatalf("version %d, want %d", schemaVersion(t, conn), v)
 	}
 	if after := counts(t, conn, d.wallet); after != before {
 		t.Fatalf("data changed by the migration: %v -> %v", before, after)
@@ -98,9 +99,11 @@ func TestReferencesMigrationPreservesValidDataAndIsReversible(t *testing.T) {
 	})
 	expectPg(t, "second reversal after the migration", err, "23505", "uq_wager_tx_one_reversal_per_target")
 
-	// Reversão: remove as garantias, preserva os dados.
-	if _, err := mig.Down(ctx); err != nil {
-		t.Fatal(err)
+	// Reversão (passo a passo, até antes da 00005): remove as garantias, preserva os dados.
+	for schemaVersion(t, conn) > 4 {
+		if _, err := mig.Down(ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if v := schemaVersion(t, conn); v != 4 {
 		t.Fatalf("version after down: %d", v)
@@ -119,8 +122,8 @@ func TestReferencesMigrationPreservesValidDataAndIsReversible(t *testing.T) {
 	if _, err := mig.Up(ctx); err != nil {
 		t.Fatalf("reapply: %v", err)
 	}
-	if v := schemaVersion(t, conn); v != 5 || !triggerExists(t, conn, "trg_wager_tx_reference_guard") {
-		t.Fatalf("version %d after reapplying", v)
+	if final, _ := postgres.ExpectedVersion(); schemaVersion(t, conn) != final || !triggerExists(t, conn, "trg_wager_tx_reference_guard") {
+		t.Fatalf("version %d after reapplying", schemaVersion(t, conn))
 	}
 }
 

@@ -61,14 +61,45 @@ func (m *Migrator) UpTo(ctx context.Context, version int64) ([]*goose.MigrationR
 	return m.provider.UpTo(ctx, version)
 }
 
-// Down reverte a última migration aplicada.
+// scheduleMigration é a migration que cria a agenda das pendências (00005). Reverter essa migration apaga a
+// agenda, que é dado durável (início, vencimento, próxima tentativa, tentativas e diagnóstico).
+const scheduleMigration = 5
+
+// Down reverte a última migration aplicada. Se ela for a 00005, antes preserva a agenda das pendências (ver
+// preserveSchedule); a reaplicação a restaura com os valores originais.
 func (m *Migrator) Down(ctx context.Context) (*goose.MigrationResult, error) {
+	current, err := m.provider.GetDBVersion(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if current == scheduleMigration {
+		if err := m.preserveSchedule(ctx); err != nil {
+			return nil, err
+		}
+	}
 	return m.provider.Down(ctx)
 }
 
-// DownTo reverte até a versão informada (0 reverte todas).
+// DownTo reverte até a versão informada.
+//
+// Reversão operacional (version > 0): se o percurso inclui a 00005, a agenda das pendências é preservada antes (a
+// reaplicação a restaura). version = 0 é o reset DELIBERADAMENTE destrutivo — apaga todas as tabelas e os dados, como
+// sempre — e descarta também a cópia preservada da agenda.
 func (m *Migrator) DownTo(ctx context.Context, version int64) ([]*goose.MigrationResult, error) {
-	return m.provider.DownTo(ctx, version)
+	current, err := m.provider.GetDBVersion(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if version > 0 && version < scheduleMigration && current >= scheduleMigration {
+		if err := m.preserveSchedule(ctx); err != nil {
+			return nil, err
+		}
+	}
+	res, err := m.provider.DownTo(ctx, version)
+	if err == nil && version == 0 {
+		err = m.dropPreservedSchedule(ctx)
+	}
+	return res, err
 }
 
 // Status lista as migrations e seu estado.
