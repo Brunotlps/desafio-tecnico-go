@@ -94,6 +94,10 @@ type PendingReferenceRepository interface {
 	Reschedule(ctx context.Context, txID uuid.UUID, next, attemptedAt time.Time) error
 	// Complete encerra a agenda (a transação passou a um estado terminal).
 	Complete(ctx context.Context, txID uuid.UUID, at time.Time) error
+	// Defer adia uma agenda aberta cuja tentativa foi abortada por falha de infraestrutura: só agenda (próxima tentativa,
+	// contador e diagnóstico); não toca em saldo, ledger nem no estado da transação, e não sobrescreve um reagendamento mais novo
+	// de outra instância nem uma agenda já concluída.
+	Defer(ctx context.Context, txID uuid.UUID, next, at time.Time, reason string) error
 	// Due lista, por ordem de vencimento, agendas abertas cuja próxima tentativa já venceu. É só uma
 	// leitura para escolher candidatos: não autoriza movimento (a tentativa revalida tudo sob os locks).
 	Due(ctx context.Context, q DueQuery) ([]PendingReference, error)

@@ -45,6 +45,12 @@ type busyPrefix struct {
 // é muito maior que qualquer orçamento de páginas por varredura.
 func newBusyPrefix(t *testing.T, wallets, batch int) *busyPrefix {
 	t.Helper()
+	return newBusyPrefixHeldBy(t, wallets, batch, `SELECT 1 FROM wallets WHERE id = $1 FOR UPDATE`)
+}
+
+// newBusyPrefixHeldBy é newBusyPrefix com o SQL que segura cada carteira ocupada (o modo de lock do escritor).
+func newBusyPrefixHeldBy(t *testing.T, wallets, batch int, holdSQL string) *busyPrefix {
+	t.Helper()
 	ctx := context.Background()
 	b := &busyPrefix{clock: newFakeClock(), cfg: testRef}
 	b.cfg.BatchSize = batch
@@ -60,7 +66,7 @@ func newBusyPrefix(t *testing.T, wallets, batch int) *busyPrefix {
 		w, p := svcOpen(t, b.iso.svc, "100.00")
 		r := mustSubmit(t, b.iso.svc, op(w, p, "REFUND", id(fmt.Sprint("old-", i)), "25.00", id("missing")))
 		b.busy = append(b.busy, r.Transaction.ID())
-		if _, err := lock.Exec(ctx, `SELECT 1 FROM wallets WHERE id = $1 FOR UPDATE`, w); err != nil {
+		if _, err := lock.Exec(ctx, holdSQL, w); err != nil {
 			t.Fatal(err)
 		}
 		b.clock.Advance(2 * time.Second)
@@ -224,11 +230,12 @@ func observe(t *testing.T, sql string, args ...any) int64 {
 	return n
 }
 
-// advisoryWaiters conta sessões do banco do teste esperando o advisory lock de chave key.
-func advisoryWaiters(t *testing.T, d *upgradeDB, key int64) int64 {
+// migratorWaiters conta as sessões que esperam o lock do migrador: o migrador o adquire por tentativas (pg_try_advisory_lock marcado
+// no texto), então quem espera é a sessão com essa consulta que NÃO detém o lock.
+func migratorWaiters(t *testing.T, d *upgradeDB) int64 {
 	t.Helper()
-	return observe(t, `SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a USING (pid)
-		WHERE l.locktype = 'advisory' AND NOT l.granted AND a.datname = $1 AND (l.classid::bigint << 32 | l.objid::bigint) = $2`, d.name, key)
+	return observe(t, `SELECT count(*) FROM pg_stat_activity a WHERE a.datname = $1 AND a.query LIKE '%wager-migrator-lock%'
+		AND NOT EXISTS (SELECT 1 FROM pg_locks l WHERE l.pid = a.pid AND l.locktype = 'advisory' AND l.granted AND l.objid::bigint = $2)`, d.name, postgres.MigratorLockID)
 }
 
 // downHeldAfterPreparation inicia Down e o conduz até a fase goose: a preparação (LOCK TABLE) é mantida em espera por uma
@@ -266,7 +273,7 @@ func downHeldAfterPreparation(t *testing.T, d *upgradeDB) (done chan error, rele
 	// O goose sonda o lock com pg_try_advisory_lock (não aparece como espera em pg_locks): a conexão cuja última consulta é essa
 	// sonda, depois que o teste reteve o lock, é a reversão esperando a sua vez.
 	eventually(t, "the goose phase to wait for its lock", 10*time.Second, func() bool {
-		return observe(t, `SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND query LIKE '%pg_try_advisory_lock%'`, d.name) > 0
+		return observe(t, `SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND query LIKE '%pg_try_advisory_lock%' AND query NOT LIKE '%wager-migrator-lock%'`, d.name) > 0
 	})
 	var once sync.Once
 	release = func() {
@@ -453,7 +460,7 @@ func TestAMigratorArrivingDuringTheRollbackPreparationWaitsForIt(t *testing.T) {
 	upDone := make(chan error, 1)
 	go func() { _, err := other.Up(ctx); upDone <- err }()
 	eventually(t, "the second migrator to wait for the first", 10*time.Second, func() bool {
-		return advisoryWaiters(t, d, postgres.MigratorLockID) > 0
+		return migratorWaiters(t, d) > 0
 	})
 	select {
 	case err := <-upDone:

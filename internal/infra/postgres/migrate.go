@@ -24,6 +24,7 @@ var migrationsFS embed.FS
 type Migrator struct {
 	db       *sql.DB
 	provider *goose.Provider
+	url      string // para a provisão dos privilégios (conexão própria, nunca o lock do migrador)
 }
 
 // NewMigrator abre uma conexão database/sql dedicada às migrations.
@@ -48,7 +49,7 @@ func NewMigrator(databaseURL string) (*Migrator, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("goose provider: %w", err)
 	}
-	return &Migrator{db: db, provider: p}, nil
+	return &Migrator{db: db, provider: p, url: databaseURL}, nil
 }
 
 func (m *Migrator) Close() error { return m.db.Close() }
@@ -58,6 +59,9 @@ func (m *Migrator) Close() error { return m.db.Close() }
 // provider, nunca a mesma chave que o provider disputa em outra conexão (o que seria um deadlock).
 const MigratorLockID int64 = 1981000005
 
+// migratorLockPoll é o intervalo entre as tentativas de adquirir o lock do migrador.
+const migratorLockPoll = 100 * time.Millisecond
+
 // exclusive serializa uma operação do Migrator contra os demais migradores, mantendo o lock numa conexão própria. O lock do
 // goose (outra chave) é adquirido por dentro, pelo provider, sempre depois deste: a ordem é única, sem deadlock.
 func (m *Migrator) exclusive(ctx context.Context, fn func(context.Context) error) error {
@@ -65,9 +69,24 @@ func (m *Migrator) exclusive(ctx context.Context, fn func(context.Context) error
 	if err != nil {
 		return err
 	}
-	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, MigratorLockID); err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("wait for the migrator lock: %w", err)
+	// Espera por tentativas (pg_try_advisory_lock), não por um pg_advisory_lock bloqueante: um backend bloqueado numa espera por lock
+	// só percebe que o cliente foi embora quando acorda, então um comando cancelado ou morto deixaria uma sessão órfã na fila, que
+	// adquiriria o lock mais tarde. Com tentativas, o cancelamento é imediato e nada fica na fila.
+	for {
+		var acquired bool
+		if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1) /* wager-migrator-lock */`, MigratorLockID).Scan(&acquired); err != nil {
+			_ = conn.Close()
+			return fmt.Errorf("wait for the migrator lock: %w", err)
+		}
+		if acquired {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+			return fmt.Errorf("wait for the migrator lock: %w", ctx.Err())
+		case <-time.After(migratorLockPoll):
+		}
 	}
 	defer func() {
 		uctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -85,7 +104,7 @@ func (m *Migrator) exclusive(ctx context.Context, fn func(context.Context) error
 // Up aplica todas as migrations pendentes.
 func (m *Migrator) Up(ctx context.Context) (res []*goose.MigrationResult, err error) {
 	err = m.exclusive(ctx, func(ctx context.Context) error {
-		res, err = m.provider.Up(ctx)
+		res, err = m.upLocked(ctx, 0)
 		return err
 	})
 	return res, err
@@ -94,10 +113,47 @@ func (m *Migrator) Up(ctx context.Context) (res []*goose.MigrationResult, err er
 // UpTo aplica as migrations pendentes até a versão informada (inclusive).
 func (m *Migrator) UpTo(ctx context.Context, version int64) (res []*goose.MigrationResult, err error) {
 	err = m.exclusive(ctx, func(ctx context.Context) error {
-		res, err = m.provider.UpTo(ctx, version)
+		res, err = m.upLocked(ctx, version)
 		return err
 	})
 	return res, err
+}
+
+// UpAndProvision aplica as pendentes e, na MESMA região coordenada, cria/atualiza o papel de runtime e seus privilégios: nenhuma
+// outra operação do migrador (um Down que revoga a escrita, p.ex.) se intercala entre o Up e a concessão.
+func (m *Migrator) UpAndProvision(ctx context.Context, role RuntimeRole) (res []*goose.MigrationResult, err error) {
+	err = m.exclusive(ctx, func(ctx context.Context) error {
+		if res, err = m.upLocked(ctx, 0); err != nil {
+			return err
+		}
+		return ProvisionRuntimeRole(ctx, m.url, role)
+	})
+	return res, err
+}
+
+// ProvisionRuntime (re)aplica o papel de runtime e seus privilégios mínimos sob a coordenação do migrador: espera uma operação em
+// andamento (p.ex. um Down que revogou a escrita e ainda não apagou a agenda), respeita o cancelamento do contexto e não deixa o
+// lock ao terminar. É a recuperação dos privilégios depois da morte de um processo, desde que a operação anterior tenha terminado.
+func (m *Migrator) ProvisionRuntime(ctx context.Context, role RuntimeRole) error {
+	return m.exclusive(ctx, func(ctx context.Context) error { return ProvisionRuntimeRole(ctx, m.url, role) })
+}
+
+// upLocked aplica as migrations (todas se version == 0). Antes de a 00006 restaurar a cópia da agenda por cima da tabela, decide
+// com segurança o que fazer com ela (ver settleScheduleCopyBeforeUp). Deve ser chamado dentro de exclusive.
+func (m *Migrator) upLocked(ctx context.Context, version int64) ([]*goose.MigrationResult, error) {
+	current, err := m.provider.GetDBVersion(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if current == scheduleMigration && (version == 0 || version > scheduleMigration) {
+		if err := m.settleScheduleCopyBeforeUp(ctx); err != nil {
+			return nil, err
+		}
+	}
+	if version == 0 {
+		return m.provider.Up(ctx)
+	}
+	return m.provider.UpTo(ctx, version)
 }
 
 // scheduleMigration é a migration que cria a agenda das pendências (00005). Reverter essa migration apaga a

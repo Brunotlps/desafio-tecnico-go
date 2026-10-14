@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"time"
 
@@ -160,21 +161,34 @@ func (s *Service) resumeOnce(ctx context.Context, ref PendingReference) (resumeS
 	return status, nil
 }
 
+// maxConsecutiveFailures encerra a varredura depois de tantas falhas seguidas (falha geral): não martela uma dependência fora do ar.
+const maxConsecutiveFailures = 3
+
+// maxDeferReason limita o diagnóstico gravado na agenda.
+const maxDeferReason = 200
+
 // ProcessDue faz uma varredura limitada das pendências vencidas e tenta cada candidato em sequência, parando assim
 // que stop for fechado (ou ctx cancelado). Devolve quantas terminaram e se alguma tentativa falhou (para o worker
 // espaçar a próxima varredura).
 //
-// A leitura dos candidatos é paginada por chave (próxima tentativa, id), sem OFFSET, e uma carteira que se mostra
-// ocupada é excluída das páginas seguintes: um prefixo de candidatos todo em carteiras ocupadas não impede a varredura
-// de chegar às carteiras independentes. O trabalho é limitado: no máximo BatchSize tentativas efetivas (as puladas por
-// carteira ocupada ou ainda não vencidas custam uma verificação barata e não contam) e maxScanPages páginas.
-// Uma varredura em que tudo está ocupado termina sem tentar nada e sem alterar nenhuma agenda.
+// A leitura dos candidatos é paginada por chave (próxima tentativa, id), sem OFFSET, e já pula, no banco, as carteiras que outra
+// transação segura (o mesmo lock que a tentativa pede); uma carteira que se mostra ocupada na tentativa, ou cuja tentativa FALHA com
+// erro, é excluída das páginas seguintes da mesma varredura: um prefixo de candidatos ocupados ou com falha numa carteira não impede a
+// varredura de chegar às carteiras independentes. Uma falha de infraestrutura NÃO é uma rejeição financeira: a tentativa é desfeita
+// por inteiro e a agenda é adiada com o backoff (sem renovar o prazo), de modo que o prefixo com falha também deixa de ocupar o início
+// da ordem nas varreduras seguintes. O trabalho é limitado: no máximo BatchSize tentativas efetivas (as puladas, ocupadas, ainda não
+// vencidas ou falhas não contam, mas só se repetem para carteiras diferentes), maxScanPages páginas e maxConsecutiveFailures falhas
+// seguidas. Uma varredura em que tudo está ocupado termina sem tentar nada e sem alterar nenhuma agenda.
 func (s *Service) ProcessDue(ctx context.Context, stop <-chan struct{}) (completed int, failed bool) {
 	now := s.now()
-	busy := map[uuid.UUID]struct{}{}
+	skip := map[uuid.UUID]struct{}{}
 	var excluded []uuid.UUID
+	exclude := func(w uuid.UUID) {
+		skip[w] = struct{}{}
+		excluded = append(excluded, w)
+	}
 	var cursor *DueCursor
-	attempts := 0
+	attempts, consecutiveFailures := 0, 0
 	reader := s.uow.Reader().Pending
 	for page := 0; page < maxScanPages && attempts < s.ref.BatchSize; page++ {
 		due, err := reader.Due(ctx, DueQuery{Now: now, Limit: s.ref.BatchSize, After: cursor, ExcludeWallets: excluded})
@@ -194,7 +208,7 @@ func (s *Service) ProcessDue(ctx context.Context, stop <-chan struct{}) (complet
 			default:
 			}
 			cursor = &DueCursor{NextAttemptAt: p.NextAttemptAt, TransactionID: p.TransactionID}
-			if _, isBusy := busy[p.WalletID]; isBusy {
+			if _, skipped := skip[p.WalletID]; skipped {
 				continue
 			}
 			if attempts >= s.ref.BatchSize {
@@ -205,13 +219,21 @@ func (s *Service) ProcessDue(ctx context.Context, stop <-chan struct{}) (complet
 			cancel()
 			switch {
 			case err != nil:
-				attempts++
+				if ctx.Err() != nil {
+					return completed, failed // cancelamento do worker: o estado durável decide
+				}
 				failed = true
+				consecutiveFailures++
+				exclude(p.WalletID)
 				s.log.WarnContext(ctx, "pending reference attempt aborted; it will be retried from the durable state",
 					"transactionId", p.TransactionID, "walletId", p.WalletID, "error", err.Error())
+				s.deferFailedAttempt(ctx, p, err)
+				if consecutiveFailures >= maxConsecutiveFailures {
+					return completed, failed
+				}
+				continue
 			case status == resumeBusy:
-				busy[p.WalletID] = struct{}{}
-				excluded = append(excluded, p.WalletID)
+				exclude(p.WalletID)
 			case status == resumeNotDue, status == resumeSkipped:
 				// nada a fazer: outra instância reagendou ou concluiu
 			case status == resumeCompleted:
@@ -220,9 +242,29 @@ func (s *Service) ProcessDue(ctx context.Context, stop <-chan struct{}) (complet
 			default:
 				attempts++
 			}
+			consecutiveFailures = 0
 		}
 	}
 	return completed, failed
+}
+
+// deferFailedAttempt adia a agenda de uma tentativa abortada por erro (melhor esforço: se o próprio adiamento falhar, a agenda
+// segue como estava e a próxima varredura tenta de novo). Só toca a agenda, numa transação curta de uma única linha — sem a
+// carteira, portanto sem criar espera na ordem de locks —; o estado financeiro continua intacto.
+func (s *Service) deferFailedAttempt(ctx context.Context, p PendingReference, cause error) {
+	dctx, cancel := context.WithTimeout(ctx, s.ref.PhaseTimeout)
+	defer cancel()
+	now := s.now()
+	reason := cause.Error()
+	if len(reason) > maxDeferReason {
+		reason = strings.ToValidUTF8(reason[:maxDeferReason], "")
+	}
+	err := s.uow.Do(dctx, func(ctx context.Context, r Repositories) error {
+		return r.Pending.Defer(ctx, p.TransactionID, now.Add(s.backoff(p.Attempts)), now, reason)
+	})
+	if err != nil {
+		s.log.WarnContext(ctx, "could not defer the failed pending reference; it stays due", "transactionId", p.TransactionID, "error", err.Error())
+	}
 }
 
 // ReferenceWorker é o executor de referências de um processo. Cumpre o contrato de
