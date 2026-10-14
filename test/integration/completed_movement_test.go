@@ -346,3 +346,64 @@ func betBodyFor(w wallet, d directTx) map[string]any {
 	b["kind"] = d.Kind
 	return b
 }
+
+// Ordem de escrita: as FKs do ledger são imediatas. O registro da transação precisa existir
+// antes do lançamento; a conclusão (PROCESSED) pode vir depois dele, e a verificação final é
+// deferida ao COMMIT.
+func TestInsertionOrderOfTransactionAndLedgerEntry(t *testing.T) {
+	a := startApp(t, testConfig())
+	rt := runtimePool(t)
+	id := scoped()
+
+	t.Run("a ledger entry before its transaction fails immediately", func(t *testing.T) {
+		w := openWallet(t, a, "100.00")
+		bet := newDirectBet("provider-a", id("o1"), id("o1"), 1000)
+		err := rtInTx(t, rt, func(ctx context.Context, tx pgx.Tx) error {
+			// lançamento primeiro: a FK para a transação é imediata (23503 no próprio comando)
+			if err := entry(ctx, tx, w, bet.ID, "DEBIT", 1000, 10000, 9000); err != nil {
+				return err
+			}
+			return bet.insert(t, ctx, tx, w, "PROCESSED", nil, int64(9000))
+		})
+		expectPg(t, "entry before transaction", err, "23503", "")
+	})
+
+	t.Run("transaction, then entry, then completion in the same SQL transaction", func(t *testing.T) {
+		w := openWallet(t, a, "100.00")
+		bet := newDirectBet("provider-a", id("o2"), id("o2"), 1000)
+		err := inTx(func(ctx context.Context, tx pgx.Tx) error { // a conclusão exige UPDATE: dono do schema
+			if err := bet.insert(t, ctx, tx, w, "PENDING", nil, nil); err != nil {
+				return err
+			}
+			if err := entry(ctx, tx, w, bet.ID, "DEBIT", 1000, 10000, 9000); err != nil {
+				return err
+			}
+			if err := setBalance(ctx, tx, w, 9000); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `UPDATE wager_transactions SET status = 'PROCESSED', result_balance = 9000, updated_at = now() WHERE id = $1`, bet.ID)
+			return err
+		})
+		if err != nil {
+			t.Fatalf("completion after the entry: %v", err)
+		}
+		assertLedgerMatchesBalance(t, w.ID)
+	})
+
+	t.Run("transaction already PROCESSED, then entry", func(t *testing.T) {
+		w := openWallet(t, a, "100.00")
+		bet := newDirectBet("provider-a", id("o3"), id("o3"), 1000)
+		err := rtInTx(t, rt, func(ctx context.Context, tx pgx.Tx) error {
+			if err := bet.insert(t, ctx, tx, w, "PROCESSED", nil, int64(9000)); err != nil {
+				return err
+			}
+			if err := entry(ctx, tx, w, bet.ID, "DEBIT", 1000, 10000, 9000); err != nil {
+				return err
+			}
+			return setBalance(ctx, tx, w, 9000)
+		})
+		if err != nil {
+			t.Fatalf("transaction before entry: %v", err)
+		}
+	})
+}
