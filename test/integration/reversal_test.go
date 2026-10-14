@@ -282,10 +282,3 @@ func TestConcurrentRefundAndRollbackOfTheSameBet(t *testing.T) {
 		assertLedgerMatchesBalance(t, wallet)
 	}
 }
-
-// O banco é a barreira final da unicidade: a aplicação trata a violação como disputa, não como erro 500.
-func TestReversalTargetTakenIsClassifiedAsADispute(t *testing.T) {
-	if !errors.Is(app.ErrReversalTargetTaken, app.ErrReversalTargetTaken) {
-		t.Fatal("sentinel")
-	}
-}
