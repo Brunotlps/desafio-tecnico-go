@@ -259,16 +259,21 @@ continuidade durável.
   é terminal e não é reaberta por uma chegada tardia nem por replay. **Falha de consulta não prova ausência**: a tentativa é abortada (erro
   transitório), nada é gravado e o prazo original segue valendo.
 * **Varredura limitada que alcança as carteiras independentes** (`Service.ProcessDue`): a leitura de candidatos é paginada por chave `(próxima tentativa, id)` — sem
-  `OFFSET` — e **pula, dentro da própria consulta, as carteiras que outra transação segura** (`JOIN wallets … FOR KEY SHARE OF w SKIP LOCKED`, o mesmo conflito que
-  `TryLockForUpdate` enxerga): um prefixo de candidatos todo em carteiras ocupadas, por maior que seja (a prova usa 120 carteiras distintas com `BatchSize=1`),
-  não esconde as carteiras independentes que vêm depois dele, e **nenhum estado entre varreduras** é necessário — portanto vale para várias chamadas e instâncias.
-  Aumentar apenas o lote ou o número de páginas só deslocaria o limiar; aqui o tamanho do prefixo ocupado não importa. A consulta é só uma leitura: o lock de linha dura o
-  tempo da consulta (sem espera e sem lock durante o backoff) e a carteira e a elegibilidade são revalidadas sob os locks da tentativa. Uma carteira que fica ocupada
-  **entre** a seleção e a tentativa é excluída das páginas seguintes da mesma varredura. O trabalho é limitado: no máximo `BatchSize` tentativas efetivas por varredura
-  (as puladas ou ainda não vencidas custam uma verificação barata e não contam) e 50 páginas; o cancelamento é respeitado entre candidatos; uma varredura toda ocupada
-  termina sem tentar nada e **sem tocar** nenhuma agenda (o prazo não é renovado por estar ocupada), e o worker só varre de novo depois do intervalo de espera, sem laço
-  ativo. Limite conhecido: uma pendência cuja tentativa **falha sempre com erro** (não por carteira ocupada) não é reagendada, continua no início da ordem e consome parte
-  do orçamento de cada varredura; o worker não a isola.
+  `OFFSET` — e **pula, dentro da própria consulta, as carteiras que outra transação segura** (`JOIN wallets … FOR UPDATE OF w SKIP LOCKED`). Os modos de lock de linha **não** têm os
+  mesmos conflitos: `FOR KEY SHARE` é compatível com `FOR NO KEY UPDATE` (o de um `UPDATE` de coluna não chave, como o do trigger de encadeamento do ledger), enquanto
+  `FOR UPDATE` conflita com todos. A tentativa pede `FOR UPDATE` (`TryLockForUpdate`), então a seleção pede o **mesmo** `FOR UPDATE`: pula as carteiras seguradas por `FOR KEY SHARE`,
+  `FOR SHARE`, `FOR NO KEY UPDATE`, `UPDATE` não chave ou `FOR UPDATE` (as cinco são testadas), e um prefixo de candidatos ocupados, por maior que seja, não esconde as carteiras
+  independentes — sem estado entre varreduras, portanto também para várias chamadas e instâncias. Aumentar apenas o lote ou as páginas só deslocaria o limiar. A consulta é só uma
+  leitura: o lock de linha dura o tempo da consulta (sem espera e sem lock durante o backoff) e a carteira e a elegibilidade são revalidadas sob os locks da tentativa.
+  * **Carteira ocupada na tentativa ou com falha** é excluída das páginas seguintes da mesma varredura. Uma **falha de infraestrutura** (erro transitório, timeout) nunca é uma rejeição
+    financeira: a transação da tentativa é desfeita por inteiro (sem efeito parcial) e a agenda é **adiada** com o backoff numa transação curta de uma única linha (`Defer`: próxima
+    tentativa, contador e diagnóstico; não renova o prazo, não toca saldo/ledger/estado, não sobrescreve um reagendamento mais novo nem uma agenda concluída). Assim um prefixo de falhas
+    numa carteira (lote 1 ou 20) não monopoliza as varreduras nem o orçamento: a carteira independente avança e o retry segue pelo estado durável quando o adiamento vence. Se o próprio
+    adiamento falhar, a agenda segue como estava e a próxima varredura tenta de novo.
+  * **Trabalho limitado**: no máximo `BatchSize` tentativas efetivas, 50 páginas e **3 falhas seguidas** (falha geral: a varredura termina com `failed=true` e o worker espaça a próxima, sem
+    martelar a dependência); as puladas por ocupação, as ainda não vencidas e as que falharam não contam como tentativas efetivas, mas cada carteira com falha é tentada uma vez por
+    varredura. O cancelamento é respeitado entre candidatos (e um erro por cancelamento não adia nada); uma varredura toda ocupada termina sem tentar nada e **sem tocar** nenhuma
+    agenda, e o worker só varre de novo depois do intervalo de espera, sem laço ativo.
 * **Elegibilidade temporal sob os locks**: depois de travar a carteira e a agenda, a tentativa compara o `next_attempt_at` **recarregado** com o relógio; uma seleção
   antiga não autoriza a tentativa que outra instância já reagendou para o futuro (o backoff persistido vale para todas). Não existe caminho "forçado" no worker:
   os testes avançam o relógio de propósito. A elegibilidade não é um prazo rígido de validade: uma referência `PROCESSED` ainda resolve depois do TTL.
@@ -428,8 +433,12 @@ apaga a tabela e o seu `Up` reconstrói linhas com `now() + 15 min` — o que re
 perda **não** a corrige; como a 00005 não pode ser reescrita, a correção é composta e compatível com o histórico. O procedimento é do migrador
 (`Migrator`, interfaces de `cmd/migrate up|down|down-to`) e **preserva ou recusa antes de qualquer perda**:
 
-* **Coordenação.** Cada operação do migrador roda sob um advisory lock próprio (`MigratorLockID`), mantido numa conexão dedicada, e só então o provider adquire o lock do
-  goose (outra chave, sempre depois: a ordem é única e não há deadlock). Decisão de versão, preparação, reversão e restauração não se intercalam com as de outro migrador.
+* **Coordenação.** Cada operação do migrador — `Up`, `UpTo`, `Down`, `DownTo`, `UpAndProvision` e `ProvisionRuntime` (o `migrate grants`) — roda sob um advisory lock próprio (`MigratorLockID`),
+  mantido numa conexão dedicada, e só então o provider adquire o lock do goose (outra chave, sempre depois: a ordem é única e não há deadlock; a provisão usa conexão própria e nunca o lock do
+  migrador). O lock é adquirido **por tentativas** (`pg_try_advisory_lock` a cada 100 ms), não por um `pg_advisory_lock` bloqueante: uma sessão bloqueada numa espera de lock só percebe a
+  saída do cliente ao acordar, e um comando cancelado ou morto deixaria uma sessão órfã na fila que adquiriria o lock depois. Assim a espera termina imediatamente no cancelamento e não vaza.
+  Decisão de versão, preparação, reversão, restauração e concessão dos grants não se intercalam com as de outro migrador; `migrate up` com `RUNTIME_DB_ROLE` faz o `Up` e a provisão **na
+  mesma região**.
 * **Preparação de rollback**, ao reverter a 00005 (por `Down` na versão 5 ou `DownTo(N)`, `0 < N < 5`), numa transação sob exclusão dos escritores (`LOCK TABLE wallets,
   wager_transactions, pending_references IN SHARE ROW EXCLUSIVE MODE`): (a) lê os privilégios sobre a agenda **de tabela e de coluna** (`pg_class.relacl` e
   `pg_attribute.attacl`, inclusive `PUBLIC`) e os revoga de todo papel que não seja o dono (o `REVOKE` de tabela remove também os de coluna); (b) **verifica no catálogo**:
@@ -442,7 +451,12 @@ perda **não** a corrige; como a 00005 não pode ser reescrita, a correção é 
   agenda viva for a reconstrução intacta (toda linha existe na cópia, sem tentativas, diagnóstico nem conclusão); caso contrário o rollback é **recusado** com contagem e primeiros
   ids, sem alterar versão, agenda, cópia nem privilégios. A API recusa partir no schema intermediário, então essa recusa só ocorre por escrita manual (dono/superusuário).
 * **Devolução dos privilégios**: se a reversão falhar ou for cancelada depois da preparação (inclusive esperando o lock do goose), o migrador devolve os privilégios capturados quando a
-  agenda ainda existe (contexto próprio, não o cancelado); se o processo morrer antes, `migrate grants` os devolve. A agenda original fica intacta.
+  agenda ainda existe (contexto próprio, não o cancelado); se o processo morrer antes, `migrate grants` os devolve — depois que a operação anterior terminou: enquanto uma operação do migrador
+  está em andamento (p.ex. um `Down` preparado) o comando **espera** pelo lock, e cancelado (SIGINT) termina sem vazar nada. A agenda original fica intacta.
+* **`Up`/`UpTo` com cópia existente** (`settleScheduleCopyBeforeUp`, na versão 5, antes de a 00006 restaurar), sob a mesma exclusão dos escritores: se a agenda viva é **a mesma tabela que foi
+  copiada** (um `Down` preparado foi cancelado ou falhou antes de apagá-la), ela contém tudo — inclusive o que o runtime confirmou depois da devolução dos grants — e a cópia, defasada, é
+  **descartada** em vez de restaurada por cima; se a agenda viva é a reconstrução da 00005 e a cópia é o original, a restauração é o esperado desde que a reconstrução esteja intacta; se não,
+  o `Up` é **recusado** antes de qualquer perda (contagem e ids; nada muda). Nunca se aplica um snapshot velho em silêncio.
 * **Restauração** (00006, na reaplicação): substitui as linhas reconstruídas pelo `Up` da 00005 pelos valores originais, inclusive as concluídas,
   desabilitando o gatilho de imutabilidade só durante a restauração (dono, sob exclusão dos escritores), dispara as verificações deferidas e remove a cópia.
   Uma cópia sem transação correspondente é recusada com contagem e ids (preflight), não descartada; uma restauração que falha deixa a cópia (a migration é transacional).
@@ -581,6 +595,6 @@ nunca roda com eles (§10.1); o `result_balance` de `LOSS` não é verificável 
 é recusada pelo domínio e tratada por quem chama a transição (§3, §8); a rotação de chaves do IdP pode causar 401 por até 30 s (§9). Da
 política de reversões (§8): o `ROLLBACK` da BET depois do `ROLLBACK` do REFUND é recusado (escolha de contrato, não de viabilidade
 financeira). Das pendências: o TTL e o backoff usam o relógio da aplicação (diferença entre instâncias desloca o prazo, nunca o renova); uma
-uma carteira continuamente ocupada adia apenas a retomada das pendências dela (a consulta de candidatos a pula, `SKIP LOCKED`, e a varredura segue para as demais); o worker não tem lease (a exclusão é pelos locks
+uma carteira continuamente ocupada ou com falha localizada adia apenas a retomada das pendências dela (a consulta a pula com o mesmo `FOR UPDATE SKIP LOCKED` da tentativa, a falha adia a agenda com backoff e a varredura segue para as demais); o worker não tem lease (a exclusão é pelos locks
 e pela revalidação). Dos testes: o harness de processos reais compila o binário **sem `-race`** — `go test -race` do processo pai não
 instrumenta os filhos (adaptação prevista para a consolidação final). A proteção da agenda no rollback está no migrador (`Migrator`), não no SQL publicado da 00005: o `Down` da 00005 executado diretamente pelo goose, sem o migrador, não preserva a agenda; a exclusão dos escritores é por privilégio (dono e superusuários não são excluídos).
