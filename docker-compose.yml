@@ -14,7 +14,9 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U wager -d wager"]
+      # Por TCP (-h): durante o initdb o servidor temporário escuta só no socket Unix, e um
+      # pg_isready local já responderia "pronto" antes de o servidor definitivo aceitar conexões.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U wager -d wager"]
       interval: 3s
       timeout: 3s
       retries: 20
