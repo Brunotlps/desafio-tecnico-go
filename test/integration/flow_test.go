@@ -204,15 +204,12 @@ func TestUnsupportedAndForbiddenKinds(t *testing.T) {
 	w := openWallet(t, a, "100.00")
 	before := countRows(t, "wager_transactions", "wallet_id = $1", w.ID)
 
-	for _, kind := range []string{"WIN", "LOSS", "REFUND", "ROLLBACK"} {
+	// WIN e LOSS sem referência são processados (win_loss_test.go); WIN com referência,
+	// REFUND e ROLLBACK ainda não, e a referência recebida nunca é ignorada.
+	for _, kind := range []string{"WIN", "REFUND", "ROLLBACK"} {
 		body := betBody(w, "provider-a", uniqueID("tx"), "10.00")
 		body["kind"] = kind
-		switch kind {
-		case "LOSS":
-			body["money"] = money("0.00")
-		case "REFUND", "ROLLBACK":
-			body["referenceExternalTransactionId"] = "some-bet"
-		}
+		body["referenceExternalTransactionId"] = "some-bet"
 		r := submit(t, a, "provider-a", uniqueID("k"), body)
 		if r.Status != http.StatusNotImplemented || r.str("code") != "KIND_NOT_SUPPORTED" {
 			t.Errorf("%s: %d %s", kind, r.Status, r.Raw)

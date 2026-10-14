@@ -130,9 +130,9 @@ func TestServiceSubmitBet(t *testing.T) {
 	}
 	// Tipos sem processamento e entradas inválidas não gravam nada.
 	win := rawBet(wallet, player, id("k6"), id("t6"), "1.00")
-	win.Kind = "WIN"
+	win.Kind, win.ReferenceExternalTransactionID = "WIN", "some-bet"
 	if _, err := svc.Submit(ctx, win, "c"); !errors.Is(err, app.ErrKindNotSupported) {
-		t.Errorf("WIN: %v", err)
+		t.Errorf("WIN with a reference: %v", err)
 	}
 	opening := rawBet(wallet, player, id("k7"), id("t7"), "1.00")
 	opening.Kind = "OPENING"
