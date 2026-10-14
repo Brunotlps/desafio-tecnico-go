@@ -86,12 +86,7 @@ jobs:
       - name: build and start the whole stack
         run: |
           docker compose up --build -d
-          for i in $(seq 1 90); do
-            status=$(docker compose ps api --format '{{.Status}}')
-            case "$status" in *healthy*) exit 0 ;; esac
-            sleep 2
-          done
-          echo "api did not become healthy"; docker compose ps; docker compose logs --no-color --tail 200; exit 1
+          scripts/wait-healthy.sh api 180
       - name: smoke test (authenticated flow through the API)
         run: scripts/smoke.sh
       - name: logs on failure
