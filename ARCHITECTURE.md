@@ -289,6 +289,7 @@ versão anterior).
 | --- | --- | --- | --- |
 | `00002_ledger_chain_and_result_integrity` | cadeia do ledger quebrada; lançamento incoerente com sua transação; `PROCESSED`/`REJECTED` com resultado nulo; `failure_code` inválido; saldo ≠ ledger | cadeia contínua, FK composta, resultado explícito | remove o que instalou |
 | `00003_completed_movement_requires_ledger` | transação `PROCESSED` (≠ `LOSS`) **sem lançamento**; `result_balance` ≠ `balance_after` do lançamento | trigger deferido da transação e verificação de resultado no lado do ledger | remove o trigger e restaura a função de 00002; **não toca nos dados** (após a reversão a lacuna volta a existir) |
+| `00004_revalidate_history_under_writer_exclusion` | **exclusão dos escritores** (`LOCK TABLE` em `wallets`, `wager_transactions`, `wallet_ledger_entries`) e, com eles excluídos: triggers das garantias ausentes ou desabilitados; cadeia do ledger quebrada; lançamento incoerente com a transação; saldo ≠ ledger; transação concluída sem lançamento; resultado ≠ `balance_after` (com contagem e primeiros ids) | nada (só valida; é a versão final esperada pela aplicação) | vazia: apenas retrocede a versão, sem tocar em dados nem garantias |
 
 Mecanismo da 00003 (por que um *constraint trigger* deferido): um `CHECK` não enxerga outra tabela; uma FK da transação para o
 ledger seria circular com a FK do ledger para a transação; um trigger imediato exigiria uma ordem de inserção. O deferido é avaliado
@@ -302,6 +303,61 @@ anterior e os registros intactos; aplicar → reverter → reaplicar funciona.
 Limitações: `LOSS` não tem lançamento, então seu `result_balance` (saldo observado) não é verificável contra o ledger; o sentido do
 lançamento de `ROLLBACK` depende da operação original e só será imposto com o processamento de reversões; o dono do schema e
 superusuários ainda podem desabilitar triggers (a aplicação nunca roda com eles).
+
+### 10.3. Upgrade com escritores ativos: a janela entre validar e instalar, e como foi fechada
+
+**O problema (achado da auditoria).** Uma migration que valida o histórico e depois instala uma garantia (00002: cadeia do ledger;
+00003: movimento obrigatório) não enxerga o commit de um escritor do schema anterior que já inseriu linhas e mantém a transação
+aberta. A instalação do trigger espera esse escritor, ele confirma sob as garantias **antigas** e a migration termina com sucesso:
+schema novo, trigger instalado e histórico incompatível persistido. A atomicidade da transação SQL de uma migration não inclui
+o commit de outras conexões, e o lock de sessão do goose só coordena **migrations** concorrentes, não os escritores da aplicação.
+
+**Escolha: exclusão dos escritores pelo banco, numa migration versionada** (`00004`), e não uma janela de manutenção como único
+mecanismo. Justificativa:
+
+* Uma janela de manutenção só é "verificável" se algo garantir que **todos** os escritores pararam. O migrador não controla outros
+  processos nem outros papéis; uma conferência em `pg_stat_activity` é uma foto (uma conexão pode chegar logo depois), e impedir
+  conexões exigiria alterar papéis do cluster, um efeito colateral desproporcional para uma migration.
+* O `LOCK TABLE ... IN SHARE ROW EXCLUSIVE MODE` usa o que os escritores têm em comum — as tabelas que escrevem. Ele conflita com
+  `INSERT`/`UPDATE`/`DELETE` (ROW EXCLUSIVE), então a migration **espera** o escritor que já escreveu (e só depois lê: sob READ
+  COMMITTED, o comando seguinte enxerga o commit dele), **retém** os que chegam até o `COMMIT` da migration e não bloqueia leituras
+  nem o `SELECT ... FOR UPDATE` do caso de uso. Validar e concluir passam a ser indivisíveis para os escritores, sem cooperação deles
+  e para qualquer papel. A ordem do lock (carteira, transação, lançamento) é a do caso de uso, para não formar ciclos de espera.
+* Com os escritores excluídos, a `00004` relê **todo** o histórico (não só o que a 00003 validava, pois a 00002 tem a mesma forma) e
+  confere que os triggers das garantias existem e estão habilitados. Escritores que **não** passam pelos triggers
+  (`session_replication_role = replica`, restauração com triggers desabilitados, dono do schema) só são detectados por essa
+  validação — por isso ela precisa ocorrer sob exclusão (testado).
+* A 00003 já foi publicada e não é reescrita; sua janela é tratada **depois do fato**: a 00004 detecta e recusa o histórico
+  incompatível, inclusive em bancos onde a janela já ocorreu (e no upgrade 2→4 com um escritor aberto, que deixa o schema em 3).
+
+**Portão da versão final.** Um upgrade só termina bem na versão 4. Se a 00004 recusar, o schema fica na versão 3, **nada é apagado
+nem reescrito**, e a aplicação (que compara a versão do schema com a embutida no binário) **recusa iniciar**: o estado é visível e
+não é tratado como sucesso. A correção dos registros é manual; depois, `migrate up` conclui.
+
+**Procedimento** (README §Migrations repete os comandos):
+
+1. *Recomendado:* parar as instâncias da API (todos os escritores) antes de `migrate up`: reduz o tempo em que escritores ficam
+   retidos e evita conflitos de lock. Não é necessário para a correção contra escritores do papel de runtime (as garantias acima
+   valem com eles ativos), mas é a precondição para **qualquer outro** escritor (manutenção manual, ETL, outro papel) que o banco
+   não consiga excluir por si só.
+2. Executar `migrate up` com o papel dono do schema; conferir `migrate status` (versão final) e subir a API nova.
+3. Se a 00004 abortar: ler a contagem e os ids, corrigir os registros manualmente (nenhuma ferramenta os altera) e repetir `migrate up`.
+
+**Limites.**
+
+* `lock_timeout` de 30 s: um escritor com transação aberta por mais tempo faz a 00004 falhar **sem efeito** (os retidos são
+  liberados); repita numa janela com os escritores parados. Sem limite, novos escritores ficariam enfileirados indefinidamente.
+* Durante a espera, escritores novos ficam retidos (latência), e um escritor que bloqueie as tabelas em ordem diferente da do caso
+  de uso pode sofrer `deadlock detected` (40P01) em vez da migration; é seguro repetir.
+* Entre a 00003 e a 00004 existe, por instantes, o schema 3 (com as garantias da 00003). Um escritor do schema 2 que confirma
+  durante a 00003 pode deixar histórico incompatível; é exatamente o que a 00004 detecta.
+* O banco não impede um escritor com privilégio de superusuário ou dono de desabilitar triggers depois do upgrade (§10.1); a
+  validação só vale para o instante da migration.
+* Upgrade online sem parada **não** é objetivo (o enunciado não o exige); a exclusão torna o upgrade correto, não invisível.
+
+Testes (`upgrade_window_test.go`): a sondagem da auditoria (escritor antigo aberto → upgrade → commit → versão final e garantias),
+escritor concorrente válido, histórico já inválido (5 formas), garantia ausente ou desabilitada, escritor que ignora triggers,
+espera/retenção pelo lock, dados preservados, reversão/reaplicação e partida recusada abaixo da versão final.
 
 ## 11. Composição Fx, ciclo de vida e shutdown (§4)
 

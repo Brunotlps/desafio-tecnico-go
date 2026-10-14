@@ -102,7 +102,7 @@ func TestMovementMigrationPreservesValidDataAndIsReversible(t *testing.T) {
 	if movementGuaranteeInstalled(t, conn) {
 		t.Fatal("the guarantee exists before the migration")
 	}
-	if _, err := mig.Up(ctx); err != nil {
+	if _, err := mig.UpTo(ctx, 3); err != nil { // a 00004 tem testes próprios (upgrade_window_test.go)
 		t.Fatalf("migration failed on valid data: %v", err)
 	}
 	if v := schemaVersion(t, conn); v != 3 {
@@ -148,7 +148,7 @@ func TestMovementMigrationPreservesValidDataAndIsReversible(t *testing.T) {
 		t.Fatal("the ledger-side function of 00002 was not restored")
 	}
 	// E reaplicar funciona (reversão e aplicação são simétricas).
-	if _, err := mig.Up(ctx); err != nil {
+	if _, err := mig.UpTo(ctx, 3); err != nil {
 		t.Fatalf("re-apply: %v", err)
 	}
 	if !movementGuaranteeInstalled(t, conn) {

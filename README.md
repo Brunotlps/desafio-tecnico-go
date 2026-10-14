@@ -173,11 +173,34 @@ por versões anteriores, **não apague nada**: rode `migrate up` (no Compose: `d
   `REFUND`, `ROLLBACK`) precisa, no COMMIT, do lançamento da própria carteira, e `result_balance` tem de ser o `balance_after`
   desse lançamento (`LOSS` e rejeições não têm lançamento).
 
+* `00004_revalidate_history_under_writer_exclusion.sql` — versão final esperada pela aplicação. Trava as tabelas financeiras
+  (`LOCK TABLE ... SHARE ROW EXCLUSIVE`: espera escritores abertos, retém os novos, não bloqueia leituras), relê **todo** o
+  histórico e confere que os triggers das garantias existem e estão habilitados. Fecha a janela entre validar e instalar das
+  migrations anteriores e recusa bancos onde ela já ocorreu. Só valida: não instala nada nem altera dados.
+
 Cada uma começa com uma **verificação do histórico**: se houver registros incompatíveis (cadeia quebrada, resultado nulo,
 lançamento sem transação coerente; na 00003, transação concluída sem lançamento ou com resultado divergente, com contagem e
 primeiros ids) a migration **aborta sem alterar dados nem o schema** — a correção de registros históricos é manual, depois
-rode `migrate up` de novo. Reversão: `migrate down` (um passo por vez) remove as garantias da última migration e **não
-altera dados**.
+rode `migrate up` de novo. Reversão: `migrate down` (um passo por vez) remove as garantias da última migration (a 00004 não
+instala nada: reverter só retrocede a versão) e **não altera dados**.
+
+**Procedimento de upgrade** (detalhes e justificativa em `ARCHITECTURE.md` §10.3):
+
+```sh
+docker compose stop api                 # recomendado: parar todos os escritores (todas as instâncias da API)
+docker compose run --rm migrate up      # papel dono do schema; espera escritores abertos e valida sob exclusão
+docker compose run --rm migrate status  # a versão final (00004) precisa constar como aplicada
+docker compose up -d --build api        # a API só inicia na versão final do schema
+```
+
+* O lock de sessão do migrador só evita **duas migrations** simultâneas; quem protege contra escritores é a exclusão por
+  `LOCK TABLE` da 00004. Mesmo com a API ativa o resultado é correto para escritores do papel de runtime; parar os escritores
+  reduz a retenção e é a precondição para qualquer outro escritor (manutenção manual, ETL, outro papel).
+* Se a 00004 abortar (histórico incompatível, trigger ausente/desabilitado ou escritor aberto por mais de 30 s), o schema fica na
+  versão 3, nada é apagado e **a API recusa iniciar** (`schema is at version 3, application expects 4`). Corrija os registros
+  indicados manualmente (contagem e primeiros ids na mensagem) ou repita sem escritores abertos, e rode `migrate up` de novo.
+* Limites: um escritor com privilégio de dono/superusuário pode ignorar triggers (só a validação o enxerga, e só no instante da
+  migration); upgrade online sem nenhuma retenção não é objetivo.
 
 Papel de runtime em bancos antigos: o primeiro `migrate up` desta versão (com `RUNTIME_DB_ROLE`) cria o `wager_app`; depois
 troque `DATABASE_URL` da API para ele (o Compose já faz isso).
@@ -233,6 +256,7 @@ Variáveis opcionais (padrões coincidem com o Compose): `TEST_DATABASE_URL`, `T
 | Movimento concluído | `completed_movement_test.go` | **pelo papel restrito**, com payloads de hash válido: `BET PROCESSED` sem lançamento nem alteração da carteira, `OPENING` sem lançamento, `PENDING`→`PROCESSED` sem lançamento e resultado diferente do `balance_after` do lançamento (777,00 × 90,00; zero × 90,00) são recusados no COMMIT; várias operações válidas na mesma transação SQL guardam o resultado próprio e o replay (HTTP) devolve o saldo original; `LOSS` e rejeições seguem sem lançamento |
 | Banco | `constraints_test.go`, `db_integrity_test.go` | SQL direto: unicidade, saldo não negativo, ledger append-only (UPDATE/DELETE/TRUNCATE), saldo×ledger no mesmo commit, OPENING único, forma interna×externa, política de zero, imutabilidade de terminais e da outbox; **cadeia contínua do ledger** (cenário da revisão, primeiro lançamento, vários lançamentos por transação, escritor concorrente obsoleto, carteira independente não bloqueada); **vínculo lançamento→transação→carteira**; **resultado explícito (NULL e valores inválidos)** |
 | Papéis | `role_test.go` | o papel de runtime não é superusuário nem dono, e 20+ tentativas (UPDATE/DELETE/TRUNCATE do ledger, `DISABLE TRIGGER`, `session_replication_role`, DDL…) são negadas; o fluxo financeiro e a verificação de schema funcionam com ele; provisão idempotente |
+| Upgrade com escritores ativos | `upgrade_window_test.go` | sondagem da auditoria: escritor antigo com `BET PROCESSED` sem lançamento aberto → upgrade espera → commit → o schema **nunca** termina na versão final com o órfão (relata o id, nada é apagado, a API recusa iniciar; corrigido manualmente, o upgrade conclui); escritor retido e escritor válido concorrentes; histórico já inválido (órfã, resultado, cadeia, saldo, lançamento de rejeitada); trigger ausente/desabilitado; escritor que ignora triggers; espera/retenção pelo lock; dados preservados; reversão/reaplicação |
 | Migrations | `migration_test.go`, `migration_movement_test.go` | as corretivas preservam dados de um banco existente (e na reversão), recusam sem alterar nada histórico com cadeia quebrada, resultado nulo, transação concluída sem lançamento ou resultado divergente (relatando contagem e ids), e aplicar→reverter→reaplicar funciona |
 | Autenticação | `auth_test.go` | credenciais ausentes, adulteradas, forjadas, `alg:none`, HS256, expiradas (token real de 3 s), audiência errada → 401; sem papel → 403; isolamento entre provedores (consulta, replay, headers falsos); nenhuma alteração de estado em acessos negados |
 | Falhas | `faults_test.go` | falha no meio da transação não deixa estado parcial; ledger "esquecido" é barrado pelo banco no COMMIT; commit confirmado com ACK perdido → 503 e recuperação com a mesma chave |
