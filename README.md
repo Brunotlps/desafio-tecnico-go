@@ -162,14 +162,22 @@ go run ./cmd/migrate down-to 0         # reverte todas (apaga os dados!)
 
 A API **recusa iniciar** se o schema não estiver na versão esperada pelo binário.
 
-### Bancos já inicializados (migration corretiva 00002)
+### Bancos já inicializados (migrations corretivas 00002 e 00003)
 
-`00002_ledger_chain_and_result_integrity.sql` corrige a proteção do ledger (cadeia contínua de saldos e vínculo
-lançamento→transação→carteira) e exige resultado não nulo em `PROCESSED`/`REJECTED`. Para um banco criado com a versão
-anterior, **não apague nada**: apenas rode `migrate up` (no Compose: `docker compose up -d --build migrate api`).
-Ela começa com uma verificação do histórico; se houver registros inconsistentes (cadeia quebrada, resultado nulo,
-lançamento sem transação coerente) a migration **aborta, com a contagem do problema, sem alterar dados nem o schema** — a
-correção de registros históricos é manual. Reversão: `migrate down` (um passo).
+As migrations já publicadas (00001, 00002) **não são reescritas**; as correções são migrations novas. Para um banco criado
+por versões anteriores, **não apague nada**: rode `migrate up` (no Compose: `docker compose up -d --build migrate api`).
+
+* `00002_ledger_chain_and_result_integrity.sql` — proteção do ledger (cadeia contínua de saldos, vínculo
+  lançamento→transação→carteira) e resultado não nulo em `PROCESSED`/`REJECTED`.
+* `00003_completed_movement_requires_ledger.sql` — toda transação `PROCESSED` com movimento (`OPENING`, `BET`, `WIN`,
+  `REFUND`, `ROLLBACK`) precisa, no COMMIT, do lançamento da própria carteira, e `result_balance` tem de ser o `balance_after`
+  desse lançamento (`LOSS` e rejeições não têm lançamento).
+
+Cada uma começa com uma **verificação do histórico**: se houver registros incompatíveis (cadeia quebrada, resultado nulo,
+lançamento sem transação coerente; na 00003, transação concluída sem lançamento ou com resultado divergente, com contagem e
+primeiros ids) a migration **aborta sem alterar dados nem o schema** — a correção de registros históricos é manual, depois
+rode `migrate up` de novo. Reversão: `migrate down` (um passo por vez) remove as garantias da última migration e **não
+altera dados**.
 
 Papel de runtime em bancos antigos: o primeiro `migrate up` desta versão (com `RUNTIME_DB_ROLE`) cria o `wager_app`; depois
 troque `DATABASE_URL` da API para ele (o Compose já faz isso).
@@ -221,9 +229,10 @@ Variáveis opcionais (padrões coincidem com o Compose): `TEST_DATABASE_URL`, `T
 | Fluxo | `flow_test.go` | abertura positiva (OPENING, ledger, 2 eventos, versão 1), zero, duplicada (409), parsing estrito de dinheiro por HTTP, BET aceita/rejeitada, tipos não suportados, validação de entrada |
 | Idempotência | `idempotency_test.go` | replay devolve o saldo original após outras movimentações; rejeição terminal não é reavaliada após crédito; conflito de payload; mesma operação externa com outra chave; chaves por provedor; **conflito tem precedência sobre carteira inexistente/jogador/moeda divergentes**; disputa da mesma identidade entre carteiras diferentes |
 | Concorrência | `concurrency_test.go` | 50 reenvios paralelos → 1 débito; 2×80,00 sobre 100,00 (com reenvios) → 1 processada, 1 rejeitada, saldo 20,00; sem lost update; carteiras independentes não se bloqueiam; várias carteiras em paralelo |
+| Movimento concluído | `completed_movement_test.go` | **pelo papel restrito**, com payloads de hash válido: `BET PROCESSED` sem lançamento nem alteração da carteira, `OPENING` sem lançamento, `PENDING`→`PROCESSED` sem lançamento e resultado diferente do `balance_after` do lançamento (777,00 × 90,00; zero × 90,00) são recusados no COMMIT; várias operações válidas na mesma transação SQL guardam o resultado próprio e o replay (HTTP) devolve o saldo original; `LOSS` e rejeições seguem sem lançamento |
 | Banco | `constraints_test.go`, `db_integrity_test.go` | SQL direto: unicidade, saldo não negativo, ledger append-only (UPDATE/DELETE/TRUNCATE), saldo×ledger no mesmo commit, OPENING único, forma interna×externa, política de zero, imutabilidade de terminais e da outbox; **cadeia contínua do ledger** (cenário da revisão, primeiro lançamento, vários lançamentos por transação, escritor concorrente obsoleto, carteira independente não bloqueada); **vínculo lançamento→transação→carteira**; **resultado explícito (NULL e valores inválidos)** |
 | Papéis | `role_test.go` | o papel de runtime não é superusuário nem dono, e 20+ tentativas (UPDATE/DELETE/TRUNCATE do ledger, `DISABLE TRIGGER`, `session_replication_role`, DDL…) são negadas; o fluxo financeiro e a verificação de schema funcionam com ele; provisão idempotente |
-| Migrations | `migration_test.go` | a corretiva preserva dados de um banco na versão 1 (e na reversão) e recusa, sem alterar nada, histórico com cadeia quebrada ou resultado nulo |
+| Migrations | `migration_test.go`, `migration_movement_test.go` | as corretivas preservam dados de um banco existente (e na reversão), recusam sem alterar nada histórico com cadeia quebrada, resultado nulo, transação concluída sem lançamento ou resultado divergente (relatando contagem e ids), e aplicar→reverter→reaplicar funciona |
 | Autenticação | `auth_test.go` | credenciais ausentes, adulteradas, forjadas, `alg:none`, HS256, expiradas (token real de 3 s), audiência errada → 401; sem papel → 403; isolamento entre provedores (consulta, replay, headers falsos); nenhuma alteração de estado em acessos negados |
 | Falhas | `faults_test.go` | falha no meio da transação não deixa estado parcial; ledger "esquecido" é barrado pelo banco no COMMIT; commit confirmado com ACK perdido → 503 e recuperação com a mesma chave |
 | Ciclo de vida | `lifecycle_test.go` | reinício preserva idempotência/resultados; grafo Fx válido, start/stop e liberação de conexões; **7 falhas de partida (inclusive schema ausente/desatualizado e credencial inválida) sem conexão PostgreSQL remanescente**; shutdown conclui requisição em andamento |

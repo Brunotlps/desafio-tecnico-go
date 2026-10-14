@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -118,6 +119,10 @@ func TestStartupFailsFastAndReleasesResources(t *testing.T) {
 		return u
 	}
 
+	expected, err := postgres.ExpectedVersion() // o banco "desatualizado" fica uma versão atrás do binário
+	if err != nil {
+		t.Fatal(err)
+	}
 	cases := map[string]struct {
 		mutate  func(*config.Config)
 		wantErr string // trecho esperado no erro de partida
@@ -126,7 +131,7 @@ func TestStartupFailsFastAndReleasesResources(t *testing.T) {
 			c.DatabaseURL = "postgres://wager:wager@127.0.0.1:1/wager?sslmode=disable&connect_timeout=1"
 		}, "ping postgres"},
 		"schema not migrated":     {func(c *config.Config) { c.DatabaseURL = runtime(notMigrated) }, "not initialized"},
-		"schema out of date":      {func(c *config.Config) { c.DatabaseURL = runtime(outdated) }, "schema is at version 1"},
+		"schema out of date":      {func(c *config.Config) { c.DatabaseURL = runtime(outdated) }, fmt.Sprintf("schema is at version %d", expected-1)},
 		"idp unreachable":         {func(c *config.Config) { c.OIDCJWKSURL = "http://127.0.0.1:1/certs" }, "JWKS"},
 		"queue missing":           {func(c *config.Config) { c.SQSWagerQueue = "does-not-exist.fifo" }, "does-not-exist.fifo"},
 		"broker unreachable":      {func(c *config.Config) { c.AWSEndpointURL = "http://127.0.0.1:1" }, "sqs"},

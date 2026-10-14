@@ -55,6 +55,14 @@ func sqlExec(sql string, args ...any) error {
 	return err
 }
 
+// insertPending grava uma transação externa PENDING (sem resultado): válida sem lançamento.
+const insertPending = `INSERT INTO wager_transactions
+	(id, origin, kind, status, wallet_id, player_id, amount, currency, provider_id, external_transaction_id, idempotency_key,
+	 payload_hash, round_id, game_id, created_at, updated_at)
+	VALUES ($1,'EXTERNAL',$2,'PENDING',$3,$4,$5,'BRL',$6,$7,$8,'h','r','g',now(),now())`
+
+// insertTx grava uma transação externa PROCESSED. Uma operação com movimento só é confirmada com o
+// lançamento no mesmo commit; nos testes que não o gravam, o erro esperado vem de uma constraint imediata.
 const insertTx = `INSERT INTO wager_transactions
 	(id, origin, kind, status, wallet_id, player_id, amount, currency, provider_id, external_transaction_id, idempotency_key,
 	 payload_hash, round_id, game_id, result_balance, created_at, updated_at)
@@ -110,8 +118,8 @@ func TestDatabaseConstraintsAndLedgerProtection(t *testing.T) {
 		err = sqlExec(`INSERT INTO wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at)
 			VALUES ($1,$2,$3,'CREDIT',0,'BRL',10000,10000,now())`, uuid.New(), w.ID, uuid.New())
 		expectPg(t, "zero amount", err, "23514", "ck_ledger_amount")
-		freeTx := uuid.New() // transação existente, ainda sem lançamento
-		if err := sqlExec(insertTx, freeTx, "EXTERNAL", "WIN", w.ID, playerID, 10, "p-ledger", "e-ledger", "k-ledger", "h", "r", "g", 10); err != nil {
+		freeTx := uuid.New() // transação existente (PENDING), ainda sem lançamento
+		if err := sqlExec(insertPending, freeTx, "WIN", w.ID, playerID, 10, "p-ledger", "e-ledger", "k-ledger"); err != nil {
 			t.Fatal(err)
 		}
 		err = sqlExec(`INSERT INTO wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at)
@@ -167,14 +175,16 @@ func TestDatabaseConstraintsAndLedgerProtection(t *testing.T) {
 	})
 	t.Run("financial identity uniqueness", func(t *testing.T) {
 		pid := "constraint-" + uuid.NewString()
-		if err := extTx("WIN", 0+5, pid, "ext-1", "key-1"); err == nil {
-			// WIN processado sem ledger é permitido pelo schema de transações; só o saldo exige ledger.
-		} else {
+		// Transações PENDING (sem movimento) bastam para exercitar a unicidade.
+		pending := func(provider, ext, key string) error {
+			return sqlExec(insertPending, uuid.New(), "WIN", w.ID, playerID, 5, provider, ext, key)
+		}
+		if err := pending(pid, "ext-1", "key-1"); err != nil {
 			t.Fatal(err)
 		}
-		expectPg(t, "same external id, other key", extTx("WIN", 5, pid, "ext-1", "key-2"), "23505", "uq_wager_tx_provider_external_id")
-		expectPg(t, "same key, other external id", extTx("WIN", 5, pid, "ext-2", "key-1"), "23505", "uq_wager_tx_provider_idempotency_key")
-		if err := extTx("WIN", 5, pid+"-other", "ext-1", "key-1"); err != nil {
+		expectPg(t, "same external id, other key", pending(pid, "ext-1", "key-2"), "23505", "uq_wager_tx_provider_external_id")
+		expectPg(t, "same key, other external id", pending(pid, "ext-2", "key-1"), "23505", "uq_wager_tx_provider_idempotency_key")
+		if err := pending(pid+"-other", "ext-1", "key-1"); err != nil {
 			t.Fatalf("another provider may reuse identifiers: %v", err)
 		}
 	})
