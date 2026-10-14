@@ -611,12 +611,14 @@ instrumenta os filhos (adaptação prevista para a consolidação final). A prot
 ## 15. Leituras: ledger paginado e reconciliação
 
 Portas e camadas. `app.LedgerReader` (implementada por `postgres.Store`) é uma porta **de leitura** própria: `LedgerPage` e `ReconciliationSnapshot`. A `UnitOfWork`
-financeira não muda (continua `READ COMMITTED` com lock de linha da carteira) e `Reader()` não é usado para estas leituras. O caso de uso (`Service.ListLedger`,
+financeira não muda (continua `READ COMMITTED` com lock de linha da carteira). `ListLedger` usa `Reader()` só para a **existência** da carteira (404) e lê a página pela porta própria; a
+  **reconciliação não usa `Reader()` nem o pool entre consultas**: o saldo e a soma saem do mesmo `pgx.Tx` `READ ONLY, REPEATABLE READ`. O caso de uso (`Service.ListLedger`,
 `Service.Reconcile`) valida e converte; o HTTP só autentica (`internal-service`), traduz parâmetros e erros. O domínio não conhece pgx.
 
 * **Ledger por posição.** `SELECT … WHERE wallet_id = $1 AND seq > $2 ORDER BY seq LIMIT $3` sobre `ix_ledger_wallet_seq (wallet_id, seq)`: sem `OFFSET`, custo
   independente da profundidade da página. O pressuposto de continuidade — dentro de uma carteira, `seq` cresce na ordem de confirmação — vale porque todo lançamento é inserido
-  sob o `FOR UPDATE` da carteira, que só termina no commit (testado com escritores paralelos na mesma carteira: nenhuma travessia pula ou repete item). `seq` é interno e não é exposto.
+  sob o `FOR UPDATE` da carteira, que só termina no commit, **e** porque o banco tem uma guarda própria contra `seq` antigo: a identity pode ser alocada antes do lock que o trigger
+  `ledger_enforce_chain` toma sobre a carteira, mas um INSERT cuja posição ficou para trás de uma confirmada é recusado (`40001`) em vez de entrar fora de ordem (comprovado por dois escritores SQL reais); uma sequence sozinha não provaria a monotonicidade (testado com escritores paralelos na mesma carteira: nenhuma travessia pula ou repete item). `seq` é interno e não é exposto.
 * **Cursor.** `base64url({"v":1,"w":walletId,"s":seq})`, aceito apenas na forma canônica que o servidor produz; ver o contrato no README. Não é assinado: a assinatura não seria
   a fronteira de autorização (o servidor já autoriza e delimita o escopo pela rota), e um cursor adulterado só pode apontar para outra posição **da mesma carteira**.
 * **Snapshot da reconciliação.** Uma transação `READ ONLY, REPEATABLE READ` (prazo 10 s): a primeira consulta (saldo da carteira, sem lock) fixa o snapshot e a segunda
