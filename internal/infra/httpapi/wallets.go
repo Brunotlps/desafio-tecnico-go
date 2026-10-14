@@ -3,6 +3,7 @@ package httpapi
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 
@@ -71,7 +72,14 @@ func (h *Handler) getLedger(w http.ResponseWriter, r *http.Request, p auth.Princ
 		h.writeError(w, r, err)
 		return
 	}
-	q := r.URL.Query()
+	// Parsing explícito: r.URL.Query() descarta em silêncio os pares malformados (escape inválido, separador ';'), o que faria um
+	// parâmetro inválido sumir (e valer o default) ou uma repetição parecer única. Qualquer erro recusa a requisição inteira, antes de
+	// consumir o mapa parcial e de chamar o serviço.
+	q, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		writeProblem(w, http.StatusBadRequest, "INVALID_QUERY", "the query string is malformed (invalid escape or separator)")
+		return
+	}
 	limit := app.DefaultLedgerLimit
 	if vs, ok := q["limit"]; ok {
 		if len(vs) != 1 || !limitRe.MatchString(vs[0]) {
