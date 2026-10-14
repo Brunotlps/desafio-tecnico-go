@@ -1,4 +1,5 @@
 .env
+.local/
 /bin/
 *.test
 *.out

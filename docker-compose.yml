@@ -1,4 +1,4 @@
-# Ambiente local: PostgreSQL, Keycloak (IdP), LocalStack (SQS/SNS), migrations e API.
+# Ambiente local: PostgreSQL, Keycloak (IdP), MiniStack (SQS/SNS/IAM, AUTH=true), provisionamento do broker, migrations e API.
 # Todas as credenciais abaixo são valores de desenvolvimento, não segredos reais.
 name: wager
 
@@ -43,22 +43,40 @@ services:
       retries: 40
       start_period: 20s
 
-  localstack:
-    image: localstack/localstack:4.9
+  # Broker de mensageria local: MiniStack (emulador compatível com a API da AWS) com AUTH=true, que avalia as
+  # políticas IAM de cada principal. Limite: NÃO valida assinaturas SigV4 (autorização emulada, não
+  # autenticação AWS completa). O estado é efêmero (sem PERSIST_STATE): recriar este contêiner apaga filas,
+  # mensagens e identidades; o `broker-provision` os recria.
+  ministack:
+    image: ministackorg/ministack:1.5.27
     environment:
-      SERVICES: sqs,sns
-      DEFAULT_REGION: us-east-1
+      AUTH: "true"
     ports:
-      - "127.0.0.1:${LOCALSTACK_PORT:-4566}:4566"
-    volumes:
-      # Provisiona filas, redrive e o destino dos eventos quando o LocalStack fica pronto.
-      - ./deploy/localstack/provision.sh:/etc/localstack/init/ready.d/10-provision.sh:ro
+      - "127.0.0.1:${BROKER_PORT:-4566}:4566"
     healthcheck:
-      # Pronto quando os scripts de init (provision.sh) terminaram com sucesso.
-      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/init/ready | grep -q '\"completed\": true' && curl -sf http://localhost:4566/_localstack/init/ready | grep -q '\"state\": \"SUCCESSFUL\"'"]
+      # A imagem não tem curl/wget; o Python da própria imagem consulta o endpoint de saúde.
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4566/_ministack/health', timeout=3).status == 200 else 1)"]
       interval: 3s
-      timeout: 3s
+      timeout: 5s
       retries: 40
+
+  # One-shot: provisiona filas FIFO, DLQ com redrive, tópico, assinatura, política da fila de auditoria,
+  # identidades e políticas mínimas, e escreve as credenciais por responsabilidade em ./.local/broker.
+  # Idempotente. Roda como root só para gravar no diretório montado; a aplicação lê o arquivo como `app`.
+  broker-provision:
+    build: .
+    entrypoint: ["/app/broker-provision"]
+    user: "0:0"
+    environment:
+      BROKER_ENDPOINT_URL: http://ministack:4566
+      AWS_REGION: us-east-1
+      BROKER_CREDENTIALS_FILE: /run/broker/credentials
+    volumes:
+      - ${BROKER_DIR:-./.local/broker}:/run/broker
+    depends_on:
+      ministack:
+        condition: service_healthy
+    restart: "no"
 
   # Roda como o papel DONO do schema (wager). Aplica as migrations (inclusive as corretivas,
   # sem apagar dados) e cria/atualiza o papel de runtime com privilégios mínimos.
@@ -89,9 +107,11 @@ services:
       OIDC_JWKS_URL: http://keycloak:8080/realms/wager/protocol/openid-connect/certs
       OIDC_AUDIENCE: wager-api
       AWS_REGION: us-east-1
-      AWS_ENDPOINT_URL: http://localstack:4566
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://ministack:4566
+      # Principal de RUNTIME do broker, pela cadeia padrão do SDK (arquivo de credenciais compartilhado).
+      # A aplicação nunca recebe as credenciais de provisionamento.
+      AWS_SHARED_CREDENTIALS_FILE: /run/broker/credentials
+      AWS_PROFILE: wager-runtime
       SQS_WAGER_QUEUE_NAME: wager-transactions.fifo
       ALLOWED_CURRENCIES: BRL
     ports:
@@ -101,8 +121,10 @@ services:
         condition: service_completed_successfully
       keycloak:
         condition: service_healthy
-      localstack:
-        condition: service_healthy
+      broker-provision:
+        condition: service_completed_successfully
+    volumes:
+      - ${BROKER_DIR:-./.local/broker}:/run/broker:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health/ready >/dev/null"]
       interval: 5s
