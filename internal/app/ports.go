@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"math/big"
 	"time"
 
 	"github.com/google/uuid"
@@ -116,4 +117,32 @@ type DueQuery struct {
 type DueCursor struct {
 	NextAttemptAt time.Time
 	TransactionID uuid.UUID
+}
+
+// LedgerRow é um lançamento com a sua posição (seq) no ledger.
+type LedgerRow struct {
+	Seq   int64
+	Entry domain.LedgerEntry
+}
+
+// ReconciliationSnapshot é o que uma única visão consistente (um snapshot) do banco mostra de uma carteira: o saldo
+// armazenado e o resultado exato, calculado pelo banco, da reconstrução do ledger.
+type ReconciliationSnapshot struct {
+	Wallet *domain.Wallet
+	// Entries é a quantidade de lançamentos da carteira nessa visão.
+	Entries int64
+	// ForeignCurrencyEntries conta lançamentos em moeda diferente da carteira (o banco o impede; é uma defesa).
+	ForeignCurrencyEntries int64
+	// NetMinor é créditos − débitos em unidades mínimas, soma exata (sem limite de int64).
+	NetMinor *big.Int
+}
+
+// LedgerReader são as leituras do ledger e da reconciliação. É uma porta própria: a UnitOfWork financeira não muda de
+// isolamento nem é usada para estas leituras.
+type LedgerReader interface {
+	// LedgerPage lê até limit lançamentos da carteira com seq > afterSeq, em ordem crescente de seq. Cada chamada tem a sua visão.
+	LedgerPage(ctx context.Context, walletID uuid.UUID, afterSeq int64, limit int) ([]LedgerRow, error)
+	// ReconciliationSnapshot lê o saldo e reconstrói o ledger numa transação READ ONLY, REPEATABLE READ (um snapshot), sem
+	// travar a carteira. ErrWalletNotFound se a carteira não existe.
+	ReconciliationSnapshot(ctx context.Context, walletID uuid.UUID) (ReconciliationSnapshot, error)
 }
