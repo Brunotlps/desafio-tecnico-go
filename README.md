@@ -343,7 +343,7 @@ durante a rede**:
    (`FOR UPDATE SKIP LOCKED`, o mais antigo primeiro, reavaliado sob o lock): grava `lease_token` (uuid novo **a cada aquisição**; não é o
    `eventId` nem a identidade do processo) e `lease_expires_at` (**relógio do banco**, nunca o do publisher) e conta uma tentativa. Eventos em
    backoff, sob lease válida ou travados por outra transação não entram na escolha: nenhum prefixo ocupado bloqueia os seguintes, e não há lock global.
-2. **Publicar** o envelope **como foi gravado** (jsonb em texto, sem regenerar nem reler saldo) com `MessageGroupId = walletId` (de `data`; o
+2. **Publicar** o envelope **como foi gravado** (o texto do `jsonb` armazenado: o PostgreSQL normaliza a ordem das chaves e os espaços, mas dados, dinheiro e `walletVersion` não passam por conversão; sem regenerar nem reler saldo) com `MessageGroupId = walletId` (de `data`; o
    `aggregateId` dos eventos de transação é a transação) e `MessageDeduplicationId = eventId`, com prazo total de `OUTBOX_PUBLISH_TIMEOUT`.
 3. **Confirmar** (`published_at`) — ou **registrar o retry** (`next_attempt_at` com backoff exponencial e jitter, `last_error`) ou **liberar** a
    reserva (encerramento) — em nova transação curta. Os três exigem `eventId`, **token da aquisição corrente**, evento não publicado e **lease
