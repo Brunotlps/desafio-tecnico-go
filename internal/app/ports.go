@@ -87,8 +87,8 @@ type PendingReference struct {
 
 type PendingReferenceRepository interface {
 	Insert(ctx context.Context, p PendingReference) error
-	// GetOpenForUpdate lê e trava a agenda aberta; ErrPendingNotFound se não existe
-	// ou já foi concluída.
+	// GetOpenForUpdate lê e trava a agenda aberta SEM esperar (SKIP LOCKED): ErrPendingBusy se outra transação segura a linha;
+	// ErrPendingNotFound se não existe	// ou já foi concluída.
 	GetOpenForUpdate(ctx context.Context, txID uuid.UUID) (PendingReference, error)
 	// Reschedule registra uma verificação concluída sem resultado definitivo.
 	Reschedule(ctx context.Context, txID uuid.UUID, next, attemptedAt time.Time) error

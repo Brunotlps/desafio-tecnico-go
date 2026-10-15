@@ -47,6 +47,8 @@ var (
 	ErrReversalTargetTaken = errors.New("reversal target already reversed")
 	// ErrWalletBusy: a carteira está travada por outra transação (TryLockForUpdate).
 	ErrWalletBusy = errors.New("wallet is locked by another transaction")
+	// ErrPendingBusy: a agenda aberta existe, mas outra transação segura a sua linha (a tentativa não espera por ela).
+	ErrPendingBusy = errors.New("pending reference schedule is locked by another transaction")
 	// ErrPendingNotFound: não há agenda aberta para a transação.
 	ErrPendingNotFound = errors.New("no open pending reference schedule")
 )
