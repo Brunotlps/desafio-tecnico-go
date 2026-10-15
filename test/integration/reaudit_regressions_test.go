@@ -665,7 +665,7 @@ func TestMigrateCommandRefusesARollbackThatWouldLoseTheSchedule(t *testing.T) {
 	liveBefore, copyBefore := scheduleJSON(t, d, "pending_references"), scheduleJSON(t, d, "pending_references_preserved")
 
 	bin := t.TempDir() + "/migrate"
-	build := exec.Command("go", "build", "-o", bin, "./cmd/migrate")
+	build := exec.Command("go", "build", "-race", "-o", bin, "./cmd/migrate")
 	build.Dir = "../.."
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build migrate: %v\n%s", err, out)

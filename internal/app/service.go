@@ -85,6 +85,7 @@ type Service struct {
 	ledger       LedgerReader
 	reconTimeout time.Duration
 	onDivergence func(ReconciliationResult)
+	obs          Observer
 }
 
 // NewService cria o serviço com relógio e gerador de ids de produção (UUIDv7).
@@ -94,7 +95,7 @@ func NewService(uow UnitOfWork, cfg Config, log *slog.Logger, opts ...Option) *S
 		allowed[c] = struct{}{}
 	}
 	s := &Service{
-		uow: uow, allowed: allowed, log: log, ref: cfg.Reference.withDefaults(), reconTimeout: 10 * time.Second,
+		uow: uow, allowed: allowed, log: log, ref: cfg.Reference.withDefaults(), reconTimeout: 10 * time.Second, obs: nopObserver{},
 		now:   func() time.Time { return time.Now().UTC() },
 		newID: func() uuid.UUID { return uuid.Must(uuid.NewV7()) },
 	}

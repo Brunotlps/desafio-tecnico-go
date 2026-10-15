@@ -13,6 +13,7 @@ import (
 	"desafio-tecnico-go/internal/app"
 	"desafio-tecnico-go/internal/domain"
 	"desafio-tecnico-go/internal/infra/auth"
+	"desafio-tecnico-go/internal/metrics"
 )
 
 // Service é o contrato do caso de uso usado pelos handlers.
@@ -38,8 +39,15 @@ type ReadinessCheck struct {
 	Check func(ctx context.Context) error
 }
 
+// Option ajusta o handler.
+type Option func(*Handler)
+
+// WithMetrics habilita GET /metrics (somente o serviço interno) e a observação da duração de POST /wagering/transactions.
+func WithMetrics(reg *metrics.Registry) Option { return func(h *Handler) { h.metrics = reg } }
+
 // Handler agrega as rotas HTTP.
 type Handler struct {
+	metrics        *metrics.Registry
 	svc            Service
 	verifier       TokenVerifier
 	checks         []ReadinessCheck
@@ -48,8 +56,11 @@ type Handler struct {
 }
 
 // New cria o handler raiz.
-func New(svc Service, verifier TokenVerifier, checks []ReadinessCheck, log *slog.Logger, requestTimeout time.Duration) http.Handler {
+func New(svc Service, verifier TokenVerifier, checks []ReadinessCheck, log *slog.Logger, requestTimeout time.Duration, opts ...Option) http.Handler {
 	h := &Handler{svc: svc, verifier: verifier, checks: checks, log: log, requestTimeout: requestTimeout}
+	for _, o := range opts {
+		o(h)
+	}
 	mux := http.NewServeMux()
 
 	// Públicas.
@@ -62,6 +73,11 @@ func New(svc Service, verifier TokenVerifier, checks []ReadinessCheck, log *slog
 	mux.HandleFunc("GET /wallets/{walletId}/ledger", h.authenticate(h.getLedger))
 	mux.HandleFunc("POST /wallets/{walletId}/reconciliation", h.authenticate(h.reconcile))
 
+	// Métricas: somente o serviço interno (a saúde segue pública).
+	if h.metrics != nil {
+		mux.HandleFunc("GET /metrics", h.authenticate(h.metricsHandler))
+	}
+
 	// Operações de provedor.
 	mux.HandleFunc("POST /wagering/transactions", h.authenticate(h.submit))
 	mux.HandleFunc("GET /wagering/transactions/{transactionId}", h.authenticate(h.getTransaction))
@@ -71,4 +87,15 @@ func New(svc Service, verifier TokenVerifier, checks []ReadinessCheck, log *slog
 		writeProblem(w, http.StatusNotFound, "NOT_FOUND", "no such route")
 	})
 	return h.observe(mux)
+}
+
+func (h *Handler) metricsHandler(w http.ResponseWriter, r *http.Request, p auth.Principal) {
+	if !p.IsInternal() {
+		forbidden(w, "metrics are restricted to the internal service")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	if err := h.metrics.Render(r.Context(), w); err != nil {
+		h.log.WarnContext(r.Context(), "writing the metrics failed", "error", err.Error())
+	}
 }

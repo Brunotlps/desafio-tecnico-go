@@ -46,6 +46,9 @@ func (s *Service) Submit(ctx context.Context, raw domain.RawExternalRequest, cor
 		if err == nil {
 			return res, nil
 		}
+		if reason := conflictReason(err); reason != "other" {
+			s.obs.Conflict(reason)
+		}
 		// A unicidade do banco revelou uma operação concorrente confirmada
 		// (p.ex. mesma chave aplicada a outra carteira). Uma nova transação a
 		// enxerga e a trata como replay ou conflito.
@@ -72,6 +75,7 @@ func (s *Service) submitOnce(ctx context.Context, req domain.ExternalRequest, co
 		return SubmitResult{}, err
 	}
 	s.logResult(ctx, result, correlationID)
+	s.obs.Result("http", string(result.Transaction.Kind()), string(result.Transaction.Status()), result.Replay)
 	return result, nil
 }
 

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -38,7 +39,8 @@ func apiBinary(t *testing.T) string {
 			return
 		}
 		binPath = filepath.Join(dir, "api")
-		cmd := exec.Command("go", "build", "-o", binPath, "./cmd/api")
+		// Os filhos são compilados COM o detector de corridas (o -race do processo pai não instrumenta binários separados).
+		cmd := exec.Command("go", "build", "-race", "-o", binPath, "./cmd/api")
 		cmd.Dir = "../.."
 		if out, err := cmd.CombinedOutput(); err != nil {
 			buildErr = fmt.Errorf("go build: %v\n%s", err, out)
@@ -50,11 +52,24 @@ func apiBinary(t *testing.T) string {
 	return binPath
 }
 
+// syncBuffer é a saída do filho, segura para leitura enquanto o processo ainda escreve.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+func (s *syncBuffer) String() string { s.mu.Lock(); defer s.mu.Unlock(); return s.b.String() }
+
 type proc struct {
 	name    string
 	URL     string
 	cmd     *exec.Cmd
-	out     *bytes.Buffer
+	out     *syncBuffer
 	appName string
 	done    chan struct{}
 	exit    error
@@ -75,7 +90,7 @@ func startProc(t *testing.T, name string) *proc { return startProcEnv(t, name) }
 func startProcEnv(t *testing.T, name string, extra ...string) *proc {
 	t.Helper()
 	port := freePort(t)
-	p := &proc{name: name, URL: fmt.Sprintf("http://127.0.0.1:%d", port), out: &bytes.Buffer{}, appName: name + "-" + uuid.NewString()[:6], done: make(chan struct{})}
+	p := &proc{name: name, URL: fmt.Sprintf("http://127.0.0.1:%d", port), out: &syncBuffer{}, appName: name + "-" + uuid.NewString()[:6], done: make(chan struct{})}
 	p.cmd = exec.Command(apiBinary(t))
 	p.cmd.Env = append(os.Environ(),
 		fmt.Sprintf("HTTP_ADDR=127.0.0.1:%d", port),
@@ -98,6 +113,11 @@ func startProcEnv(t *testing.T, name string, extra ...string) *proc {
 			_ = p.cmd.Process.Kill()
 		}
 		<-p.done
+		// Corrida ou queda inesperada do filho falha o teste: o detector imprime "WARNING: DATA RACE" (e sai com 66) e um panic ou
+		// fatal error do runtime aparece na saída. O encerramento por SIGKILL/SIGTERM de cenários controlados não imprime isso.
+		if out := p.out.String(); strings.Contains(out, "WARNING: DATA RACE") || strings.Contains(out, "panic: ") || strings.Contains(out, "fatal error: ") {
+			t.Errorf("%s: the child reported a race or crashed:\n%s", p.name, out)
+		}
 		if t.Failed() {
 			t.Logf("--- %s output ---\n%s", p.name, p.out.String())
 		}

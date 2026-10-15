@@ -253,6 +253,7 @@ func (s *Service) ProcessMessage(ctx context.Context, consumerName string, body 
 		// Unicidade revelou uma operação ou mensagem concorrente já confirmada: a nova tentativa a enxerga (replay, duplicata ou conflito).
 		if (errors.Is(err, ErrDuplicateIdempotencyKey) || errors.Is(err, ErrDuplicateExternalTransaction) ||
 			errors.Is(err, ErrReversalTargetTaken) || errors.Is(err, ErrDuplicateInbox)) && attempt < maxConflictRetries {
+			s.obs.Conflict(conflictReason(err))
 			continue
 		}
 		if code, ok := permanentCode(err); ok {
@@ -309,8 +310,15 @@ func (s *Service) messageOnce(ctx context.Context, consumerName string, env Enve
 	if err != nil {
 		return InboundResult{}, err
 	}
-	if res.Disposition == InboundDone && !res.Duplicate && result.Transaction != nil {
+	switch {
+	case res.Disposition == InboundDone && res.Duplicate:
+		s.obs.InboxOutcome("duplicate")
+	case res.Disposition == InboundPermanent && res.Code == "MESSAGE_ID_CONFLICT":
+		s.obs.InboxOutcome("conflict")
+	case res.Disposition == InboundDone && result.Transaction != nil:
 		s.logResult(ctx, result, env.MessageID)
+		s.obs.InboxOutcome("new")
+		s.obs.Result("sqs", string(result.Transaction.Kind()), string(result.Transaction.Status()), result.Replay)
 	}
 	return res, nil
 }

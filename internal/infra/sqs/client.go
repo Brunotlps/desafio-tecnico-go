@@ -176,3 +176,22 @@ func (c *Client) ForwardToDLQ(ctx context.Context, body []byte, groupID, dedupID
 }
 
 var _ inbound.Transport = (*Client)(nil)
+
+// DLQDepth devolve a profundidade APROXIMADA da DLQ (visíveis e em voo), lida com GetQueueAttributes (permitido ao runtime só nela).
+func (c *Client) DLQDepth(ctx context.Context) (visible, inFlight int, err error) {
+	u, err := c.queueURL(ctx, true)
+	if err != nil {
+		return 0, 0, err
+	}
+	out, err := c.api.GetQueueAttributes(ctx, &awssqs.GetQueueAttributesInput{QueueUrl: aws.String(u),
+		AttributeNames: []types.QueueAttributeName{types.QueueAttributeNameApproximateNumberOfMessages, types.QueueAttributeNameApproximateNumberOfMessagesNotVisible}})
+	if err != nil {
+		return 0, 0, err
+	}
+	v, e1 := strconv.Atoi(out.Attributes[string(types.QueueAttributeNameApproximateNumberOfMessages)])
+	f, e2 := strconv.Atoi(out.Attributes[string(types.QueueAttributeNameApproximateNumberOfMessagesNotVisible)])
+	if e1 != nil || e2 != nil {
+		return 0, 0, fmt.Errorf("sqs dlq %q: unreadable queue attributes", c.dlqName)
+	}
+	return v, f, nil
+}
