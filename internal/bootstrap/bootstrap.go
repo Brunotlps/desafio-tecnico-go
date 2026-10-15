@@ -14,6 +14,7 @@ import (
 
 	"desafio-tecnico-go/internal/app"
 	"desafio-tecnico-go/internal/config"
+	"desafio-tecnico-go/internal/inbound"
 	"desafio-tecnico-go/internal/infra/auth"
 	"desafio-tecnico-go/internal/infra/httpapi"
 	"desafio-tecnico-go/internal/infra/postgres"
@@ -37,6 +38,7 @@ func Options(cfg config.Config) fx.Option {
 		authModule,
 		messagingModule,
 		outboxModule(cfg),
+		consumerModule(cfg),
 		applicationModule,
 		httpModule,
 		lifecycleModule,
@@ -80,9 +82,12 @@ var authModule = fx.Module("auth",
 
 var messagingModule = fx.Module("messaging",
 	fx.Provide(func(cfg config.Config) (*sqs.Client, error) {
-		return sqs.NewClient(context.Background(), sqs.Config{
-			Region: cfg.AWSRegion, EndpointURL: cfg.AWSEndpointURL, QueueName: cfg.SQSWagerQueue,
-		})
+		sc := sqs.Config{Region: cfg.AWSRegion, EndpointURL: cfg.AWSEndpointURL, QueueName: cfg.SQSWagerQueue,
+			CredentialsFile: cfg.SQSCredentialsFile, Profile: cfg.SQSAWSProfile}
+		if cfg.SQSConsumers > 0 {
+			sc.DLQName = cfg.SQSDLQName // o consumidor encaminha à DLQ: a readiness também a confere
+		}
+		return sqs.NewClient(context.Background(), sc)
 	}),
 	// Valida a dependência no início, sem esperar o primeiro /health/ready.
 	fx.Invoke(func(lc fx.Lifecycle, c *sqs.Client) {
@@ -118,6 +123,17 @@ func outboxModule(cfg config.Config) fx.Option {
 			lc.Append(fx.Hook{OnStart: p.Ready})
 		}),
 	)
+}
+
+// consumerModule compõe o consumidor SQS quando SQS_CONSUMERS > 0. Usa o cliente SQS do runtime (receber, remover, visibilidade e
+// envio à DLQ) e o mesmo Service do HTTP (inbox e finanças no mesmo commit).
+func consumerModule(cfg config.Config) fx.Option {
+	if cfg.SQSConsumers == 0 {
+		return fx.Options()
+	}
+	return fx.Module("consumer", fx.Provide(func(cfg config.Config, svc *app.Service, q *sqs.Client, log *slog.Logger) *inbound.Consumer {
+		return inbound.New(svc, q, cfg.ConsumerConfig(), log, inbound.Hooks{})
+	}))
 }
 
 var applicationModule = fx.Module("application",
@@ -164,6 +180,7 @@ var lifecycleModule = fx.Module("lifecycle",
 		Worker    *app.ReferenceWorker
 		Server    *httpapi.Server
 		Publisher *outbox.Publisher `optional:"true"` // só existe com OUTBOX_PUBLISHERS > 0
+		Consumer  *inbound.Consumer `optional:"true"` // só existe com SQS_CONSUMERS > 0
 	}) {
 		lc, cfg, c, worker, server := p.Lifecycle, p.Config, p.Coord, p.Worker, p.Server
 		// Ordem de início: os executores (referências e publisher) primeiro; a porta HTTP, que admite entradas, por último.
@@ -173,6 +190,10 @@ var lifecycleModule = fx.Module("lifecycle",
 		if p.Publisher != nil {
 			c.OnShutdown(p.Publisher.SetShutdownDeadline)
 			c.Add(p.Publisher)
+		}
+		if p.Consumer != nil {
+			c.OnShutdown(p.Consumer.SetShutdownDeadline)
+			c.Add(p.Consumer)
 		}
 		c.Add(server)
 		lc.Append(fx.Hook{OnStart: c.Start, OnStop: c.Stop})
