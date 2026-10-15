@@ -18,6 +18,7 @@ reconciliation) and metrics.
 | Go             | 1.26.1         | build and tests (declared in `go.mod` and in the `Dockerfile`) |
 | Docker + Compose v2 | 29.x / 5.x | PostgreSQL, Keycloak, MiniStack (broker), API |
 | curl, python3  | —              | examples in this README               |
+| Bash, jq and Linux utilities | — | verification and smoke scripts (the smoke uses `/proc/sys/kernel/random/uuid`) |
 
 Memory: Keycloak + MiniStack + PostgreSQL use ~2 GB. Published ports (on `127.0.0.1` only):
 PostgreSQL **5433**, Keycloak **8081**, broker (MiniStack) **4566**, API **8080** (override with
@@ -26,7 +27,8 @@ PostgreSQL **5433**, Keycloak **8081**, broker (MiniStack) **4566**, API **8080*
 ## Quick start
 
 ```sh
-docker compose up --build        # postgres, keycloak, ministack, broker-provision and migrate (one-shot) and api
+docker compose up --build -d     # postgres, keycloak, ministack, broker-provision and migrate (one-shot) and api
+scripts/wait-healthy.sh api 180
 curl -s localhost:8080/health/ready
 # {"checks":{"postgres":"ok","sqs":"ok"},"status":"ok"}
 ```
@@ -325,7 +327,9 @@ Each one starts with a **history check**: if there are incompatible records (bro
 entry without a consistent transaction; in 00003, a completed transaction without an entry or with a divergent result, with count and
 first ids) the migration **aborts without changing data or the schema** — fixing historical records is manual, then
 run `migrate up` again. Rollback: `migrate down` (one step at a time) removes the last migration's guarantees (00004 does not
-install anything: reverting only moves the version back) and **does not change data**.
+install anything: reverting only moves the version back). **Rolling back 00008 deletes inbox and diagnostics**, including per-message deduplication.
+Financial history remains; the migrator preserves the schedule when reverting 00005, as described below.
+`migrate down-to 0` deletes all data.
 
 **Upgrade procedure** (details and rationale in `ARCHITECTURE.en.md` §10.3):
 
@@ -369,7 +373,7 @@ migrator procedure (`Migrator`, used by `cmd/migrate`) that **preserves or refus
      if a copy already exists and the live schedule is the same table that was copied (an earlier `down` failed or was cancelled), the copy is refreshed from the live schedule;
      if the live schedule is the rebuild created by 00005's `Up` (partial reapplication), the original copy is kept and the rollback only proceeds if the live schedule is
      the **intact** rebuild (no row outside the copy, no attempts, diagnostic or completion) — otherwise it is **refused**, with count and ids, changing nothing.
-   Reverting 00006 and later migrations does not touch data.
+   Reverting 00006 does not touch data; 00007 drops the transient reservation; 00008 deletes inbox and diagnostics. The preservation described here applies to the schedule.
 2. **Reapplication** — `migrate up`: before 00006 (and with write access of the non-owner roles **revoked from the decision until the restoration finishes**, privileges given back at the end: a runtime resume in that window is
    denied loudly, never committed only to be overwritten), if the live schedule is the **same table** that was copied (a `down` was cancelled before dropping it), the stale copy is discarded so as not to
    overwrite the work the runtime committed afterwards; if the live schedule is a modified rebuild, the `up` is **refused** before any loss. In the normal case, 00005's `Up`
@@ -524,7 +528,7 @@ go test -tags integration -count=1 ./test/integration -run 'TestThree|TestKillin
 ```
 
 The child binaries of the multi-process tests (API) and of the migration CLI tests are compiled **with `-race`** by the harness (the parent's `-race` does not instrument separate binaries):
-a race report, `panic` or `fatal error` in a child's output fails the test; the expected `SIGKILL`/`SIGTERM` of controlled scenarios prints none of that.
+in the API's multi-process harness, a race report, `panic` or `fatal error` in a child's output fails the test; the expected `SIGKILL`/`SIGTERM` of controlled scenarios prints none of that. The migration CLI tests check the output according to each scenario.
 
 Optional variables (defaults match Compose): `TEST_DATABASE_URL`, `TEST_RUNTIME_DB_ROLE`,
 `TEST_RUNTIME_DB_PASSWORD`, `KEYCLOAK_TOKEN_URL`, `OIDC_ISSUER`, `OIDC_JWKS_URL`, `AWS_ENDPOINT_URL`.

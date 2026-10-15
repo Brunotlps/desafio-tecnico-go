@@ -3,9 +3,9 @@
 > 🇧🇷 Português (este arquivo) · 🇬🇧 [English version](README.en.md) · Arquitetura: [`ARCHITECTURE.md`](ARCHITECTURE.md)
 
 Implementação do desafio descrito em [`descricao-desafio/README.md`](descricao-desafio/README.md) (a fonte normativa;
-não é alterada aqui). Este repositório contém a base operacional e o fluxo financeiro vertical
-*abertura de carteira → BET / WIN / LOSS / REFUND / ROLLBACK (com referências pendentes) → consulta*, por HTTP, com autenticação
-real, ledger, idempotência persistente e eventos gravados na outbox.
+não é alterada aqui). Este repositório contém o fluxo financeiro completo
+*abertura de carteira → BET / WIN / LOSS / REFUND / ROLLBACK (com referências pendentes) → consulta*, por HTTP e SQS, com autenticação
+real, ledger, idempotência persistente, inbox durável, publicador da outbox para SNS FIFO, ledger paginado, reconciliação e métricas.
 
 > **Status resumido** — o que existe e o que **não** existe está na seção [Escopo e pendências](#escopo-e-pendências).
 > Decisões e interpretações estão em [`ARCHITECTURE.md`](ARCHITECTURE.md).
@@ -17,6 +17,7 @@ real, ledger, idempotência persistente e eventos gravados na outbox.
 | Go             | 1.26.1         | build e testes (declarado em `go.mod` e no `Dockerfile`) |
 | Docker + Compose v2 | 29.x / 5.x | PostgreSQL, Keycloak, MiniStack (broker), API |
 | curl, python3  | —              | exemplos deste README                 |
+| Bash, jq e utilitários Linux | — | scripts de verificação e smoke (o smoke usa `/proc/sys/kernel/random/uuid`) |
 
 Memória: Keycloak + MiniStack + PostgreSQL usam ~2 GB. Portas publicadas (somente em `127.0.0.1`):
 PostgreSQL **5433**, Keycloak **8081**, broker (MiniStack) **4566**, API **8080** (sobrescreva com
@@ -25,7 +26,8 @@ PostgreSQL **5433**, Keycloak **8081**, broker (MiniStack) **4566**, API **8080*
 ## Início rápido
 
 ```sh
-docker compose up --build        # postgres, keycloak, ministack, broker-provision e migrate (one-shot) e api
+docker compose up --build -d     # postgres, keycloak, ministack, broker-provision e migrate (one-shot) e api
+scripts/wait-healthy.sh api 180
 curl -s localhost:8080/health/ready
 # {"checks":{"postgres":"ok","sqs":"ok"},"status":"ok"}
 ```
@@ -91,6 +93,7 @@ curl -s -H "Authorization: Bearer $INTERNAL"   localhost:8080/wallets/$WALLET
 | `GET /health/live`, `GET /health/ready`                               | público            | 200 / 503 |
 | `GET /wallets/{walletId}/ledger?cursor=&limit=`                       | `internal-service` | 200 (ver "Ledger paginado") |
 | `POST /wallets/{walletId}/reconciliation`                             | `internal-service` | 200 (ver "Reconciliação") |
+| `GET /metrics` | `internal-service` | 200 (ver [Métricas](#métricas)) |
 
 Respostas de erro: `{"code":"...","message":"..."}`.
 
@@ -130,7 +133,7 @@ PostgreSQL `READ ONLY, REPEATABLE READ`, com prazo de 10 s, sem lock da carteira
   `500 RECONCILIATION_FAILED` (log com a carteira) — **nunca** `consistent:true` nem uma divergência inventada. Falha de leitura é indisponibilidade (`503`), não resultado.
 * **Divergência** (`consistent:false`): resposta com os valores, log de nível `ERROR` (`reconciliation divergence detected`, com carteira, valores, `checkedEntries` e versão) e um
   ponto de integração para a métrica (`app.WithReconciliationObserver`); saldo, ledger, versão, transações e eventos **não** são alterados.
-* A métrica de divergência e as demais categorias de `GET /metrics` fazem parte da instrumentação posterior (não implementada).
+* `app.WithReconciliationObserver` alimenta `wager_reconciliation_divergences_total`; as demais categorias estão em [Métricas](#métricas).
 
 | Situação                                              | HTTP | `code`                                   |
 | ----------------------------------------------------- | ---- | ---------------------------------------- |
@@ -294,9 +297,9 @@ go run ./cmd/migrate down-to 0         # RESET destrutivo: reverte todas (apaga 
 
 A API **recusa iniciar** se o schema não estiver na versão esperada pelo binário.
 
-### Bancos já inicializados (migrations 00002 a 00007)
+### Bancos já inicializados (migrations 00002 a 00008)
 
-As migrations já publicadas (00001, 00002) **não são reescritas**; as correções são migrations novas. Para um banco criado
+As migrations já publicadas (00001 a 00008) **não são reescritas**; as correções são migrations novas. Para um banco criado
 por versões anteriores, **não apague nada**: rode `migrate up` (no Compose: `docker compose up -d --build migrate api`).
 
 * `00002_ledger_chain_and_result_integrity.sql` — proteção do ledger (cadeia contínua de saldos, vínculo
@@ -307,7 +310,7 @@ por versões anteriores, **não apague nada**: rode `migrate up` (no Compose: `d
 
 * `00008_inbox_and_message_diagnostics.sql` — **versão final esperada pela aplicação (8)**; `inbox_messages` (identidade `(consumer_name, message_id)`, `body_hash` = SHA-256 dos bytes exatos, linha **já concluída**, `transaction_id` NOT NULL com FK) e `message_diagnostics` (recusas permanentes, sem transação nem corpo financeiro); ambas append-only (trigger recusa UPDATE/DELETE/TRUNCATE até para o dono; o runtime só tem SELECT e INSERT). A reversão descarta as duas tabelas (a idempotência financeira vive em `wager_transactions` e não é afetada).
 * `00007_outbox_publisher_lease.sql` — versão anterior; reserva do publicador da outbox: `lease_token` e `lease_expires_at` (ambos NULL ou ambos preenchidos; nunca num evento publicado) e o marcador `published_at`, uma vez gravado, passa a ser imutável. Eventos, snapshots, agenda, tentativas, diagnósticos e marcadores existentes ficam intactos (as colunas novas chegam NULL e o backlog é publicado normalmente). Reversão (`migrate down`, um passo): descarta só a reserva (transitória) e restaura o guard anterior; nada mais muda.
-* `00006_pending_shape_and_schedule_preservation.sql` — corrige dois achados da auditoria sem reescrever a 00005; corrige dois achados da auditoria sem reescrever a 00005. (1) **Forma de `PENDING_REFERENCE` imposta no schema**: a referência externa, quando existe, precisa ter uma forma que a reidratação aceita (não vazia, ≤ 128 caracteres, sem caracteres de controle nem espaços nas pontas, diferente do próprio id externo) e `PENDING_REFERENCE` só existe para origem externa, tipo `WIN`/`REFUND`/`ROLLBACK` e com referência externa; o histórico incompatível é **recusado** (contagem e primeiros ids, sob exclusão dos escritores), nunca corrigido. (2) **Restaura a agenda preservada** por um rollback anterior (ver abaixo). Reversão: remove as garantias; não toca em dados.
+* `00006_pending_shape_and_schedule_preservation.sql` — corrige dois achados da auditoria sem reescrever a 00005. (1) **Forma de `PENDING_REFERENCE` imposta no schema**: a referência externa, quando existe, precisa ter uma forma que a reidratação aceita (não vazia, ≤ 128 caracteres, sem caracteres de controle nem espaços nas pontas, diferente do próprio id externo) e `PENDING_REFERENCE` só existe para origem externa, tipo `WIN`/`REFUND`/`ROLLBACK` e com referência externa; o histórico incompatível é **recusado** (contagem e primeiros ids, sob exclusão dos escritores), nunca corrigido. (2) **Restaura a agenda preservada** por um rollback anterior (ver abaixo). Reversão: remove as garantias; não toca em dados.
 * `00005_references_and_reversals.sql` — Instala no banco as garantias das reversões e das
   pendências (referência interna coerente com a externa e o escopo, alvo `PROCESSED` de tipo elegível, valor integral, sentido do
   `ROLLBACK`, referência resolvida para concluir, **uma reversão por alvo**, mutabilidade restrita das transações não terminais, e a agenda
@@ -325,7 +328,9 @@ Cada uma começa com uma **verificação do histórico**: se houver registros in
 lançamento sem transação coerente; na 00003, transação concluída sem lançamento ou com resultado divergente, com contagem e
 primeiros ids) a migration **aborta sem alterar dados nem o schema** — a correção de registros históricos é manual, depois
 rode `migrate up` de novo. Reversão: `migrate down` (um passo por vez) remove as garantias da última migration (a 00004 não
-instala nada: reverter só retrocede a versão) e **não altera dados**.
+instala nada: reverter só retrocede a versão). **A reversão da 00008 apaga inbox e diagnósticos**, incluindo a deduplicação por mensagem.
+O histórico financeiro permanece; a preservação da agenda ao reverter a 00005 é feita pelo migrador, conforme a seção seguinte.
+`migrate down-to 0` apaga todos os dados.
 
 **Procedimento de upgrade** (detalhes e justificativa em `ARCHITECTURE.md` §10.3):
 
@@ -340,7 +345,7 @@ docker compose up -d --build api        # a API só inicia na versão final do s
   `LOCK TABLE` da 00004. Mesmo com a API ativa o resultado é correto para escritores do papel de runtime; parar os escritores
   reduz a retenção e é a precondição para qualquer outro escritor (manutenção manual, ETL, outro papel).
 * Se a 00004 ou a 00005 abortar (histórico incompatível, trigger ausente/desabilitado ou escritor aberto por mais de 30 s), o schema fica na
-  versão anterior (p.ex. 4), nada é apagado e **a API recusa iniciar** (`schema is at version 5, application expects 6`). Corrija os registros
+  versão anterior (p.ex. 4), nada é apagado e **a API recusa iniciar** (`database schema is at version 4, application expects 8`). Corrija os registros
   indicados manualmente (contagem e primeiros ids na mensagem) ou repita sem escritores abertos, e rode `migrate up` de novo.
 * Limites: um escritor com privilégio de dono/superusuário pode ignorar triggers (só a validação o enxerga, e só no instante da
   migration); upgrade online sem nenhuma retenção não é objetivo.
@@ -369,7 +374,7 @@ migrador (`Migrator`, usado por `cmd/migrate`) que **preserva ou recusa antes de
      se já existe uma cópia e a agenda viva é a mesma tabela que foi copiada (um `down` anterior falhou ou foi cancelado), a cópia é renovada a partir da agenda viva;
      se a agenda viva é a reconstrução criada pelo `Up` da 00005 (reaplicação parcial), a cópia original é mantida e o rollback só prossegue se a agenda viva for
      a reconstrução **intacta** (nenhuma linha fora da cópia, sem tentativas, diagnóstico nem conclusão) — caso contrário é **recusado**, com contagem e ids, sem alterar nada.
-   Reverter a 00006 e as posteriores não toca em dados.
+   Reverter a 00006 não toca nos dados; a 00007 descarta a reserva transitória; a 00008 apaga inbox e diagnósticos. A preservação descrita aqui é da agenda.
 2. **Reaplicação** — `migrate up`: antes da 00006 (e com a escrita dos papéis que não são o dono **revogada da decisão até a restauração terminar**, privilégios devolvidos ao final: uma retomada do runtime nessa janela é
    negada em voz alta, nunca confirmada para ser sobrescrita), se a agenda viva é a **mesma tabela** que foi copiada (um `down` foi cancelado antes de apagá-la), a cópia defasada é descartada para não
    sobrescrever o trabalho que o runtime confirmou depois; se a agenda viva é uma reconstrução alterada, o `up` é **recusado** antes de qualquer perda. No caso normal, o `Up` da 00005
@@ -517,11 +522,13 @@ de teste criado por versões anteriores da suíte:
 `psql ... -c "COMMENT ON DATABASE wager_test IS 'wager-integration-test-database'"`.
 
 ```sh
-go test -tags integration -count=1 ./test/integration/...          # ~25 s
+go test -tags integration -count=1 ./test/integration/...          # alguns minutos
 go test -tags integration -race -count=1 ./test/integration/...
 go vet -tags integration ./...
 go test -tags integration -count=1 ./test/integration -run 'TestThree|TestKilling' -v   # 3 processos
 ```
+
+Os binários filhos da API e do migrador são compilados **com `-race`** pelo harness; o `-race` do processo pai não instrumenta executáveis separados. No harness multiprocesso da API, relatos de race, `panic` ou `fatal error` na saída dos filhos falham o teste; os testes da CLI de migrations verificam a saída conforme cada cenário.
 
 Variáveis opcionais (padrões coincidem com o Compose): `TEST_DATABASE_URL`, `TEST_RUNTIME_DB_ROLE`,
 `TEST_RUNTIME_DB_PASSWORD`, `KEYCLOAK_TOKEN_URL`, `OIDC_ISSUER`, `OIDC_JWKS_URL`, `AWS_ENDPOINT_URL`.
@@ -559,7 +566,7 @@ Variáveis opcionais (padrões coincidem com o Compose): `TEST_DATABASE_URL`, `T
 | Ledger paginado | `ledger_reads_test.go`, `internal/app/ledger_test.go` | percurso completo por várias páginas e limites (1, 3, 7, 8, 9, 100; bordas `limit` = restantes e +1; padrão 50) em ordem de `seq`, sem vazamento de outra carteira; `limit`/`cursor` inválidos, repetidos ou de **outra carteira** → 400 sem dados; carteira zero → `items:[]`, inexistente → 404; query malformada (`limit=%ZZ`, `cursor=%ZZ`, repetição com escape inválido, separador `;`, cursor válido repetido com `%ZZ`, parâmetro desconhecido malformado) → 400 `INVALID_QUERY` sem dados, e 401/403 antes dela; `createdAt` iguais e gaps de `seq`; lançamentos novos no meio da navegação (sem perda nem duplicação, sem sessão `idle in transaction`); 6 escritores paralelos na mesma carteira (toda travessia é prefixo da ordem final); cursor: forma canônica, versão, posição, tamanho |
 | Reconciliação | `reconciliation_test.go`, `internal/app/ledger_test.go` | carteira zero, abertura, o exemplo do enunciado (100,00 + BET 25,00 → 75,00/75,00/0,00, 2 lançamentos), cadeia BET/WIN/LOSS/rejeição/REFUND/ROLLBACK, estado intacto após ler; **movimento confirmado entre as consultas** (barreira): resposta de um único momento e escritor sem espera; somas separadas **acima de `int64`** com saldo final `MaxInt64` (exato); divergência real em banco exclusivo (resposta, log, sinal, nada alterado, diferença negativa); soma fora de `Money` → falha (não divergência); falha de leitura → erro; aritmética em unidades (`big.Int`) |
 | Shutdown coordenado | `internal/lifecycle/coordinator_test.go`, `shutdown_test.go` | ordem (admissão em todos → drenagem → cancelamento → confirmação), término incompleto, falha de partida; com infraestrutura real: requisição presa no lock é recusada/drenada/cancelada e o **pool só fecha depois**, tentativa do worker presa é cancelada e outra instância conclui, partida com porta ocupada sem vazar conexões, configuração incoerente recusada |
-| Multiprocesso | `multiprocess_test.go`, `win_loss_test.go`, `references_multiprocess_test.go` | **3 processos do binário real**: 50 reenvios espalhados, disputa 2×80,00 entre processos, conexões próprias, `SIGTERM` com saída 0; `SIGKILL` de um processo no meio da carga sem duplicar nem perder débito; reenvios de `WIN`/`LOSS`; **reversões pendentes resolvidas pelos executores dos três processos** (por carteira: uma processada, uma rejeitada, um crédito), `SIGKILL` do processo que aceitou a pendência, expiração com três executores (uma rejeição, um evento). O binário dos filhos é compilado **sem `-race`** (pendência registrada) |
+| Multiprocesso | `multiprocess_test.go`, `win_loss_test.go`, `references_multiprocess_test.go` | **3 processos do binário real**: 50 reenvios espalhados, disputa 2×80,00 entre processos, conexões próprias, `SIGTERM` com saída 0; `SIGKILL` de um processo no meio da carga sem duplicar nem perder débito; reenvios de `WIN`/`LOSS`; **reversões pendentes resolvidas pelos executores dos três processos** (por carteira: uma processada, uma rejeitada, um crédito), `SIGKILL` do processo que aceitou a pendência, expiração com três executores (uma rejeição, um evento). O binário dos filhos é compilado **com `-race`** pelo harness |
 
 ## Integração contínua
 
@@ -578,7 +585,7 @@ Para validar o Compose sem mexer no seu ambiente, use outro projeto e outras por
 ```sh
 export POSTGRES_PORT=15433 KEYCLOAK_PORT=18081 BROKER_PORT=14566 API_PORT=18080 BROKER_DIR=/tmp/wager-check-broker   # credenciais do broker isoladas
 docker compose -p wager-check up --build -d
-API_URL=http://localhost:18080 KEYCLOAK_URL=http://localhost:18081 scripts/smoke.sh
+API_URL=http://localhost:18080 KEYCLOAK_URL=http://localhost:18081 COMPOSE="docker compose -p wager-check" scripts/smoke.sh
 docker compose -p wager-check down -v      # remove apenas o projeto de verificação
 ```
 
@@ -602,29 +609,28 @@ test/integration   testes com infraestrutura real (build tag `integration`)
 
 ## Escopo e pendências
 
-**Implementado e testado (HTTP):** configuração validada; Fx com lifecycle e **shutdown coordenado**; Docker Compose; Keycloak e
+**Implementado e testado (HTTP e SQS):** configuração validada; Fx com lifecycle e **shutdown coordenado**; Docker Compose; Keycloak e
 MiniStack provisionados; migrations; health checks reais; Money; Wallet; WagerTransaction (máquina
 de estados completa no domínio); LedgerEntry; abertura de carteira; **`REFUND`, `ROLLBACK` e `WIN` com referência**, **referências pendentes
 (`PENDING_REFERENCE`) com agenda durável, TTL, backoff e worker**, uma reversão por alvo imposta no banco; `BET` com idempotência
 persistente, rejeição por saldo, ledger e outbox atômicos; `WIN` (sem referência) e `LOSS`; consultas com isolamento por provedor;
-autenticação/autorização reais. **Garantias do banco** (migrations 00001–00003, verificadas por SQL direto pelo papel
+autenticação/autorização reais; consumidor SQS e inbox durável; produtor interno; publicador da outbox; ledger paginado, reconciliação e métricas. **Garantias do banco** (migrations 00001–00003, verificadas por SQL direto pelo papel
 restrito): ledger append-only e de cadeia contínua; saldo = último `balance_after`; toda transação `PROCESSED` com movimento
 exige, no COMMIT, o lançamento da própria carteira e `result_balance` = `balance_after` dele (`LOSS` e rejeições não têm
 lançamento); unicidade de identidade; terminais imutáveis. **Precedência da identidade:** chave ou id externo já registrado é
 replay/conflito (409) antes das políticas de operação nova (moeda, tipo).
 
-**Não implementado (explícito):**
+**Estado dos itens obrigatórios e opcionais do enunciado:**
 
 | Item do enunciado | Situação |
 | --- | --- |
 | Consumidor SQS e tabela de inbox | **implementados** (ver [Consumidor SQS e inbox](#consumidor-sqs-e-inbox)) |
-| Publicador de outbox (múltiplas instâncias, backoff, recuperação) | **implementado** (ver [Publicador da outbox](#publicador-da-outbox)); *at-least-once*, sem ordem global; a consolidação com 3 processos para SQS ainda não existe |
+| Publicador de outbox (múltiplas instâncias, backoff, recuperação) | **implementado** (ver [Publicador da outbox](#publicador-da-outbox)); *at-least-once*, sem ordem global |
 | Métricas (resultados, duplicatas, retries, DLQ, atraso da outbox, reconciliação) | **implementadas** (ver [Métricas](#métricas)); contadores locais ao processo, sem percentis; sem tracing nem dashboards |
-| Controle de acesso do broker (credenciais e políticas) | **provado como autorização emulada** (MiniStack 1.5.27, `AUTH=true`; prova na CI). O MiniStack **não valida assinaturas SigV4**: não é autenticação AWS completa nem prova de produção (ver [Broker](#broker-ministack-com-authtrue)). O produtor/consumidor SQS ainda **não** existem |
+| Controle de acesso do broker (credenciais e políticas) | **provado como autorização emulada** (MiniStack 1.5.27, `AUTH=true`; prova na CI). O MiniStack **não valida assinaturas SigV4**: não é autenticação AWS completa nem prova de produção (ver [Broker](#broker-ministack-com-authtrue)). |
 | Testes SQS/HTTP cruzados, DLQ, interrupção de consumidor | **provados** (ver Testes) |
 | Prova com 3 processos para SQS/outbox | **provada**: três processos reais do binário compilado com `-race` (consumidor e publisher em cada um), 50 reentregas, duas BETs de 80 sobre 100 cruzando HTTP e SQS, um processo morto por `SIGKILL` e os demais encerrados por `SIGTERM` |
 | Testes de carga, OpenTelemetry, partidas dobradas | opcionais, não feitos |
 | Limites das garantias atuais | o dono do schema e superusuários podem desabilitar triggers (a API roda com papel restrito); o `result_balance` de `LOSS` (saldo observado, sem lançamento) não é verificável contra o ledger; o sentido do lançamento de `ROLLBACK` é imposto no banco desde a 00005 (ARCHITECTURE §10); a regressão de relógio entre instâncias é recusada pelo domínio e tratada por quem chama a transição (ARCHITECTURE §3); rotação de chaves do IdP pode causar 401 por até 30 s |
 
 **Estado:** todos os componentes obrigatórios existem. O que não foi feito: fuzz, carga, tracing, dashboards, partidas dobradas e renovação de lease/visibilidade. Detalhes e limites em `ARCHITECTURE.md`.
-Detalhes em `ARCHITECTURE.md`.
