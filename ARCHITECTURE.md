@@ -192,18 +192,27 @@ continuidade durável.
 
 ## 7. Inbox e outbox (§6.5, §11)
 
-* **Outbox implementada (gravação)**: `outbox_events` guarda o envelope completo como `jsonb` (snapshot imutável,
-  trigger impede alterá-lo), `eventId` = PK, `aggregate_type/id`, `correlation_id`, `causation_id`, `attempts`,
-  `next_attempt_at`, `last_error`, `published_at`, e `seq` (ordem de inserção). Os eventos entram **na mesma transação**
-  da operação; **nada é publicado** antes do commit (não há publicador ainda, então a garantia é trivial hoje).
-  `causationId` de `WalletBalanceChanged` = `eventId` do `WagerTransactionProcessed` da mesma operação.
-* **Pendente** (não implementado): publicador com `SELECT … FOR UPDATE SKIP LOCKED` + lease (colunas de lock serão
-  adicionadas por migration), backoff exponencial, recuperação de trabalho abandonado, republicação com mesmo `eventId`.
-  **Roteamento previsto** (destino provisionado, §9): SNS FIFO `wager-events.fifo`; `MessageGroupId` = o **`walletId` do payload** (não o
-  `aggregateId`: nos eventos de transação o agregado é a transação) e `MessageDeduplicationId = eventId`. O SNS FIFO preserva a ordem das
-  publicações **aceitas** no mesmo grupo, mas **o publicador não promete reproduzir a ordem original da outbox** (vários publicadores, retries e
-  recuperação podem reordenar e republicar): consumidores deduplicam por `eventId` (a entrega é *at-least-once*; a deduplicação do broker é
-  temporária) e projeções de saldo aplicam `balanceAfter` só se `walletVersion` for maior.
+* **Outbox (gravação)**: `outbox_events` guarda o envelope completo como `jsonb` (snapshot imutável, trigger impede
+  alterá-lo), `eventId` = PK, `aggregate_type/id`, `correlation_id`, `causation_id`, `attempts`, `next_attempt_at`, `last_error`,
+  `published_at`, `lease_token`/`lease_expires_at` (migration 00007) e `seq` (ordem de inserção). Os eventos entram **na mesma
+  transação** da operação; o publicador só enxerga o que foi confirmado. `causationId` de `WalletBalanceChanged` = `eventId` do
+  `WagerTransactionProcessed` da mesma operação.
+* **Publicador (incremento 3)** — `internal/outbox` (laço, backoff e lifecycle, sem SQL nem SDK), `postgres.OutboxStore` (reserva e escritas
+  condicionadas à posse) e `internal/infra/sns` (cliente do principal `wager-publisher`). Três passos, **nunca com transação ou conexão
+  abertas durante a rede**: (1) reservar um evento (`FOR UPDATE SKIP LOCKED`, mais antigo elegível, lease de 20 s com **token novo por
+  aquisição**, relógio do banco); (2) publicar o snapshot armazenado no SNS (5 s, fora de SQL); (3) confirmar, reagendar (backoff 1 s–30 s com jitter,
+  persistido em `next_attempt_at`) ou liberar, exigindo token **e** lease válida **no instante da escrita**. A espera por lock acontece num
+  `SELECT … FOR UPDATE` e o `UPDATE` testa a posse **depois**, com `clock_timestamp()` — um único `UPDATE` não bastaria, porque o PostgreSQL não
+  reavalia o predicado quando o lock é solto sem alterar a linha. Zero linhas = posse perdida. Recuperação: uma lease vencida torna o evento
+  elegível a qualquer publicador (inclusive depois de `SIGKILL`); `attempts` conta reservas, `last_error` o último diagnóstico; eventos nunca
+  são descartados. Seleção sem *starvation*: backoff, lease válida e linhas travadas ficam fora da ordenação (`ORDER BY next_attempt_at, seq`).
+  O componente entra no coordenador de lifecycle (admissão → drenagem → cancelamento com **liberação** da reserva → `Done` depois da ação SQL final).
+  **Roteamento**: SNS FIFO `wager-events.fifo`; `MessageGroupId` = o **`walletId` do payload** (não o `aggregateId`: nos eventos de transação o
+  agregado é a transação) e `MessageDeduplicationId = eventId`. O SNS FIFO preserva a ordem das publicações **aceitas** no mesmo grupo, mas **o
+  publicador não promete reproduzir a ordem original da outbox** (vários publicadores, retries e recuperação podem reordenar e republicar):
+  consumidores deduplicam por `eventId` (a entrega é *at-least-once*; a deduplicação do broker é temporária) e projeções de saldo aplicam
+  `balanceAfter` só se `walletVersion` for maior, de forma atômica; consumidores de histórico preservam os eventos relevantes. Limites: sem renovação
+  de lease (uma publicação mais longa que a lease pode ser republicada); o token protege o estado SQL, não uma publicação antiga já enviada.
 * **Inbox**: tabela e consumidor **não criados** (sem schema fictício). Desenho previsto: `UNIQUE(consumer_name,
   message_id)` + hash, inserida na mesma transação do caso de uso; `Submit` já é reutilizável pela entrada SQS
   (a chave é `data.idempotencyKey`). Fila: `MessageGroupId = walletId`, `MessageDeduplicationId = messageId`,
@@ -330,7 +339,7 @@ continuidade durável.
     na DLQ e na auditoria) e um principal sem políticas (para comprovar `AccessDenied`). A aplicação **seleciona** o perfil de runtime
     (`AWS_PROFILE`/`AWS_SHARED_CREDENTIALS_FILE`, cadeia padrão do SDK) e não recebe as credenciais de provisionamento (a raiz do emulador), que ficam só no
     one-shot e na prova; o arquivo montado, porém, contém os cinco perfis e todos são legíveis pelo processo — não há isolamento físico entre eles (distribuir a cada
-    processo só o perfil necessário é uma recomendação técnica de endurecimento). O publisher já tem principal, mas não há worker.
+    processo só o perfil necessário é uma recomendação técnica de endurecimento). O publisher tem principal próprio **e** cliente SNS próprio (o perfil é lido pelo construtor, §7); o cliente SQS de readiness segue com o runtime.
   * **Modelo de confiança** (decisão da mentoria): a fila compartilhada é para **produtores internos confiáveis**; provedores externos não têm
     `SendMessage` direto. O produtor vincula a origem autenticada (token, ou configuração controlada) ao `providerId` permitido antes de
     publicar; o consumidor valida o envelope e o escopo, mas não trata um campo do corpo como autenticação. Ainda **não implementado** (inbox e consumidor são o incremento 4).
@@ -351,7 +360,7 @@ continuidade durável.
 
 ## 10. Garantias impostas pelo PostgreSQL (§5.3, §5.8)
 
-Migrations `00001_init.sql` a `00006_…` — verificadas por tentativas **diretas de SQL** (inclusive pelo papel restrito de runtime) em `constraints_test.go`, `db_integrity_test.go` e `completed_movement_test.go`:
+Migrations `00001_init.sql` a `00007_…` — verificadas por tentativas **diretas de SQL** (inclusive pelo papel restrito de runtime) em `constraints_test.go`, `db_integrity_test.go` e `completed_movement_test.go`:
 
 | Garantia | Mecanismo |
 | --- | --- |
@@ -374,7 +383,8 @@ Migrations `00001_init.sql` a `00006_…` — verificadas por tentativas **diret
 | Política de zero | `CHECK` (`LOSS` = 0, demais > 0) |
 | Forma por estado | `CHECK` com `IS NOT NULL` explícito: `PROCESSED` exige `result_balance` não nulo e ≥ 0; `REJECTED` exige código e resultado; `PENDING*` não têm código nem resultado; `FAILED` exige código (um `CHECK` aceita `NULL` como "desconhecido", então `>= 0` sozinho não basta). Formato do `failure_code` também por `CHECK` |
 | Terminais imutáveis; transações nunca apagadas | trigger `wager_transactions_guard` |
-| Outbox: snapshot imutável | trigger `outbox_events_guard` (só tentativas/agenda/publicação mudam) |
+| Outbox: snapshot imutável; `published_at` imutável depois de gravado (00007) | trigger `outbox_events_guard` (só tentativas/agenda/reserva/publicação mudam) |
+| Outbox: forma da reserva (00007) | `CHECK ck_outbox_lease_pair` (token e prazo juntos) e `ck_outbox_published_has_no_lease` (evento publicado não tem reserva) |
 | **Referência coerente** (migration 00005) | trigger `BEFORE INSERT/UPDATE` `wager_tx_reference_guard`: a referência interna aponta para o alvo com o **mesmo** provedor, id externo referenciado, jogador, carteira, moeda e rodada; alvo `PROCESSED`; tipo elegível (`REFUND`→`BET`, `WIN`→`BET`, `ROLLBACK`→`BET|WIN|REFUND`); reversões com **valor idêntico**. `CHECK`: referência interna exige a externa (`ck_wager_tx_reference_pair`) e não pode ser a própria transação |
 | **Referência resolvida para concluir** | `CHECK ck_wager_tx_processed_reference`: `REFUND`, `ROLLBACK` e `WIN` com referência externa só ficam `PROCESSED` com a referência interna preenchida (forma `NULL` coberta explicitamente) |
 | **Uma reversão por alvo** | índice único parcial `uq_wager_tx_one_reversal_per_target (reference_transaction_id) WHERE kind IN ('REFUND','ROLLBACK') AND status = 'PROCESSED'`: vale para `REFUND` e `ROLLBACK` em conjunto; `WIN` com referência não o consome; rejeições/falhas/pendências também não |
@@ -389,13 +399,13 @@ Migrations `00001_init.sql` a `00006_…` — verificadas por tentativas **diret
 * **Runtime** (`wager_app`, criado por `migrate up` quando `RUNTIME_DB_ROLE` está definido, ou por `migrate grants`):
   `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT`, **sem posse de nada** e sem `CREATE` no
   schema. Privilégios mínimos (lista em `internal/infra/postgres/roles.go`, reaplicada de um estado conhecido a cada execução):
-  ledger `SELECT, INSERT`; outbox `SELECT, INSERT`; transações `SELECT, INSERT` e `UPDATE (status, failure_code, result_balance,
+  ledger `SELECT, INSERT`; outbox `SELECT, INSERT` e `UPDATE (attempts, next_attempt_at, last_error, published_at, lease_token, lease_expires_at)` (payload e identidade imutáveis; sem `DELETE`/`TRUNCATE`); transações `SELECT, INSERT` e `UPDATE (status, failure_code, result_balance,
   reference_transaction_id, updated_at)` (identidade, valor, provedor, chave, hash, rodada, jogo e referência externa **não** são atualizáveis);
   agenda `pending_references` `SELECT, INSERT` e `UPDATE (next_attempt_at, attempts, last_attempt_at, last_error, completed_at)` (prazo e
   identidade imutáveis, sem `DELETE`); carteiras `SELECT, INSERT` e `UPDATE (balance, version, updated_at)`; `goose_db_version` `SELECT`. Sem `UPDATE/DELETE/TRUNCATE` no ledger, sem `DISABLE TRIGGER` (exige posse), sem
   `session_replication_role` (exige superusuário), sem `DROP`/`ALTER`. Testado com tentativas reais (`role_test.go`) e com o fluxo
-  financeiro completo e a verificação de schema rodando com esse papel. Ampliar privilégios (p.ex. `UPDATE` da outbox pelo publicador) é uma mudança explícita nessa lista; a 00005 ampliou
-  só as colunas de transição das transações e da agenda. `migrate grants` omite a agenda em um banco ainda anterior à 00005. A preparação de rollback revoga a escrita na agenda (§10.2).
+  financeiro completo e a verificação de schema rodando com esse papel. Ampliar privilégios é uma mudança explícita nessa lista; a 00005 ampliou as colunas de transição das transações e da agenda e a 00007, só as colunas de controle da outbox
+  (omitidas por `migrate grants` num banco anterior à 00007). `migrate grants` omite a agenda em um banco ainda anterior à 00005. A preparação de rollback revoga a escrita na agenda (§10.2).
 * Limitação restante: o dono e superusuários continuam podendo desabilitar triggers — por isso a aplicação nunca roda com
   esses papéis. Em produção, crie o papel de runtime fora do pipeline de migrations se o papel das migrations não tiver `CREATEROLE`.
 
@@ -411,6 +421,7 @@ versão anterior).
 | --- | --- | --- | --- |
 | `00002_ledger_chain_and_result_integrity` | cadeia do ledger quebrada; lançamento incoerente com sua transação; `PROCESSED`/`REJECTED` com resultado nulo; `failure_code` inválido; saldo ≠ ledger | cadeia contínua, FK composta, resultado explícito | remove o que instalou |
 | `00003_completed_movement_requires_ledger` | transação `PROCESSED` (≠ `LOSS`) **sem lançamento**; `result_balance` ≠ `balance_after` do lançamento | trigger deferido da transação e verificação de resultado no lado do ledger | remove o trigger e restaura a função de 00002; **não toca nos dados** (após a reversão a lacuna volta a existir) |
+| `00007_outbox_publisher_lease` | sem preflight (as colunas novas chegam NULL; o backlog não é tocado) | `lease_token`, `lease_expires_at`, `ck_outbox_lease_pair`, `ck_outbox_published_has_no_lease` e o guard que torna `published_at` imutável | descarta só a reserva (transitória), restaura o guard da 00001; eventos, agenda, tentativas, diagnósticos e marcadores permanecem |
 | `00006_pending_shape_and_schedule_preservation` | **exclusão dos escritores**; recusa, com contagem e primeiros ids: `PENDING_REFERENCE` irretomável (não externo, tipo que não espera referência, ou referência ausente/inválida), referência externa com forma que a reidratação rejeita (vazia, > 128, controle, espaços nas pontas, igual ao próprio id) e cópia preservada sem transação correspondente | `CHECK ck_wager_tx_reference_form` (qualquer estado) e `ck_wager_tx_pending_reference_shape`, função `wager_valid_external_reference`; **restaura** a agenda preservada por um rollback anterior (valores originais, inclusive as concluídas) sobre as linhas que o `Up` da 00005 reconstruiu, e remove a cópia | remove os dois `CHECK` e a função; não toca em dados |
 | `00005_references_and_reversals` | **exclusão dos escritores** (mesmo `LOCK TABLE` da 00004) e, com eles excluídos: transação confirmada como `PENDING`; reversão/`WIN` com referência `PROCESSED` sem a referência interna; referência interna incoerente com a externa, o escopo, o tipo, o estado ou o valor; alvo com mais de uma reversão `PROCESSED`; lançamento de `ROLLBACK` no sentido errado (contagem e primeiros ids) | tudo o que está em §10 na linha "Referência coerente" em diante, mais a agenda `pending_references` | remove as garantias, restaura as funções da 00001/00003 e `DROP`a a agenda (transações e ledger intactos). **O migrador preserva a agenda antes dessa reversão e a 00006 a restaura na reaplicação** — ver "Rollback e a agenda das pendências" abaixo |
 | `00004_revalidate_history_under_writer_exclusion` | **exclusão dos escritores** (`LOCK TABLE` em `wallets`, `wager_transactions`, `wallet_ledger_entries`) e, com eles excluídos: triggers das garantias ausentes ou desabilitados; cadeia do ledger quebrada; lançamento incoerente com a transação; saldo ≠ ledger; transação concluída sem lançamento; resultado ≠ `balance_after` (com contagem e primeiros ids) | nada (só valida; é a versão final esperada pela aplicação) | vazia: apenas retrocede a versão, sem tocar em dados nem garantias |
@@ -540,7 +551,7 @@ espera/retenção pelo lock, dados preservados, reversão/reaplicação e partid
   `SELECT` em `goose_db_version` (`migrate up` pendente impede a partida) e **fecha o pool antes de devolver o erro se algo
   falhar**: o Fx não chama o `OnStop` de um hook cujo `OnStart` falhou, então a liberação não depende dele. Verificador →
   carrega o JWKS; SQS → `GetQueueUrl` da fila de entrada. Por último, o **coordenador** inicia os componentes que admitem trabalho, na
-  ordem de registro: worker de referências e, por fim, o servidor HTTP (`Listen` síncrono, `Serve` em segundo plano) — a porta de entrada abre
+  ordem de registro: worker de referências, **publicador da outbox** (quando `OUTBOX_PUBLISHERS` > 0; o cliente SNS valida o tópico na partida, como o SQS) e, por fim, o servidor HTTP (`Listen` síncrono, `Serve` em segundo plano) — a porta de entrada abre
   por último. Se um componente falha ao iniciar, o coordenador encerra os já iniciados antes de devolver o erro, e o Fx desfaz os hooks
   anteriores: **nenhuma conexão com o PostgreSQL permanece aberta** (testado contando `pg_stat_activity`, inclusive com o worker ativo e a porta
   ocupada): PostgreSQL inacessível, schema sem migrations ou desatualizado, credenciais inválidas, IdP inacessível, fila ausente, broker
@@ -549,8 +560,8 @@ espera/retenção pelo lock, dados preservados, reversão/reaplicação e partid
   (`SHUTDOWN_DRAIN_TIMEOUT`) e uma **reserva compartilhada de pelo menos 8 s** — não concedida de novo a cada componente — para
   cancelamento, cleanup e fechamento das dependências. Sequência: (1) **admissão fechada em todos os componentes ao mesmo tempo**: o servidor
   fecha o listener e responde `503 SHUTTING_DOWN` a requisições novas (inclusive em conexões keep-alive), o worker deixa de buscar trabalho;
-  (2) **drenagem simultânea** do trabalho admitido; (3) no limite de drenagem, **cancelamento** do que restou (fecha as conexões e cancela o
-  contexto das requisições; cancela a tentativa do worker, cuja transação é desfeita); (4) **confirmação observável do término** de cada
+  (2) **drenagem simultânea** do trabalho admitido (inclusive a publicação e a confirmação em andamento do publicador); (3) no limite de drenagem, **cancelamento** do que restou (fecha as conexões e cancela o
+  contexto das requisições; cancela a tentativa do worker, cuja transação é desfeita; cancela a publicação em andamento, cuja reserva é **liberada** — a ação SQL final usa contexto próprio limitado ao prazo restante e `Done` só fecha depois dela); (4) **confirmação observável do término** de cada
   componente (`Done`): o servidor só confirma quando o `http.Server` terminou **e** todos os handlers retornaram — o fim do `Serve`, sozinho,
   não prova isso, e cancelar um contexto não prova o fim de uma goroutine; (5) só então o Fx executa os `OnStop` das dependências em ordem
   inversa (verificador, SQS, pool). Se algum componente não confirmar até o prazo global menos uma margem de 1 s, o encerramento é registrado
@@ -594,8 +605,7 @@ espera/retenção pelo lock, dados preservados, reversão/reaplicação e partid
 
 ## 14. Limitações e trabalho não concluído
 
-Ver "Escopo e pendências" no README. Em síntese, **ainda ausentes**: SQS + inbox (consumidor, retry/DLQ, produtor autorizado), publicador
-de outbox, paginação do ledger, reconciliação, métricas, e a prova com três processos para os fluxos SQS/outbox. O controle de acesso do
+Ver "Escopo e pendências" no README. Em síntese, **ainda ausentes**: SQS + inbox (consumidor, retry/DLQ, produtor autorizado), paginação do ledger, reconciliação, métricas, e a prova com três processos para os fluxos SQS (o publicador tem dois processos reais e um `SIGKILL`). O controle de acesso do
 broker está **provado como autorização emulada** (§9), com o limite de não validar SigV4. A prova com três processos **existe** para
 HTTP (apostas, WIN/LOSS) e para reversões e pendências com o worker real (`references_multiprocess_test.go`).
 
