@@ -113,6 +113,10 @@ services:
       AWS_SHARED_CREDENTIALS_FILE: /run/broker/credentials
       AWS_PROFILE: wager-runtime
       SQS_WAGER_QUEUE_NAME: wager-transactions.fifo
+      # Publicador da outbox: principal próprio (perfil wager-publisher do mesmo arquivo montado) e tópico de eventos.
+      OUTBOX_PUBLISHERS: "1"
+      OUTBOX_AWS_PROFILE: wager-publisher
+      SNS_EVENT_TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:wager-events.fifo
       ALLOWED_CURRENCIES: BRL
     ports:
       - "127.0.0.1:${API_PORT:-8080}:8080"

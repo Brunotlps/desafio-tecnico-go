@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Teste de fumaça ponta a ponta contra a API em execução (Docker Compose): autenticação real,
 # abertura de carteira, BET aceita/rejeitada, replay, conflito, isolamento entre provedores, reversões
-# (REFUND/ROLLBACK, uma por alvo) e uma referência pendente concluída pelo worker de referências.
+# (REFUND/ROLLBACK, uma por alvo), uma referência pendente concluída pelo worker de referências e a publicação da outbox no
+# tópico de eventos (a fila de auditoria assinante recebe).
 #
 #   docker compose up --build -d && scripts/smoke.sh
 #
-# Variáveis: API_URL (http://localhost:8080), KEYCLOAK_URL (http://localhost:8081).
+# Variáveis: API_URL (http://localhost:8080), KEYCLOAK_URL (http://localhost:8081), COMPOSE ("docker compose"; usado para
+# consultar a outbox e a fila de auditoria no stack).
 set -euo pipefail
 
 API="${API_URL:-http://localhost:8080}"
@@ -85,4 +87,18 @@ for _ in $(seq 1 40); do
 done
 expect "the worker resolved the pending REFUND" "$S" 200 '.status == "PROCESSED" and .balance.amount == "100.00"'
 expect "final wallet balance" "$(req GET "/wallets/$WID" "$INTERNAL")" 200 '.balance.amount == "100.00"'
+
+# Publicador da outbox: os eventos de todo o fluxo acima são publicados no tópico e entregues à fila de auditoria assinante.
+COMPOSE="${COMPOSE:-docker compose}"
+unpublished() { $COMPOSE exec -T postgres psql -U wager -d wager -tAc "SELECT count(*) FROM outbox_events WHERE published_at IS NULL" | tr -d '[:space:]'; }
+for _ in $(seq 1 40); do
+  [ "$(unpublished)" = "0" ] && break
+  sleep 1
+done
+[ "$(unpublished)" = "0" ] || fail "the outbox publisher left $(unpublished) event(s) unpublished"
+ok "outbox drained: every event of the flow was published"
+AUDIT=$($COMPOSE exec -T ministack awslocal sqs get-queue-url --queue-name wager-events-audit.fifo --query QueueUrl --output text | tr -d '[:space:]')
+DELIVERED=$($COMPOSE exec -T ministack awslocal sqs get-queue-attributes --queue-url "$AUDIT" --attribute-names ApproximateNumberOfMessages --query Attributes.ApproximateNumberOfMessages --output text | tr -d '[:space:]')
+[ "${DELIVERED:-0}" -gt 0 ] || fail "no event reached the subscriber of the event topic"
+ok "events delivered to the subscribed audit queue ($DELIVERED)"
 echo "smoke OK"
