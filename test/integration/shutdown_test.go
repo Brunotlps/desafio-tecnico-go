@@ -181,16 +181,17 @@ func TestShutdownCancelsAWorkerAttemptAndTheDurableStateRecovers(t *testing.T) {
 		t.Fatalf("pending: %d %s", r.Status, r.Raw)
 	}
 	txID := uuid.MustParse(r.str("transactionId"))
-	// Trava a agenda: a próxima tentativa do worker fica esperando por ela.
+	// Prende a tentativa do worker: a leitura da transação fica esperando por um lock de tabela. (A agenda e a carteira não prendem mais a
+	// tentativa — são puladas com SKIP LOCKED, por desenho —, então o travamento é na leitura da transação, que a tentativa não pula.)
 	lock, err := testPool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer lock.Rollback(ctx)
-	if _, err := lock.Exec(ctx, `SELECT 1 FROM pending_references WHERE transaction_id = $1 FOR UPDATE`, txID); err != nil {
+	if _, err := lock.Exec(ctx, `LOCK TABLE wager_transactions IN ACCESS EXCLUSIVE MODE`); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "the worker to wait for the schedule lock", 5*time.Second, func() bool { return waitingForLock("%pending_references%") })
+	eventually(t, "the worker attempt to wait for the transaction read", 5*time.Second, func() bool { return waitingForLock("%wager_transactions%") })
 
 	stopped := make(chan struct{})
 	go func() { a.Stop(t); close(stopped) }()
