@@ -72,6 +72,8 @@ func repositories(q querier) app.Repositories {
 		Ledger:       ledgerRepo{q},
 		Outbox:       outboxRepo{q},
 		Pending:      pendingRepo{q},
+		Inbox:        inboxRepo{q},
+		Diagnostics:  diagnosticRepo{q},
 	}
 }
 

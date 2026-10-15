@@ -145,6 +145,7 @@ func (s *Service) resumeOnce(ctx context.Context, ref PendingReference) (resumeS
 	})
 	switch {
 	case errors.Is(err, ErrWalletBusy), errors.Is(err, ErrPendingBusy):
+		s.obs.Conflict("wallet_busy")
 		return resumeBusy, nil
 	case err != nil:
 		if errors.Is(err, ErrCommitUnknown) {
@@ -153,7 +154,11 @@ func (s *Service) resumeOnce(ctx context.Context, ref PendingReference) (resumeS
 		}
 		return resumeSkipped, err
 	}
+	if status == resumeWaiting {
+		s.obs.Retry("references", "waiting")
+	}
 	if done != nil {
+		s.obs.Result("references", string(done.Kind()), string(done.Status()), false)
 		s.log.InfoContext(ctx, "pending reference resolved",
 			"transactionId", done.ID(), "walletId", done.WalletID(), "providerId", done.External().ProviderID,
 			"kind", done.Kind(), "status", done.Status(), "failureCode", done.FailureCode())

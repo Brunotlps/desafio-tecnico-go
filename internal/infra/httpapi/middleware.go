@@ -66,6 +66,9 @@ func (h *Handler) observe(next http.Handler) http.Handler {
 					writeProblem(rec, http.StatusInternalServerError, "INTERNAL_ERROR", "unexpected error")
 				}
 			}
+			if h.metrics != nil && r.Pattern == "POST /wagering/transactions" {
+				h.metrics.Duration("http_submit", time.Since(start))
+			}
 			attrs := []any{"method", r.Method, "route", r.Pattern, "status", rec.status,
 				"durationMs", time.Since(start).Milliseconds(), "correlationId", corr}
 			if info.clientID != "" {

@@ -589,8 +589,8 @@ func TestUpgradeAndRollbackPreserveTheOutbox(t *testing.T) {
 	if _, err := mig.Up(ctx); err != nil {
 		t.Fatalf("up to the final version: %v", err)
 	}
-	if v := schemaVersion(t, conn); v != 7 {
-		t.Fatalf("schema %d, want 7", v)
+	if v := schemaVersion(t, conn); v != finalVersion(t) {
+		t.Fatalf("schema %d, want the final version %d", v, finalVersion(t))
 	}
 	same("after up", v6, snapshot(conn))
 	var leased int64
@@ -625,8 +625,8 @@ func TestUpgradeAndRollbackPreserveTheOutbox(t *testing.T) {
 	}
 
 	// Reversão: a reserva (transitória) é descartada; eventos, agenda, tentativas, diagnóstico e marcadores permanecem.
-	if _, err := mig.Down(ctx); err != nil {
-		t.Fatalf("down: %v", err)
+	if _, err := mig.DownTo(ctx, 6); err != nil { // desfaz a 00008 (inbox) e a 00007 (reserva); as colunas duráveis da outbox permanecem
+		t.Fatalf("down to 6: %v", err)
 	}
 	if v := schemaVersion(t, conn); v != 6 {
 		t.Fatalf("schema %d after down, want 6", v)

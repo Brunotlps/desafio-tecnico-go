@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -154,11 +155,15 @@ func (s *Service) Reconcile(ctx context.Context, walletID uuid.UUID) (Reconcilia
 	defer cancel()
 	snap, err := s.ledger.ReconciliationSnapshot(ctx, walletID)
 	if err != nil {
+		if !errors.Is(err, ErrWalletNotFound) {
+			s.obs.Reconciliation("error")
+		}
 		return ReconciliationResult{}, err
 	}
 	fail := func(format string, args ...any) (ReconciliationResult, error) {
 		err := fmt.Errorf("%w: "+format, append([]any{ErrReconciliationFailed}, args...)...)
 		s.log.ErrorContext(ctx, "reconciliation failed", "walletId", walletID, "error", err.Error())
+		s.obs.Reconciliation("error")
 		return ReconciliationResult{}, err
 	}
 	if snap.ForeignCurrencyEntries != 0 || snap.NetMinor == nil || snap.Wallet == nil {

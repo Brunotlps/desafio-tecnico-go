@@ -18,6 +18,7 @@ const (
 	constraintIdempotencyKey       = "uq_wager_tx_provider_idempotency_key"
 	constraintExternalID           = "uq_wager_tx_provider_external_id"
 	constraintOneReversalPerTarget = "uq_wager_tx_one_reversal_per_target"
+	constraintInboxIdentity        = "inbox_messages_pkey"
 )
 
 // classify traduz erros do driver. Violações de unicidade conhecidas viram
@@ -39,6 +40,8 @@ func classify(err error) error {
 				return app.ErrDuplicateExternalTransaction
 			case constraintOneReversalPerTarget:
 				return app.ErrReversalTargetTaken
+			case constraintInboxIdentity:
+				return app.ErrDuplicateInbox
 			}
 		}
 		if isTransientCode(pgErr.Code) {

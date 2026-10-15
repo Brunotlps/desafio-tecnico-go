@@ -725,7 +725,7 @@ func TestMigrateCommandPreservesTheScheduleAcrossDownAndUp(t *testing.T) {
 	before := readSchedules(t, d.owner)
 
 	bin := t.TempDir() + "/migrate"
-	build := exec.Command("go", "build", "-o", bin, "./cmd/migrate")
+	build := exec.Command("go", "build", "-race", "-o", bin, "./cmd/migrate")
 	build.Dir = "../.."
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build migrate: %v\n%s", err, out)

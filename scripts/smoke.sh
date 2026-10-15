@@ -116,4 +116,38 @@ AUDIT=$($COMPOSE exec -T ministack awslocal sqs get-queue-url --queue-name wager
 DELIVERED=$($COMPOSE exec -T ministack awslocal sqs get-queue-attributes --queue-url "$AUDIT" --attribute-names ApproximateNumberOfMessages --query Attributes.ApproximateNumberOfMessages --output text | tr -d '[:space:]')
 [ "${DELIVERED:-0}" -gt 0 ] || fail "no event reached the subscriber of the event topic"
 ok "events delivered to the subscribed audit queue ($DELIVERED)"
+
+# Entrada por SQS: o produtor INTERNO (principal wager-producer) vincula a origem ao providerId; o consumidor trata com o mesmo núcleo
+# do HTTP (inbox e finanças no mesmo commit) e o resultado fica consultável pela API.
+envelope() { # providerId externalId
+  jq -nc --arg m "msg-$RUN-$2" --arg pr "$1" --arg ext "$2" --arg w "$WID" --arg p "$PLAYER" \
+    '{messageId:$m,type:"WagerTransactionRequested",occurredAt:"2026-09-08T12:00:00.000Z",data:{providerId:$pr,externalTransactionId:$ext,idempotencyKey:($pr+":"+$ext),playerId:$p,walletId:$w,roundId:"round-1",gameId:"fortune-chimp",kind:"BET",money:{amount:"10.00",currency:"BRL"}}}'
+}
+producer() { $COMPOSE run --rm -T -e PRODUCER_CLIENT_ID="$1" -e PRODUCER_CLIENT_SECRET="$2" sqs-producer; }
+SQSEXT="sqs-$RUN"
+producer provider-a provider-a-dev-secret <<<"$(envelope provider-a "$SQSEXT")" | grep -q "published msg-$RUN-$SQSEXT" || fail "the internal producer did not publish the envelope"
+ok "internal producer published an envelope for provider-a"
+for _ in $(seq 1 40); do
+  S=$(req GET "/providers/provider-a/wagering/transactions/$SQSEXT" "$PA")
+  [ "${S%% *}" = "200" ] && break
+  sleep 1
+done
+expect "the SQS message was consumed (same core as HTTP)" "$S" 200 '.status == "PROCESSED" and .balance.amount == "90.00"'
+expect "wallet balance after the SQS BET" "$(req GET "/wallets/$WID" "$INTERNAL")" 200 '.balance.amount == "90.00"'
+if producer provider-a provider-a-dev-secret <<<"$(envelope provider-b "other-$RUN")" >/dev/null 2>&1; then
+  fail "provider-a published an envelope for provider-b"
+fi
+ok "provider-a cannot publish as provider-b (refused before any send)"
+
+# Métricas: somente o serviço interno; categorias com observações reais.
+expect "metrics require authentication" "$(req GET /metrics)" 401
+expect "providers cannot read the metrics" "$(req GET /metrics "$PA")" 403
+M=$(curl -sf -H "Authorization: Bearer $INTERNAL" "$API/metrics") || fail "internal-service could not read /metrics"
+for series in 'wager_transactions_total{origin="http"' 'wager_transactions_total{origin="sqs"' 'wager_inbox_total{outcome="new"}' wager_outbox_pending \
+  wager_outbox_oldest_pending_age_seconds 'wager_processing_seconds_count{component="http_submit"}' 'wager_processing_seconds_count{component="sqs_message"}' \
+  'wager_collector_up{source="dlq"} 1' 'wager_collector_up{source="outbox"} 1' wager_dlq_messages_approx wager_retries_total wager_reconciliation_divergences_total \
+  wager_concurrency_conflicts_total wager_dlq_forwarded_total; do
+  grep -qF "$series" <<<"$M" || fail "metric $series is missing"
+done
+ok "metrics: authorization and every category exposed"
 echo "smoke OK"

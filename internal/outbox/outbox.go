@@ -108,6 +108,13 @@ func (c Config) Validate() error {
 // protegem o estado, mas uma lease apertada demais só produziria republicações.
 const MinLeaseMargin = 5 * time.Second
 
+// Hooks são pontos de observação opcionais (métricas), chamados depois da decisão/commit correspondente.
+type Hooks struct {
+	Published func(d time.Duration) // publicação confirmada (duração da tentativa: reserva até a confirmação)
+	Retry     func(reason string)   // falha de publicação agendada para nova tentativa; reason de um conjunto limitado
+	LeaseLost func()                // a posse se perdeu antes da escrita final (o evento segue recuperável)
+}
+
 // Publisher é o componente (lifecycle.Component) que executa os executores.
 type Publisher struct {
 	store Store
@@ -124,6 +131,7 @@ type Publisher struct {
 	wg                  sync.WaitGroup
 	deadline            atomic.Pointer[time.Time]
 	rand                func(n int64) int64 // injetável nos testes
+	hooks               Hooks
 }
 
 // New cria o componente. Nada roda antes de Start.
@@ -132,6 +140,9 @@ func New(store Store, sink Sink, cfg Config, log *slog.Logger) *Publisher {
 	p.runCtx, p.cancel = context.WithCancel(context.Background())
 	return p
 }
+
+// WithHooks registra os pontos de observação (antes de Start).
+func (p *Publisher) WithHooks(h Hooks) *Publisher { p.hooks = h; return p }
 
 func (p *Publisher) Name() string { return "outbox-publisher" }
 
@@ -187,6 +198,7 @@ func (p *Publisher) run(worker int) {
 // Step executa um ciclo completo (reservar, publicar, confirmar/retry/liberar) e devolve se havia um evento. É exportado
 // para os testes controlarem o ritmo; o componente o chama em laço.
 func (p *Publisher) Step() bool {
+	began := time.Now()
 	rctx, cancel := context.WithTimeout(p.runCtx, p.cfg.SQLTimeout)
 	res, err := p.store.Reserve(rctx, p.cfg.Lease)
 	cancel()
@@ -220,6 +232,8 @@ func (p *Publisher) Step() bool {
 	case perr == nil:
 		if err := p.store.Confirm(fctx, *res); err != nil {
 			p.logFinish("confirm", *res, err) // enviado e não confirmado: a lease vence e o evento é republicado (mesmo eventId)
+		} else if p.hooks.Published != nil {
+			p.hooks.Published(time.Since(began))
 		}
 	case p.runCtx.Err() != nil:
 		// Encerramento: não é uma falha do evento. Libera a reserva (se ainda for nossa); a expiração garante a recuperação.
@@ -230,6 +244,9 @@ func (p *Publisher) Step() bool {
 		delay := p.backoff(res.Attempts)
 		p.log.Warn("outbox publish failed; scheduled retry", "eventId", res.EventID, "type", res.Type, "attempts", res.Attempts,
 			"retryIn", delay.Round(time.Millisecond).String(), "error", sanitize(perr.Error()))
+		if p.hooks.Retry != nil {
+			p.hooks.Retry(publishFailureReason(perr))
+		}
 		if err := p.store.Retry(fctx, *res, delay, sanitize(perr.Error())); err != nil {
 			p.logFinish("retry", *res, err)
 		}
@@ -246,6 +263,9 @@ func (p *Publisher) publish(ctx context.Context, r Reservation) error {
 
 func (p *Publisher) logFinish(action string, r Reservation, err error) {
 	if errors.Is(err, ErrLeaseLost) {
+		if p.hooks.LeaseLost != nil {
+			p.hooks.LeaseLost()
+		}
 		p.log.Warn("outbox lease lost before "+action+"; the event stays recoverable", "eventId", r.EventID)
 		return
 	}
@@ -298,4 +318,15 @@ func sanitize(s string) string {
 		s = strings.ToValidUTF8(s[:maxErrorLen], "") + "…"
 	}
 	return s
+}
+
+// publishFailureReason classifica uma falha de publicação num conjunto limitado de motivos.
+func publishFailureReason(err error) string {
+	switch {
+	case errors.Is(err, ErrInvalidEvent):
+		return "invalid_event"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	}
+	return "broker"
 }

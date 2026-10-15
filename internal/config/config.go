@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"desafio-tecnico-go/internal/domain"
+	"desafio-tecnico-go/internal/inbound"
 	"desafio-tecnico-go/internal/outbox"
 )
 
@@ -44,6 +45,19 @@ type Config struct {
 	OutboxAWSProfile      string        // perfil do principal publisher no arquivo de credenciais (padrão wager-publisher)
 	SNSEventTopicARN      string        // ARN do tópico FIFO de saída
 	OutboxCredentialsFile string        // arquivo de credenciais do perfil do publisher (padrão: AWS_SHARED_CREDENTIALS_FILE)
+
+	// Consumidor SQS (incremento 4). SQSConsumers = 0 desliga a entrada por SQS neste processo.
+	SQSConsumers           int           // executores por processo (padrão 4)
+	ConsumerName           string        // estável entre instâncias e reinícios (padrão wager-consumer; nunca hostname/PID)
+	SQSDLQName             string        // DLQ (encaminhamento manual de mensagens permanentes)
+	ConsumerReceiveWait    time.Duration // long polling (padrão 10s), cancelável
+	ConsumerPhaseTimeout   time.Duration // fase financeira de uma tentativa (padrão 10s)
+	ConsumerIOTimeout      time.Duration // cada ação de transporte / diagnóstico (padrão 5s)
+	ConsumerBackoffInitial time.Duration // padrão 5s
+	ConsumerBackoffMax     time.Duration // padrão 60s
+	ConsumerPauseMax       time.Duration // teto da pausa das buscas em falha global (padrão 30s)
+	SQSCredentialsFile     string        // opcional: arquivo de credenciais do cliente SQS (padrão: cadeia padrão do SDK, perfil de runtime)
+	SQSAWSProfile          string        // perfil nesse arquivo (padrão wager-runtime)
 
 	DatabaseURL string
 	DBMaxConns  int32
@@ -115,6 +129,16 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		OutboxAWSProfile:        get("OUTBOX_AWS_PROFILE", "wager-publisher"),
 		SNSEventTopicARN:        get("SNS_EVENT_TOPIC_ARN", ""),
 		OutboxCredentialsFile:   get("OUTBOX_CREDENTIALS_FILE", get("AWS_SHARED_CREDENTIALS_FILE", "")),
+		ConsumerName:            get("CONSUMER_NAME", "wager-consumer"),
+		SQSDLQName:              get("SQS_DLQ_NAME", "wager-transactions-dlq.fifo"),
+		ConsumerReceiveWait:     duration("CONSUMER_RECEIVE_WAIT", "10s"),
+		ConsumerPhaseTimeout:    duration("CONSUMER_PHASE_TIMEOUT", "10s"),
+		ConsumerIOTimeout:       duration("CONSUMER_IO_TIMEOUT", "5s"),
+		ConsumerBackoffInitial:  duration("CONSUMER_BACKOFF_INITIAL", "5s"),
+		ConsumerBackoffMax:      duration("CONSUMER_BACKOFF_MAX", "60s"),
+		ConsumerPauseMax:        duration("CONSUMER_PAUSE_MAX", "30s"),
+		SQSCredentialsFile:      get("SQS_CREDENTIALS_FILE", ""),
+		SQSAWSProfile:           get("SQS_AWS_PROFILE", "wager-runtime"),
 		DatabaseURL:             required("DATABASE_URL"),
 		OIDCIssuer:              required("OIDC_ISSUER"),
 		OIDCJWKSURL:             required("OIDC_JWKS_URL"),
@@ -139,6 +163,12 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		errs = append(errs, errors.New("REFERENCE_WORKERS must be 0 or 1"))
 	}
 	c.ReferenceWorkers = int(workers)
+
+	consumers, err := strconv.ParseInt(get("SQS_CONSUMERS", "4"), 10, 32)
+	if err != nil {
+		errs = append(errs, errors.New("SQS_CONSUMERS must be an integer between 0 and 16"))
+	}
+	c.SQSConsumers = int(consumers)
 
 	publishers, err := strconv.ParseInt(get("OUTBOX_PUBLISHERS", "1"), 10, 32)
 	if err != nil {
@@ -203,6 +233,7 @@ func (c Config) Validate() error {
 		errs = append(errs, errors.New("REFERENCE_PHASE_TIMEOUT must be shorter than SHUTDOWN_TIMEOUT"))
 	}
 	errs = append(errs, c.validateOutbox()...)
+	errs = append(errs, c.validateConsumer()...)
 	return errors.Join(errs...)
 }
 
@@ -231,6 +262,39 @@ func (c Config) validateOutbox() []error {
 	}
 	if reserve := c.ShutdownTimeout - c.ShutdownDrain; c.OutboxSQLTimeout >= reserve {
 		errs = append(errs, errors.New("OUTBOX_SQL_TIMEOUT must be shorter than the shutdown reserve (SHUTDOWN_TIMEOUT - SHUTDOWN_DRAIN_TIMEOUT)"))
+	}
+	return errs
+}
+
+// ConsumerConfig devolve a configuração do consumidor derivada desta configuração.
+func (c Config) ConsumerConfig() inbound.Config {
+	return inbound.Config{
+		Workers: c.SQSConsumers, ConsumerName: c.ConsumerName, SourceQueue: c.SQSWagerQueue, ReceiveWait: c.ConsumerReceiveWait,
+		PhaseTimeout: c.ConsumerPhaseTimeout, IOTimeout: c.ConsumerIOTimeout, BackoffInitial: c.ConsumerBackoffInitial,
+		BackoffMax: c.ConsumerBackoffMax, PauseMax: c.ConsumerPauseMax, Visibility: QueueVisibility,
+	}
+}
+
+// QueueVisibility é o visibility timeout provisionado da fila de entrada (broker.DefaultVisibility); só serve à validação.
+const QueueVisibility = 60 * time.Second
+
+// validateConsumer confere o consumidor SQS. Com SQSConsumers = 0 nada é exigido (entrada por SQS desligada).
+func (c Config) validateConsumer() []error {
+	if c.SQSConsumers == 0 {
+		return nil
+	}
+	var errs []error
+	if err := c.ConsumerConfig().Validate(); err != nil {
+		errs = append(errs, fmt.Errorf("consumer: %w", err))
+	}
+	if c.SQSDLQName == "" {
+		errs = append(errs, errors.New("SQS_DLQ_NAME is required when SQS_CONSUMERS > 0"))
+	}
+	if c.ConsumerPhaseTimeout >= c.ShutdownTimeout {
+		errs = append(errs, errors.New("CONSUMER_PHASE_TIMEOUT must be shorter than SHUTDOWN_TIMEOUT"))
+	}
+	if reserve := c.ShutdownTimeout - c.ShutdownDrain; c.ConsumerIOTimeout >= reserve {
+		errs = append(errs, errors.New("CONSUMER_IO_TIMEOUT must be shorter than the shutdown reserve (SHUTDOWN_TIMEOUT - SHUTDOWN_DRAIN_TIMEOUT)"))
 	}
 	return errs
 }

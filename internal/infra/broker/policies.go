@@ -44,10 +44,11 @@ func policyFor(role Role, r Resources) string {
 		// Produtor interno confiável: só envia à entrada. Sem consumo, remoção, DLQ ou SNS.
 		st = []statement{allow("SendToTheInputQueue", []string{"sqs:SendMessage", "sqs:GetQueueUrl"}, r.InputARN)}
 	case Runtime:
-		// Consumidor: ciclo de vida da mensagem na entrada e envio à DLQ (encaminhamento manual).
+		// Consumidor: ciclo de vida da mensagem na entrada, envio à DLQ (encaminhamento manual) e leitura da profundidade da DLQ.
 		st = []statement{
 			allow("ConsumeTheInputQueue", []string{"sqs:GetQueueUrl", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility"}, r.InputARN),
-			allow("ForwardToTheDLQ", []string{"sqs:GetQueueUrl", "sqs:SendMessage"}, r.DLQARN),
+			// GetQueueAttributes só na DLQ: a leitura aproximada da sua profundidade para a métrica (nada de inspector/admin).
+			allow("ForwardToTheDLQ", []string{"sqs:GetQueueUrl", "sqs:SendMessage", "sqs:GetQueueAttributes"}, r.DLQARN),
 		}
 	case Publisher:
 		// Publisher: publica no tópico de saída; GetTopicAttributes para descobrir/validar o tópico.

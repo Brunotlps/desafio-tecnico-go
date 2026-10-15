@@ -320,7 +320,7 @@ func TestUpIsRefusedBeforeLossWhenTheLiveScheduleIsNotTheIntactReconstruction(t 
 func buildMigrate(t *testing.T) string {
 	t.Helper()
 	bin := t.TempDir() + "/migrate"
-	build := exec.Command("go", "build", "-o", bin, "./cmd/migrate")
+	build := exec.Command("go", "build", "-race", "-o", bin, "./cmd/migrate")
 	build.Dir = "../.."
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build migrate: %v\n%s", err, out)

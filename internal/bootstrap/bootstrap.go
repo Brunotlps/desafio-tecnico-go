@@ -8,18 +8,21 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"time"
 
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxevent"
 
 	"desafio-tecnico-go/internal/app"
 	"desafio-tecnico-go/internal/config"
+	"desafio-tecnico-go/internal/inbound"
 	"desafio-tecnico-go/internal/infra/auth"
 	"desafio-tecnico-go/internal/infra/httpapi"
 	"desafio-tecnico-go/internal/infra/postgres"
 	"desafio-tecnico-go/internal/infra/sns"
 	"desafio-tecnico-go/internal/infra/sqs"
 	"desafio-tecnico-go/internal/lifecycle"
+	"desafio-tecnico-go/internal/metrics"
 	"desafio-tecnico-go/internal/outbox"
 )
 
@@ -35,8 +38,10 @@ func Options(cfg config.Config) fx.Option {
 		loggingModule,
 		persistenceModule,
 		authModule,
+		metricsModule,
 		messagingModule,
 		outboxModule(cfg),
+		consumerModule(cfg),
 		applicationModule,
 		httpModule,
 		lifecycleModule,
@@ -80,9 +85,10 @@ var authModule = fx.Module("auth",
 
 var messagingModule = fx.Module("messaging",
 	fx.Provide(func(cfg config.Config) (*sqs.Client, error) {
-		return sqs.NewClient(context.Background(), sqs.Config{
-			Region: cfg.AWSRegion, EndpointURL: cfg.AWSEndpointURL, QueueName: cfg.SQSWagerQueue,
-		})
+		sc := sqs.Config{Region: cfg.AWSRegion, EndpointURL: cfg.AWSEndpointURL, QueueName: cfg.SQSWagerQueue,
+			CredentialsFile: cfg.SQSCredentialsFile, Profile: cfg.SQSAWSProfile}
+		sc.DLQName = cfg.SQSDLQName // o consumidor a usa para encaminhar e a métrica lê sua profundidade; a readiness a confere
+		return sqs.NewClient(context.Background(), sc)
 	}),
 	// Valida a dependência no início, sem esperar o primeiro /health/ready.
 	fx.Invoke(func(lc fx.Lifecycle, c *sqs.Client) {
@@ -106,12 +112,16 @@ func outboxModule(cfg config.Config) fx.Option {
 				})
 			},
 			func(db *postgres.Database) *postgres.OutboxStore { return postgres.NewOutboxStore(db) },
-			func(cfg config.Config, store *postgres.OutboxStore, sink *sns.Publisher, log *slog.Logger) *outbox.Publisher {
+			func(cfg config.Config, store *postgres.OutboxStore, sink *sns.Publisher, reg *metrics.Registry, log *slog.Logger) *outbox.Publisher {
 				return outbox.New(store, sink, outbox.Config{
 					Workers: cfg.OutboxPublishers, Lease: cfg.OutboxLease, PublishTimeout: cfg.OutboxPublishTimeout,
 					SQLTimeout: cfg.OutboxSQLTimeout, PollInterval: cfg.OutboxPollInterval,
 					BackoffInitial: cfg.OutboxBackoffInitial, BackoffMax: cfg.OutboxBackoffMax,
-				}, log)
+				}, log).WithHooks(outbox.Hooks{
+					Published: func(d time.Duration) { reg.OutboxPublished(); reg.Duration("outbox_publish", d) },
+					Retry:     func(reason string) { reg.Retry("outbox", reason) },
+					LeaseLost: func() { reg.Conflict("outbox_lease_lost") },
+				})
 			},
 		),
 		fx.Invoke(func(lc fx.Lifecycle, p *sns.Publisher) {
@@ -120,28 +130,74 @@ func outboxModule(cfg config.Config) fx.Option {
 	)
 }
 
+// consumerModule compõe o consumidor SQS quando SQS_CONSUMERS > 0. Usa o cliente SQS do runtime (receber, remover, visibilidade e
+// envio à DLQ) e o mesmo Service do HTTP (inbox e finanças no mesmo commit).
+func consumerModule(cfg config.Config) fx.Option {
+	if cfg.SQSConsumers == 0 {
+		return fx.Options()
+	}
+	return fx.Module("consumer", fx.Provide(func(cfg config.Config, svc *app.Service, q *sqs.Client, reg *metrics.Registry, log *slog.Logger) *inbound.Consumer {
+		return inbound.New(svc, q, cfg.ConsumerConfig(), log, inbound.Hooks{
+			Retry:        func(reason string) { reg.Retry("consumer", reason) },
+			DLQForwarded: reg.DLQForwarded,
+			Latency:      func(d time.Duration, _ string) { reg.Duration("sqs_message", d) },
+		})
+	}))
+}
+
+// metricsModule: o registro de métricas e os coletores sob demanda (backlog da outbox e profundidade aproximada da DLQ). Cada coletor tem
+// prazo curto (impõe o Registry); se falhar, as amostras são omitidas e wager_collector_up marca a fonte como indisponível.
+var metricsModule = fx.Module("metrics",
+	fx.Provide(metrics.New),
+	fx.Invoke(func(reg *metrics.Registry, db *postgres.Database, q *sqs.Client) {
+		store := postgres.NewOutboxStore(db)
+		reg.AddCollector(metrics.Collector{Source: "outbox", Collect: func(ctx context.Context) ([]metrics.Sample, error) {
+			st, err := store.Stats(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return []metrics.Sample{
+				{Name: "wager_outbox_pending", Help: "Eventos da outbox ainda não publicados (inclui em retry e reservados).", Value: float64(st.Pending)},
+				{Name: "wager_outbox_reserved", Help: "Dos pendentes, os sob uma lease válida de algum publisher.", Value: float64(st.Reserved)},
+				{Name: "wager_outbox_oldest_pending_age_seconds", Help: "Idade do evento não publicado mais antigo (0 sem backlog).", Value: st.OldestPending.Seconds()},
+			}, nil
+		}})
+		reg.AddCollector(metrics.Collector{Source: "dlq", Collect: func(ctx context.Context) ([]metrics.Sample, error) {
+			visible, inFlight, err := q.DLQDepth(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return []metrics.Sample{
+				{Name: "wager_dlq_messages_approx", Help: "Profundidade APROXIMADA da DLQ segundo o broker (diferente do contador de envios manuais confirmados).", Labels: `state="visible"`, Value: float64(visible)},
+				{Name: "wager_dlq_messages_approx", Help: "Profundidade APROXIMADA da DLQ segundo o broker (diferente do contador de envios manuais confirmados).", Labels: `state="in_flight"`, Value: float64(inFlight)},
+			}, nil
+		}})
+	}),
+)
+
 var applicationModule = fx.Module("application",
 	fx.Provide(
-		func(uow app.UnitOfWork, store *postgres.Store, cfg config.Config, log *slog.Logger) *app.Service {
+		func(uow app.UnitOfWork, store *postgres.Store, reg *metrics.Registry, cfg config.Config, log *slog.Logger) *app.Service {
 			return app.NewService(uow, app.Config{
 				AllowedCurrencies: cfg.AllowedCurrencies,
 				Reference: app.ReferenceConfig{
 					TTL: cfg.ReferenceTTL, BackoffInitial: cfg.ReferenceBackoffInitial, BackoffMax: cfg.ReferenceBackoffMax,
 					PollInterval: cfg.ReferencePollInterval, PhaseTimeout: cfg.ReferencePhaseTimeout,
 				},
-			}, log, app.WithLedgerReader(store))
+			}, log, app.WithObserver(reg), app.WithReconciliationObserver(func(app.ReconciliationResult) { reg.DivergenceDetected() }),
+				app.WithLedgerReader(store))
 		},
 		func(svc *app.Service, log *slog.Logger) *app.ReferenceWorker { return app.NewReferenceWorker(svc, log) },
 	),
 )
 
 var httpModule = fx.Module("http",
-	fx.Provide(func(cfg config.Config, svc *app.Service, v *auth.Verifier, db *postgres.Database, q *sqs.Client, log *slog.Logger) *httpapi.Server {
+	fx.Provide(func(cfg config.Config, svc *app.Service, v *auth.Verifier, db *postgres.Database, q *sqs.Client, reg *metrics.Registry, log *slog.Logger) *httpapi.Server {
 		checks := []httpapi.ReadinessCheck{
 			{Name: "postgres", Check: db.Ping},
 			{Name: "sqs", Check: q.Ready},
 		}
-		return httpapi.NewServer(cfg.HTTPAddr, httpapi.New(svc, v, checks, log, cfg.RequestTimeout), log)
+		return httpapi.NewServer(cfg.HTTPAddr, httpapi.New(svc, v, checks, log, cfg.RequestTimeout, httpapi.WithMetrics(reg)), log)
 	}),
 	// O servidor é um componente do coordenador (ver lifecycleModule): não tem hook próprio.
 )
@@ -164,6 +220,7 @@ var lifecycleModule = fx.Module("lifecycle",
 		Worker    *app.ReferenceWorker
 		Server    *httpapi.Server
 		Publisher *outbox.Publisher `optional:"true"` // só existe com OUTBOX_PUBLISHERS > 0
+		Consumer  *inbound.Consumer `optional:"true"` // só existe com SQS_CONSUMERS > 0
 	}) {
 		lc, cfg, c, worker, server := p.Lifecycle, p.Config, p.Coord, p.Worker, p.Server
 		// Ordem de início: os executores (referências e publisher) primeiro; a porta HTTP, que admite entradas, por último.
@@ -173,6 +230,10 @@ var lifecycleModule = fx.Module("lifecycle",
 		if p.Publisher != nil {
 			c.OnShutdown(p.Publisher.SetShutdownDeadline)
 			c.Add(p.Publisher)
+		}
+		if p.Consumer != nil {
+			c.OnShutdown(p.Consumer.SetShutdownDeadline)
+			c.Add(p.Consumer)
 		}
 		c.Add(server)
 		lc.Append(fx.Hook{OnStart: c.Start, OnStop: c.Stop})
