@@ -72,8 +72,8 @@ operations; and the **outbox publisher** (`internal/outbox`) publishes the commi
   ```
 
   A **transient** failure (database unavailable, timeout, uncertain commit) **aborts the attempt** and produces no state: the
-  client repeats with the same key. `FAILED` is reserved for a **permanent** infrastructure failure that needs to remain
-  auditable (e.g., a message exhausted on the DLQ, in the SQS increment). `REJECTED` = a business rule, with a `failureCode`.
+  client repeats with the same key. `FAILED` exists in the domain for auditable permanent failures, but the current consumer does not create
+  a `FAILED` transaction when forwarding a message to the DLQ: it records `message_diagnostics`; an already committed operation keeps its state. `REJECTED` = a business rule, with a `failureCode`.
   **Validation and encapsulation**: `ExternalRequest` is immutable (private fields, getters only, a single constructor
   `NewExternalRequest`) and its hash is derived from the validated fields, so business fields and hash do not diverge;
   `NewExternalTransaction` still revalidates the request (including coherence with the hash) and rejects the zero value.
@@ -494,7 +494,7 @@ loss does **not** fix it; since 00005 cannot be rewritten, the fix is composite 
 * **Restoration** (00006, on reapplication): replaces the rows rebuilt by 00005's `Up` with the original values, including the completed ones,
   disabling the immutability trigger only during the restoration (owner, under writer exclusion), fires the deferred checks and removes the copy.
   A copy without a matching transaction is refused with count and ids (preflight), not discarded; a restoration that fails leaves the copy (the migration is transactional).
-* **Destructive reset ≠ operational rollback**: `down-to 0` deletes everything, as always, and also discards the copy; `down`/`down-to N>0` preserve it.
+* **Destructive reset ≠ operational rollback**: `down-to 0` deletes everything, as always, and also discards the copy; `down`/`down-to N>0` preserve **the schedule** through the migrator; reverting 00008 deletes inbox and diagnostics.
 * Limits: the exclusion is by privilege — the owner and superusers (the operator) are not excluded, and a `SECURITY DEFINER` view/function of another owner that writes to the schedule is not detected;
   00005's `Down` run directly through goose is not protected; data that never had a schedule (a `PENDING_REFERENCE` created by SQL before 00005) receives 00005's rebuilt schedule.
 * Tests: `audit_regressions_test.go` (a cycle preserving an expired deadline, attempts, diagnostic and completed schedules; the window observed with the `DROP` held by an open read; a database still at version 5;
@@ -633,7 +633,7 @@ never runs with them (§10.1); `LOSS`'s `result_balance` cannot be verified agai
 is refused by the domain and handled by whoever calls the transition (§3, §8); IdP key rotation may cause 401 for up to 30 s (§9). From the
 reversal policy (§8): the BET's `ROLLBACK` after the REFUND's `ROLLBACK` is refused (a contract choice, not one of financial viability). From the pending operations: the TTL and the backoff use the application's clock (the difference between instances shifts the deadline, never renews it); a
 wallet that is continuously busy or has a localized failure only delays the resumption of its own pending operations (the query skips it with the same `FOR UPDATE SKIP LOCKED` as the attempt, the failure defers the schedule with backoff and the scan moves on to the others); the worker has no lease (exclusion is by the locks
-and by revalidation). From the tests: the real-process harness compiles the API and migration binaries **with `-race`** and fails a test on a race, `panic` or `fatal error` in a child's output (an adaptation delivered in the final consolidation; the parent's `go test -race` does not instrument separate binaries, which is why the children are built that way). The schedule's protection on rollback is in the migrator (`Migrator`), not in 00005's published SQL: 00005's `Down` run directly through goose, without the migrator, does not preserve the schedule; writer exclusion is by privilege (the owner and superusers are not excluded).
+and by revalidation). From the tests: the real-process harness compiles the API and migration binaries **with `-race`**; the API's multi-process harness fails a test on a race, `panic` or `fatal error` in a child's output. The migration CLI tests check the output according to each scenario. The parent's `go test -race` does not instrument separate binaries, which is why the children are built that way. The schedule's protection on rollback is in the migrator (`Migrator`), not in 00005's published SQL: 00005's `Down` run directly through goose, without the migrator, does not preserve the schedule; writer exclusion is by privilege (the owner and superusers are not excluded).
 
 ## 15. Reads: paginated ledger and reconciliation
 

@@ -26,9 +26,9 @@ técnica** ou **pendência**. O estado de implementação está no fim e no READ
 
 * **Domínio** (`internal/domain`) não importa Fx, HTTP, SQS nem pgx. Depende só da biblioteca padrão e de `google/uuid`.
 * **Aplicação** (`internal/app`) orquestra casos de uso e define as portas (`UnitOfWork`, repositórios).
-* **Infraestrutura** (`internal/infra/*`) implementa as portas e as entradas. **Entradas**: HTTP agora; SQS depois,
-  chamando o mesmo `app.Service.Submit`.
-* Sem hierarquias genéricas: uma interface por necessidade concreta (`UnitOfWork`, os cinco repositórios — carteiras, transações, ledger, outbox e agenda de pendências —,
+* **Infraestrutura** (`internal/infra/*`) implementa as portas e as entradas. **Entradas**: HTTP e SQS (`Service.ProcessMessage`),
+  chamando o mesmo núcleo financeiro `processExternal`; a entrada SQS inclui a inbox no mesmo commit (§7).
+* Sem hierarquias genéricas: uma interface por necessidade concreta (`UnitOfWork`, os repositórios — carteiras, transações, ledger, outbox, agenda de pendências, inbox e diagnósticos —,
   `httpapi.Service`/`TokenVerifier` para os handlers). Divergência das recomendações iniciais do prompt: **nenhuma**.
 
 ## 2. Dinheiro (requisito §5.1, §6.1)
@@ -68,8 +68,8 @@ técnica** ou **pendência**. O estado de implementação está no fim e no READ
   ```
 
   Falha **transitória** (banco indisponível, timeout, commit incerto) **aborta a tentativa** e não gera estado: o
-  cliente repete com a mesma chave. `FAILED` é reservado a falha **permanente** de infraestrutura que precise ficar
-  auditável (ex.: mensagem esgotada na DLQ, no incremento do SQS). `REJECTED` = regra de negócio, com `failureCode`.
+  cliente repete com a mesma chave. `FAILED` existe no domínio para falhas permanentes auditáveis, mas o consumidor atual não cria
+  uma transação `FAILED` ao enviar uma mensagem à DLQ: registra `message_diagnostics`; uma operação já confirmada preserva seu estado. `REJECTED` = regra de negócio, com `failureCode`.
   **Validação e encapsulamento**: `ExternalRequest` é imutável (campos privados, só getters, único construtor
   `NewExternalRequest`) e seu hash é derivado dos campos validados, portanto campos de negócio e hash não divergem;
   `NewExternalTransaction` ainda revalida a requisição (inclusive a coerência com o hash) e rejeita o valor zero.
@@ -100,7 +100,7 @@ técnica** ou **pendência**. O estado de implementação está no fim e no READ
 
 * **Biblioteca**: `pgx/v5` com SQL explícito (sem ORM). `Store` implementa `app.UnitOfWork`:
   `Do(ctx, fn)` abre **uma** transação `READ COMMITTED` e entrega a `fn` repositórios (`Wallets`, `Transactions`,
-  `Ledger`, `Outbox`) **vinculados à mesma `pgx.Tx`**. Leituras sem transação usam `Reader()` (repositórios sobre o pool).
+  `Ledger`, `Outbox`, `Pending`, `Inbox`, `Diagnostics`) **vinculados à mesma `pgx.Tx`**. Leituras sem transação usam `Reader()` (repositórios sobre o pool).
   Os repositórios dependem de uma interface mínima (`Exec/Query/QueryRow`) satisfeita por pool e transação.
 * **Mapeamento de Money**: `BIGINT` em centavos + `currency TEXT`; reconstruído com `FromMinor`.
 * **Locking pessimista por carteira**: `SELECT … FROM wallets WHERE id = $1 FOR UPDATE` no início de toda operação
@@ -303,7 +303,7 @@ continuidade durável.
   operação **original** — mesmo id, hash e chave; não recria nada nem usa reidratação como mutação — e conclui estado, saldo, ledger, outbox e
   agenda no mesmo commit; ou apenas reagenda (`next_attempt_at`, `attempts`), sem repetir o evento inicial. Backoff **persistido**:
   exponencial a partir de 1 s, teto 30 s, jitter uniforme em `[d/2, d]` (nunca acima do teto); nenhuma transação ou lock é mantido durante o backoff.
-* **Ordem única de locks** (HTTP, retomada e a futura entrada SQS): **carteira → agenda da pendência → linha da transação**. O caminho HTTP
+* **Ordem única de locks** (HTTP, retomada e entrada SQS): **carteira → agenda da pendência → linha da transação**. O caminho HTTP
   trava a carteira primeiro; a retomada lê candidatos *sem locks* (só uma listagem, que não autoriza movimento), trava a carteira com
   `FOR UPDATE SKIP LOCKED` — uma carteira ocupada é **pulada** (as demais seguem, sem lock global) e nunca prende a retomada na ordem inversa
   — e depois a agenda. Como o alvo é sempre da mesma carteira (outra carteira é `REFERENCE_MISMATCH`, decidido por campos imutáveis), o estado
@@ -350,7 +350,7 @@ continuidade durável.
     processo só o perfil necessário é uma recomendação técnica de endurecimento). O publisher tem principal próprio **e** cliente SNS próprio (o perfil é lido pelo construtor, §7); o cliente SQS de readiness segue com o runtime.
   * **Modelo de confiança** (decisão da mentoria): a fila compartilhada é para **produtores internos confiáveis**; provedores externos não têm
     `SendMessage` direto. O produtor vincula a origem autenticada (token, ou configuração controlada) ao `providerId` permitido antes de
-    publicar; o consumidor valida o envelope e o escopo, mas não trata um campo do corpo como autenticação. Ainda **não implementado** (inbox e consumidor são o incremento 4).
+    publicar; o consumidor valida o envelope e o escopo, mas não trata um campo do corpo como autenticação. Implementado no incremento 4: `cmd/sqs-producer` verifica a origem no IdP antes de publicar (§7).
   * **Entrega SNS→SQS** controlada pela política da fila de auditoria: só o serviço SNS, só a partir do tópico de eventos (`aws:SourceArn`).
     Sem a política — ou com outro tópico — a mensagem **não** é entregue, ainda que o `Publish` seja aceito (testado).
   * **Provisionamento idempotente** (`cmd/broker-provision`, SDK Go v2, one-shot do Compose; também usado pela prova): converge recursos,
@@ -434,7 +434,7 @@ versão anterior).
 | `00007_outbox_publisher_lease` | sem preflight (as colunas novas chegam NULL; o backlog não é tocado) | `lease_token`, `lease_expires_at`, `ck_outbox_lease_pair`, `ck_outbox_published_has_no_lease` e o guard que torna `published_at` imutável | descarta só a reserva (transitória), restaura o guard da 00001; eventos, agenda, tentativas, diagnósticos e marcadores permanecem |
 | `00006_pending_shape_and_schedule_preservation` | **exclusão dos escritores**; recusa, com contagem e primeiros ids: `PENDING_REFERENCE` irretomável (não externo, tipo que não espera referência, ou referência ausente/inválida), referência externa com forma que a reidratação rejeita (vazia, > 128, controle, espaços nas pontas, igual ao próprio id) e cópia preservada sem transação correspondente | `CHECK ck_wager_tx_reference_form` (qualquer estado) e `ck_wager_tx_pending_reference_shape`, função `wager_valid_external_reference`; **restaura** a agenda preservada por um rollback anterior (valores originais, inclusive as concluídas) sobre as linhas que o `Up` da 00005 reconstruiu, e remove a cópia | remove os dois `CHECK` e a função; não toca em dados |
 | `00005_references_and_reversals` | **exclusão dos escritores** (mesmo `LOCK TABLE` da 00004) e, com eles excluídos: transação confirmada como `PENDING`; reversão/`WIN` com referência `PROCESSED` sem a referência interna; referência interna incoerente com a externa, o escopo, o tipo, o estado ou o valor; alvo com mais de uma reversão `PROCESSED`; lançamento de `ROLLBACK` no sentido errado (contagem e primeiros ids) | tudo o que está em §10 na linha "Referência coerente" em diante, mais a agenda `pending_references` | remove as garantias, restaura as funções da 00001/00003 e `DROP`a a agenda (transações e ledger intactos). **O migrador preserva a agenda antes dessa reversão e a 00006 a restaura na reaplicação** — ver "Rollback e a agenda das pendências" abaixo |
-| `00004_revalidate_history_under_writer_exclusion` | **exclusão dos escritores** (`LOCK TABLE` em `wallets`, `wager_transactions`, `wallet_ledger_entries`) e, com eles excluídos: triggers das garantias ausentes ou desabilitados; cadeia do ledger quebrada; lançamento incoerente com a transação; saldo ≠ ledger; transação concluída sem lançamento; resultado ≠ `balance_after` (com contagem e primeiros ids) | nada (só valida; é a versão final esperada pela aplicação) | vazia: apenas retrocede a versão, sem tocar em dados nem garantias |
+| `00004_revalidate_history_under_writer_exclusion` | **exclusão dos escritores** (`LOCK TABLE` em `wallets`, `wager_transactions`, `wallet_ledger_entries`) e, com eles excluídos: triggers das garantias ausentes ou desabilitados; cadeia do ledger quebrada; lançamento incoerente com a transação; saldo ≠ ledger; transação concluída sem lançamento; resultado ≠ `balance_after` (com contagem e primeiros ids) | nada (só valida; era a versão final quando foi introduzida) | vazia: apenas retrocede a versão, sem tocar em dados nem garantias |
 
 Mecanismo da 00003 (por que um *constraint trigger* deferido): um `CHECK` não enxerga outra tabela; uma FK da transação para o
 ledger seria circular com a FK do ledger para a transação; um trigger imediato exigiria que a transação já estivesse concluída e o lançamento já inserido no instante de cada
@@ -490,7 +490,7 @@ perda **não** a corrige; como a 00005 não pode ser reescrita, a correção é 
 * **Restauração** (00006, na reaplicação): substitui as linhas reconstruídas pelo `Up` da 00005 pelos valores originais, inclusive as concluídas,
   desabilitando o gatilho de imutabilidade só durante a restauração (dono, sob exclusão dos escritores), dispara as verificações deferidas e remove a cópia.
   Uma cópia sem transação correspondente é recusada com contagem e ids (preflight), não descartada; uma restauração que falha deixa a cópia (a migration é transacional).
-* **Reset destrutivo ≠ rollback operacional**: `down-to 0` apaga tudo, como sempre, e descarta também a cópia; `down`/`down-to N>0` preservam.
+* **Reset destrutivo ≠ rollback operacional**: `down-to 0` apaga tudo, como sempre, e descarta também a cópia; `down`/`down-to N>0` preservam **a agenda** pelo migrador; reverter a 00008 apaga inbox e diagnósticos.
 * Limites: a exclusão é por privilégio — dono e superusuários (o operador) não são excluídos, e uma visão/função `SECURITY DEFINER` de outro dono que escreva na agenda não é detectada;
   o `Down` da 00005 executado direto pelo goose não é protegido; dados que nunca tiveram agenda (um `PENDING_REFERENCE` criado por SQL antes da 00005) recebem a agenda reconstruída da 00005.
 * Testes: `audit_regressions_test.go` (ciclo preservando prazo vencido, tentativas, diagnóstico e concluídas; janela observada com o `DROP` retido por uma leitura aberta; banco ainda na versão 5;
@@ -523,7 +523,7 @@ mecanismo. Justificativa:
 * A 00003 já foi publicada e não é reescrita; sua janela é tratada **depois do fato**: a 00004 detecta e recusa o histórico
   incompatível, inclusive em bancos onde a janela já ocorreu (e no upgrade 2→4 com um escritor aberto, que deixa o schema em 3).
 
-**Portão da versão final.** Um upgrade só termina bem na versão final (hoje 6). Se uma migration recusar (p.ex. a 00004 ou a 00005), o schema fica na versão anterior, **nada é apagado
+**Portão da versão final.** Um upgrade só termina bem na versão final (hoje 8). Se uma migration recusar (p.ex. a 00004 ou a 00005), o schema fica na versão anterior, **nada é apagado
 nem reescrito**, e a aplicação (que compara a versão do schema com a embutida no binário) **recusa iniciar**: o estado é visível e
 não é tratado como sucesso. A correção dos registros é manual; depois, `migrate up` conclui.
 
@@ -554,14 +554,14 @@ espera/retenção pelo lock, dados preservados, reversão/reaplicação e partid
 
 ## 11. Composição Fx, ciclo de vida e shutdown (§4)
 
-* `bootstrap.Options(cfg)` = `fx.Supply(cfg)` + `fx.Module`s: `logging`, `persistence` (pool), `auth` (verificador),
-  `messaging` (cliente SQS), `application` (serviço) e `http` (servidor). Construtores via `fx.Provide`; ligação de
+* `bootstrap.Options(cfg)` = `fx.Supply(cfg)` + `fx.Module`s: `logging`, `persistence` (pool), `auth` (verificador), `metrics`,
+  `messaging` (cliente SQS), `outbox` (quando habilitado), `consumer` (quando habilitado), `application` (serviço), `http` (servidor) e `lifecycle`. Construtores via `fx.Provide`; ligação de
   hooks via `fx.Invoke`/`fx.Lifecycle`. Logs do Fx saem pelo `slog` JSON.
 * **Início** (`OnStart`): `postgres.Database` — o pool só é aberto em `Start`, que faz `Ping`, confere a versão do schema por um
   `SELECT` em `goose_db_version` (`migrate up` pendente impede a partida) e **fecha o pool antes de devolver o erro se algo
   falhar**: o Fx não chama o `OnStop` de um hook cujo `OnStart` falhou, então a liberação não depende dele. Verificador →
-  carrega o JWKS; SQS → `GetQueueUrl` da fila de entrada. Por último, o **coordenador** inicia os componentes que admitem trabalho, na
-  ordem de registro: worker de referências, **publicador da outbox** (quando `OUTBOX_PUBLISHERS` > 0; o cliente SNS valida o tópico na partida, como o SQS) e, por fim, o servidor HTTP (`Listen` síncrono, `Serve` em segundo plano) — a porta de entrada abre
+  carrega o JWKS; SQS → `GetQueueUrl` da fila de entrada e da DLQ configurada. Por último, o **coordenador** inicia os componentes que admitem trabalho, na
+  ordem de registro: worker de referências, **publicador da outbox** (quando `OUTBOX_PUBLISHERS` > 0; o cliente SNS valida o tópico na partida, como o SQS), o **consumidor SQS** (quando `SQS_CONSUMERS` > 0) e, por fim, o servidor HTTP (`Listen` síncrono, `Serve` em segundo plano) — a porta de entrada abre
   por último. Se um componente falha ao iniciar, o coordenador encerra os já iniciados antes de devolver o erro, e o Fx desfaz os hooks
   anteriores: **nenhuma conexão com o PostgreSQL permanece aberta** (testado contando `pg_stat_activity`, inclusive com o worker ativo e a porta
   ocupada): PostgreSQL inacessível, schema sem migrations ou desatualizado, credenciais inválidas, IdP inacessível, fila ausente, broker
@@ -569,9 +569,9 @@ espera/retenção pelo lock, dados preservados, reversão/reaplicação e partid
 * **Encerramento coordenado** (`internal/lifecycle`): um único prazo global (`SHUTDOWN_TIMEOUT`, 20 s) com **drenagem de no máximo 12 s**
   (`SHUTDOWN_DRAIN_TIMEOUT`) e uma **reserva compartilhada de pelo menos 8 s** — não concedida de novo a cada componente — para
   cancelamento, cleanup e fechamento das dependências. Sequência: (1) **admissão fechada em todos os componentes ao mesmo tempo**: o servidor
-  fecha o listener e responde `503 SHUTTING_DOWN` a requisições novas (inclusive em conexões keep-alive), o worker deixa de buscar trabalho;
-  (2) **drenagem simultânea** do trabalho admitido (inclusive a publicação e a confirmação em andamento do publicador); (3) no limite de drenagem, **cancelamento** do que restou (fecha as conexões e cancela o
-  contexto das requisições; cancela a tentativa do worker, cuja transação é desfeita; cancela a publicação em andamento, cuja reserva é **liberada** — a ação SQL final usa contexto próprio, limitada ao `OUTBOX_SQL_TIMEOUT` **e** ao prazo global restante — sem orçamento restante nenhum SQL novo começa e a lease vence — e `Done` só fecha depois dela); (4) **confirmação observável do término** de cada
+  fecha o listener e responde `503 SHUTTING_DOWN` a requisições novas (inclusive em conexões keep-alive), o worker deixa de buscar trabalho, o publicador não reserva mais eventos e o consumidor cancela as buscas e não despacha trabalho novo;
+  (2) **drenagem simultânea** do trabalho admitido (inclusive publicação/confirmação do publicador e tratamento SQS admitido); (3) no limite de drenagem, **cancelamento** do que restou (fecha as conexões e cancela o
+  contexto das requisições; cancela a tentativa do worker, cuja transação é desfeita; cancela a publicação em andamento, cuja reserva é **liberada** — a ação SQL final usa contexto próprio, limitada ao `OUTBOX_SQL_TIMEOUT` **e** ao prazo global restante — sem orçamento restante nenhum SQL novo começa e a lease vence — e `Done` só fecha depois dela; cancela o tratamento SQS e libera a mensagem para reentrega, com ações finais limitadas pelo menor instante absoluto entre o limite próprio e o prazo global); (4) **confirmação observável do término** de cada
   componente (`Done`): o servidor só confirma quando o `http.Server` terminou **e** todos os handlers retornaram — o fim do `Serve`, sozinho,
   não prova isso, e cancelar um contexto não prova o fim de uma goroutine; (5) só então o Fx executa os `OnStop` das dependências em ordem
   inversa (verificador, SQS, pool). Se algum componente não confirmar até o prazo global menos uma margem de 1 s, o encerramento é registrado
@@ -627,9 +627,8 @@ nunca roda com eles (§10.1); o `result_balance` de `LOSS` não é verificável 
 é recusada pelo domínio e tratada por quem chama a transição (§3, §8); a rotação de chaves do IdP pode causar 401 por até 30 s (§9). Da
 política de reversões (§8): o `ROLLBACK` da BET depois do `ROLLBACK` do REFUND é recusado (escolha de contrato, não de viabilidade
 financeira). Das pendências: o TTL e o backoff usam o relógio da aplicação (diferença entre instâncias desloca o prazo, nunca o renova); uma
-uma carteira continuamente ocupada ou com falha localizada adia apenas a retomada das pendências dela (a consulta a pula com o mesmo `FOR UPDATE SKIP LOCKED` da tentativa, a falha adia a agenda com backoff e a varredura segue para as demais); o worker não tem lease (a exclusão é pelos locks
-e pela revalidação). Dos testes: o harness de processos reais compila o binário **sem `-race`** — `go test -race` do processo pai não
-instrumenta os filhos (adaptação prevista para a consolidação final). A proteção da agenda no rollback está no migrador (`Migrator`), não no SQL publicado da 00005: o `Down` da 00005 executado diretamente pelo goose, sem o migrador, não preserva a agenda; a exclusão dos escritores é por privilégio (dono e superusuários não são excluídos).
+carteira continuamente ocupada ou com falha localizada adia apenas a retomada das pendências dela (a consulta a pula com o mesmo `FOR UPDATE SKIP LOCKED` da tentativa, a falha adia a agenda com backoff e a varredura segue para as demais); o worker não tem lease (a exclusão é pelos locks
+e pela revalidação). Dos testes: o harness compila os binários da API e do migrador **com `-race`**; no harness multiprocesso da API, relatos de race, `panic` ou `fatal error` na saída dos filhos falham o teste. Os testes da CLI de migrations verificam a saída conforme cada cenário. O `-race` do processo pai não instrumenta executáveis separados. A proteção da agenda no rollback está no migrador (`Migrator`), não no SQL publicado da 00005: o `Down` da 00005 executado diretamente pelo goose, sem o migrador, não preserva a agenda; a exclusão dos escritores é por privilégio (dono e superusuários não são excluídos).
 
 ## 15. Leituras: ledger paginado e reconciliação
 
@@ -649,7 +648,7 @@ financeira não muda (continua `READ COMMITTED` com lock de linha da carteira). 
   confirma um movimento **entre** as consultas e mostra que a resposta continua de um único momento e que o escritor independente não espera (a leitura não retém lock).
 * **Soma exata.** `sum()` sobre `bigint` do PostgreSQL devolve `NUMERIC`: não há overflow intermediário. O texto do resultado é lido como `big.Int` e convertido a `Money`
   com verificação (`IsInt64`, e `MinInt64` é recusado). A diferença também é calculada em `big.Int`. Fora da faixa → `ErrReconciliationFailed` (500), nunca sucesso.
-* **Divergência**: resposta + log `ERROR` + `app.WithReconciliationObserver` (onde a métrica será ligada); nada é reparado.
+* **Divergência**: resposta + log `ERROR` + `app.WithReconciliationObserver` (ligado a `wager_reconciliation_divergences_total`); nada é reparado.
 * **Testes**: `internal/app/ledger_test.go` (cursor e aritmética, unitários) e `test/integration/ledger_reads_test.go`, `reconciliation_test.go` (PostgreSQL, Keycloak e MiniStack reais;
   divergência e soma fora de faixa só em fixtures exclusivas preparadas pelo dono, nunca como funcionalidade).
-* **Limites**: sem snapshot congelado da navegação do ledger (documentado); métricas e `GET /metrics` ficam para a instrumentação posterior; o prazo da reconciliação (10 s) não é configurável por ambiente.
+* **Limites**: sem snapshot congelado da navegação do ledger (documentado); o prazo da reconciliação (10 s) não é configurável por ambiente.
