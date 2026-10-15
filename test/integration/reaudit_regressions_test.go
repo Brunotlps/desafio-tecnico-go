@@ -156,12 +156,12 @@ func TestSeveralInstancesBehindTheBusyPrefixProgressTheFreeWalletOnce(t *testing
 
 // --- helpers da agenda preservada --------------------------------------------------------------------------
 
-// reauditSchedule prepara um banco isolado na versão final com TTL não padrão (7 min), relógio duas horas atrás (agenda
+// reauditSchedule prepara um banco isolado no schema da agenda (6) com TTL não padrão (7 min), relógio duas horas atrás (agenda
 // aberta já vencida) com 7 tentativas e diagnóstico, e uma agenda concluída.
 func reauditSchedule(t *testing.T) (d *upgradeDB, open, done uuid.UUID) {
 	t.Helper()
 	ctx := context.Background()
-	d = newUpgradeDB(t, "reaudit_schedule", finalVersion(t))
+	d = newUpgradeDB(t, "reaudit_schedule", scheduleSchemaVersion)
 	clock := newFakeClock()
 	clock.Advance(-2 * time.Hour)
 	cfg := testRef

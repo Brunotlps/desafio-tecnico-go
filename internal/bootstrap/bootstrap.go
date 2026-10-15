@@ -17,8 +17,10 @@ import (
 	"desafio-tecnico-go/internal/infra/auth"
 	"desafio-tecnico-go/internal/infra/httpapi"
 	"desafio-tecnico-go/internal/infra/postgres"
+	"desafio-tecnico-go/internal/infra/sns"
 	"desafio-tecnico-go/internal/infra/sqs"
 	"desafio-tecnico-go/internal/lifecycle"
+	"desafio-tecnico-go/internal/outbox"
 )
 
 // Options devolve a composição completa da aplicação para a configuração dada.
@@ -34,6 +36,7 @@ func Options(cfg config.Config) fx.Option {
 		persistenceModule,
 		authModule,
 		messagingModule,
+		outboxModule(cfg),
 		applicationModule,
 		httpModule,
 		lifecycleModule,
@@ -87,6 +90,36 @@ var messagingModule = fx.Module("messaging",
 	}),
 )
 
+// outboxModule compõe o publisher da outbox quando OUTBOX_PUBLISHERS > 0. O cliente SNS usa o perfil do principal wager-publisher
+// (lido do arquivo de credenciais pelo construtor, sem alterar o ambiente do processo); o cliente SQS de readiness continua com
+// o perfil de runtime. A readiness do tópico (existência, FIFO e permissão de GetTopicAttributes) é verificada na partida.
+func outboxModule(cfg config.Config) fx.Option {
+	if cfg.OutboxPublishers == 0 {
+		return fx.Options()
+	}
+	return fx.Module("outbox",
+		fx.Provide(
+			func(cfg config.Config) (*sns.Publisher, error) {
+				return sns.New(context.Background(), sns.Config{
+					Region: cfg.AWSRegion, EndpointURL: cfg.AWSEndpointURL, TopicARN: cfg.SNSEventTopicARN,
+					CredentialsFile: cfg.OutboxCredentialsFile, Profile: cfg.OutboxAWSProfile,
+				})
+			},
+			func(db *postgres.Database) *postgres.OutboxStore { return postgres.NewOutboxStore(db) },
+			func(cfg config.Config, store *postgres.OutboxStore, sink *sns.Publisher, log *slog.Logger) *outbox.Publisher {
+				return outbox.New(store, sink, outbox.Config{
+					Workers: cfg.OutboxPublishers, Lease: cfg.OutboxLease, PublishTimeout: cfg.OutboxPublishTimeout,
+					SQLTimeout: cfg.OutboxSQLTimeout, PollInterval: cfg.OutboxPollInterval,
+					BackoffInitial: cfg.OutboxBackoffInitial, BackoffMax: cfg.OutboxBackoffMax,
+				}, log)
+			},
+		),
+		fx.Invoke(func(lc fx.Lifecycle, p *sns.Publisher) {
+			lc.Append(fx.Hook{OnStart: p.Ready})
+		}),
+	)
+}
+
 var applicationModule = fx.Module("application",
 	fx.Provide(
 		func(uow app.UnitOfWork, store *postgres.Store, cfg config.Config, log *slog.Logger) *app.Service {
@@ -123,10 +156,23 @@ var lifecycleModule = fx.Module("lifecycle",
 		c.OnShutdown(store.SetShutdownDeadline)
 		return c
 	}),
-	fx.Invoke(func(lc fx.Lifecycle, cfg config.Config, c *lifecycle.Coordinator, worker *app.ReferenceWorker, server *httpapi.Server) {
-		// Ordem de início: o worker primeiro; a porta HTTP, que admite entradas, por último.
+	fx.Invoke(func(p struct {
+		fx.In
+		Lifecycle fx.Lifecycle
+		Config    config.Config
+		Coord     *lifecycle.Coordinator
+		Worker    *app.ReferenceWorker
+		Server    *httpapi.Server
+		Publisher *outbox.Publisher `optional:"true"` // só existe com OUTBOX_PUBLISHERS > 0
+	}) {
+		lc, cfg, c, worker, server := p.Lifecycle, p.Config, p.Coord, p.Worker, p.Server
+		// Ordem de início: os executores (referências e publisher) primeiro; a porta HTTP, que admite entradas, por último.
 		if cfg.ReferenceWorkers > 0 {
 			c.Add(worker)
+		}
+		if p.Publisher != nil {
+			c.OnShutdown(p.Publisher.SetShutdownDeadline)
+			c.Add(p.Publisher)
 		}
 		c.Add(server)
 		lc.Append(fx.Hook{OnStart: c.Start, OnStop: c.Stop})

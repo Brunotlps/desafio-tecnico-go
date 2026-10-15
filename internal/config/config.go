@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"desafio-tecnico-go/internal/domain"
+	"desafio-tecnico-go/internal/outbox"
 )
 
 // Config é a configuração validada da aplicação.
@@ -31,6 +32,18 @@ type Config struct {
 	ReferencePollInterval   time.Duration // padrão 1s
 	ReferencePhaseTimeout   time.Duration // padrão 10s: locks e commit de uma tentativa
 	ReferenceWorkers        int           // executores por processo: 1 (padrão) ou 0 (desligado)
+
+	// Publisher da outbox (incremento 3). OutboxPublishers = 0 desliga a publicação neste processo.
+	OutboxPublishers      int           // executores por processo (padrão 1)
+	OutboxLease           time.Duration // padrão 20s, sem renovação
+	OutboxPublishTimeout  time.Duration // padrão 5s: prazo total de uma publicação (inclui as tentativas do SDK)
+	OutboxSQLTimeout      time.Duration // padrão 2s: cada transação curta de reserva/confirmação
+	OutboxPollInterval    time.Duration // padrão 500ms: espera sem evento elegível
+	OutboxBackoffInitial  time.Duration // padrão 1s
+	OutboxBackoffMax      time.Duration // padrão 30s
+	OutboxAWSProfile      string        // perfil do principal publisher no arquivo de credenciais (padrão wager-publisher)
+	SNSEventTopicARN      string        // ARN do tópico FIFO de saída
+	OutboxCredentialsFile string        // arquivo de credenciais do perfil do publisher (padrão: AWS_SHARED_CREDENTIALS_FILE)
 
 	DatabaseURL string
 	DBMaxConns  int32
@@ -93,6 +106,15 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		ReferenceBackoffMax:     duration("REFERENCE_BACKOFF_MAX", "30s"),
 		ReferencePollInterval:   duration("REFERENCE_POLL_INTERVAL", "1s"),
 		ReferencePhaseTimeout:   duration("REFERENCE_PHASE_TIMEOUT", "10s"),
+		OutboxLease:             duration("OUTBOX_LEASE", "20s"),
+		OutboxPublishTimeout:    duration("OUTBOX_PUBLISH_TIMEOUT", "5s"),
+		OutboxSQLTimeout:        duration("OUTBOX_SQL_TIMEOUT", "2s"),
+		OutboxPollInterval:      duration("OUTBOX_POLL_INTERVAL", "500ms"),
+		OutboxBackoffInitial:    duration("OUTBOX_BACKOFF_INITIAL", "1s"),
+		OutboxBackoffMax:        duration("OUTBOX_BACKOFF_MAX", "30s"),
+		OutboxAWSProfile:        get("OUTBOX_AWS_PROFILE", "wager-publisher"),
+		SNSEventTopicARN:        get("SNS_EVENT_TOPIC_ARN", ""),
+		OutboxCredentialsFile:   get("OUTBOX_CREDENTIALS_FILE", get("AWS_SHARED_CREDENTIALS_FILE", "")),
 		DatabaseURL:             required("DATABASE_URL"),
 		OIDCIssuer:              required("OIDC_ISSUER"),
 		OIDCJWKSURL:             required("OIDC_JWKS_URL"),
@@ -117,6 +139,12 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		errs = append(errs, errors.New("REFERENCE_WORKERS must be 0 or 1"))
 	}
 	c.ReferenceWorkers = int(workers)
+
+	publishers, err := strconv.ParseInt(get("OUTBOX_PUBLISHERS", "1"), 10, 32)
+	if err != nil {
+		errs = append(errs, errors.New("OUTBOX_PUBLISHERS must be an integer between 0 and 8"))
+	}
+	c.OutboxPublishers = int(publishers)
 
 	n, err := strconv.ParseInt(get("DB_MAX_CONNS", "10"), 10, 32)
 	if err != nil || n < 1 || n > 500 {
@@ -174,5 +202,35 @@ func (c Config) Validate() error {
 	if c.ReferenceWorkers > 0 && c.ReferencePhaseTimeout >= c.ShutdownTimeout {
 		errs = append(errs, errors.New("REFERENCE_PHASE_TIMEOUT must be shorter than SHUTDOWN_TIMEOUT"))
 	}
+	errs = append(errs, c.validateOutbox()...)
 	return errors.Join(errs...)
+}
+
+// validateOutbox confere o publisher da outbox. Com OutboxPublishers = 0 nada é exigido (publicação desligada), de modo que
+// configurações montadas diretamente sem os campos do publisher continuam válidas.
+func (c Config) validateOutbox() []error {
+	if c.OutboxPublishers == 0 {
+		return nil
+	}
+	var errs []error
+	pc := outbox.Config{
+		Workers: c.OutboxPublishers, Lease: c.OutboxLease, PublishTimeout: c.OutboxPublishTimeout, SQLTimeout: c.OutboxSQLTimeout,
+		PollInterval: c.OutboxPollInterval, BackoffInitial: c.OutboxBackoffInitial, BackoffMax: c.OutboxBackoffMax,
+	}
+	if err := pc.Validate(); err != nil {
+		errs = append(errs, fmt.Errorf("outbox: %w", err))
+	}
+	if !strings.HasPrefix(c.SNSEventTopicARN, "arn:aws:sns:") {
+		errs = append(errs, errors.New("SNS_EVENT_TOPIC_ARN must be the ARN of the event topic when OUTBOX_PUBLISHERS > 0"))
+	}
+	if c.OutboxCredentialsFile == "" || c.OutboxAWSProfile == "" {
+		errs = append(errs, errors.New("OUTBOX_CREDENTIALS_FILE (or AWS_SHARED_CREDENTIALS_FILE) and OUTBOX_AWS_PROFILE are required when OUTBOX_PUBLISHERS > 0 (the publisher uses its own principal)"))
+	}
+	if c.OutboxPublishTimeout >= c.ShutdownDrain {
+		errs = append(errs, errors.New("OUTBOX_PUBLISH_TIMEOUT must be shorter than SHUTDOWN_DRAIN_TIMEOUT so an admitted publication drains"))
+	}
+	if reserve := c.ShutdownTimeout - c.ShutdownDrain; c.OutboxSQLTimeout >= reserve {
+		errs = append(errs, errors.New("OUTBOX_SQL_TIMEOUT must be shorter than the shutdown reserve (SHUTDOWN_TIMEOUT - SHUTDOWN_DRAIN_TIMEOUT)"))
+	}
+	return errs
 }

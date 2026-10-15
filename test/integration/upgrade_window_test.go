@@ -195,6 +195,11 @@ func tryStartApp(t *testing.T, d *upgradeDB) (*testApp, error) {
 	return a, nil
 }
 
+// scheduleSchemaVersion é o schema em que vivem as garantias de preservação da agenda das pendências (00005 cria a agenda, 00006
+// restaura a cópia). Os testes dessa mecânica ("Down" = 6 → 5) ficam fixados nele: migrations posteriores (00007, a reserva do
+// publicador da outbox) têm testes próprios e não alteram a agenda; o percurso até a versão final continua exercitado por `Up`.
+const scheduleSchemaVersion int64 = 6
+
 func finalVersion(t *testing.T) int64 {
 	t.Helper()
 	v, err := postgres.ExpectedVersion()

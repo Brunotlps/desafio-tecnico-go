@@ -77,10 +77,14 @@ func TestRuntimeRoleHasMinimalPrivileges(t *testing.T) {
 		"update pending deadline":               `UPDATE pending_references SET expires_at = expires_at`,
 		"delete pending schedule":               `DELETE FROM pending_references`,
 		"delete transactions":                   `DELETE FROM wager_transactions`,
-		"update outbox":                         `UPDATE outbox_events SET attempts = attempts`,
-		"delete outbox":                         `DELETE FROM outbox_events`,
-		"write migration history":               `DELETE FROM goose_db_version`,
-		"become the owner":                      `ALTER TABLE wallet_ledger_entries OWNER TO CURRENT_USER`,
+		// O publicador (00007) atualiza só as colunas de controle da outbox; snapshot e identidade seguem imutáveis para o runtime.
+		"update outbox payload":    `UPDATE outbox_events SET payload = payload`,
+		"update outbox identity":   `UPDATE outbox_events SET event_type = event_type`,
+		"update outbox occurrence": `UPDATE outbox_events SET occurred_at = occurred_at`,
+		"delete outbox":            `DELETE FROM outbox_events`,
+		"truncate outbox":          `TRUNCATE outbox_events`,
+		"write migration history":  `DELETE FROM goose_db_version`,
+		"become the owner":         `ALTER TABLE wallet_ledger_entries OWNER TO CURRENT_USER`,
 	}
 	for name, stmt := range forbidden {
 		_, err := rt.Exec(ctx, stmt)
@@ -109,6 +113,9 @@ func TestRuntimeRoleHasMinimalPrivileges(t *testing.T) {
 		"read ledger":       `SELECT id FROM wallet_ledger_entries LIMIT 1`,
 		"read transactions": `SELECT id FROM wager_transactions LIMIT 1`,
 		"read outbox":       `SELECT id FROM outbox_events LIMIT 1`,
+		// Controle de publicação da outbox (00007): reserva, tentativa, diagnóstico e marcador.
+		"update outbox control columns": `UPDATE outbox_events SET attempts = attempts, next_attempt_at = next_attempt_at, last_error = last_error,
+			published_at = published_at, lease_token = lease_token, lease_expires_at = lease_expires_at WHERE false`,
 	} {
 		rows, err := rt.Query(ctx, stmt)
 		if err != nil {
