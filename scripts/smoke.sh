@@ -85,4 +85,19 @@ for _ in $(seq 1 40); do
 done
 expect "the worker resolved the pending REFUND" "$S" 200 '.status == "PROCESSED" and .balance.amount == "100.00"'
 expect "final wallet balance" "$(req GET "/wallets/$WID" "$INTERNAL")" 200 '.balance.amount == "100.00"'
+# --- Ledger paginado e reconciliação (somente serviço interno) ----------------------------------------
+expect "provider cannot read the ledger" "$(req GET "/wallets/$WID/ledger" "$PA")" 403
+expect "provider cannot reconcile" "$(req POST "/wallets/$WID/reconciliation" "$PA")" 403
+P1=$(req GET "/wallets/$WID/ledger?limit=2" "$INTERNAL")
+expect "ledger page 1 (limit 2)" "$P1" 200 '(.items | length) == 2 and .items[0].money.amount == "100.00" and .items[0].direction == "CREDIT" and (.nextCursor | type) == "string"'
+C1=$(jq -er .nextCursor <<<"${P1#* }")
+P2=$(req GET "/wallets/$WID/ledger?limit=2&cursor=$C1" "$INTERNAL")
+expect "ledger page 2" "$P2" 200 '(.items | length) == 2 and (.nextCursor | type) == "string"'
+C2=$(jq -er .nextCursor <<<"${P2#* }")
+expect "ledger last page has no nextCursor" "$(req GET "/wallets/$WID/ledger?limit=2&cursor=$C2" "$INTERNAL")" 200 '(.items | length) == 1 and (has("nextCursor") | not)'
+expect "invalid cursor" "$(req GET "/wallets/$WID/ledger?cursor=nope" "$INTERNAL")" 400 '.code == "INVALID_CURSOR"'
+expect "malformed query is rejected" "$(req GET "/wallets/$WID/ledger?limit=%ZZ" "$INTERNAL")" 400 '.code == "INVALID_QUERY" and (has("items") | not)'
+expect "limit above the maximum" "$(req GET "/wallets/$WID/ledger?limit=101" "$INTERNAL")" 400 '.code == "INVALID_LIMIT"'
+expect "reconciliation is consistent" "$(req POST "/wallets/$WID/reconciliation" "$INTERNAL")" 200 \
+  '.consistent == true and .storedBalance.amount == "100.00" and .calculatedBalance.amount == "100.00" and .difference.amount == "0.00" and .checkedEntries == 5'
 echo "smoke OK"

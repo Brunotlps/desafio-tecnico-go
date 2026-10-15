@@ -31,6 +31,8 @@ type Store struct {
 	src PoolSource
 	// shutdownDeadline, quando definido, limita o rollback ao orçamento restante do encerramento.
 	shutdownDeadline atomic.Pointer[time.Time]
+	// reconcileHook é um ponto de sincronização de testes (ver SetReconciliationHook); nil em produção.
+	reconcileHook atomic.Pointer[func(stage string)]
 }
 
 // SetShutdownDeadline informa o prazo global do encerramento: a partir daí, o rollback de

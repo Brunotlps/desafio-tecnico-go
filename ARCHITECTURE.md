@@ -588,14 +588,14 @@ espera/retenção pelo lock, dados preservados, reversão/reaplicação e partid
 5. Operações que dependem de uma referência ainda indisponível respondem `202` (`PENDING_REFERENCE`, sem saldo, com retomada durável, §8); `200`/`422` quando a transação é gravada já terminal.
 6. Replay de `REJECTED` responde `422` com `idempotentReplay:true` (mesmo status do original).
 7. Serviço interno pode ler qualquer transação; provedor só as suas.
-8. `GET …/ledger` e `POST …/reconciliation` respondem `501` após autorização.
+8. `GET …/ledger` pagina por `seq` (cursor opaco versionado) e `POST …/reconciliation` reconcilia num snapshot `READ ONLY, REPEATABLE READ`; ambos só para o serviço interno (§15).
 9. Reversões: uma reversão bem-sucedida por movimento alvo em todo o histórico (§8); o TTL das referências conta da primeira persistência e
    não é renovado; uma referência `PROCESSED` resolve mesmo depois do TTL; referência de outro provedor nunca é consultada.
 
 ## 14. Limitações e trabalho não concluído
 
 Ver "Escopo e pendências" no README. Em síntese, **ainda ausentes**: SQS + inbox (consumidor, retry/DLQ, produtor autorizado), publicador
-de outbox, paginação do ledger, reconciliação, métricas, e a prova com três processos para os fluxos SQS/outbox. O controle de acesso do
+de outbox, métricas (`GET /metrics`), e a prova com três processos para os fluxos SQS/outbox. O controle de acesso do
 broker está **provado como autorização emulada** (§9), com o limite de não validar SigV4. A prova com três processos **existe** para
 HTTP (apostas, WIN/LOSS) e para reversões e pendências com o worker real (`references_multiprocess_test.go`).
 
@@ -607,3 +607,26 @@ financeira). Das pendências: o TTL e o backoff usam o relógio da aplicação (
 uma carteira continuamente ocupada ou com falha localizada adia apenas a retomada das pendências dela (a consulta a pula com o mesmo `FOR UPDATE SKIP LOCKED` da tentativa, a falha adia a agenda com backoff e a varredura segue para as demais); o worker não tem lease (a exclusão é pelos locks
 e pela revalidação). Dos testes: o harness de processos reais compila o binário **sem `-race`** — `go test -race` do processo pai não
 instrumenta os filhos (adaptação prevista para a consolidação final). A proteção da agenda no rollback está no migrador (`Migrator`), não no SQL publicado da 00005: o `Down` da 00005 executado diretamente pelo goose, sem o migrador, não preserva a agenda; a exclusão dos escritores é por privilégio (dono e superusuários não são excluídos).
+
+## 15. Leituras: ledger paginado e reconciliação
+
+Portas e camadas. `app.LedgerReader` (implementada por `postgres.Store`) é uma porta **de leitura** própria: `LedgerPage` e `ReconciliationSnapshot`. A `UnitOfWork`
+financeira não muda (continua `READ COMMITTED` com lock de linha da carteira). `ListLedger` usa `Reader()` só para a **existência** da carteira (404) e lê a página pela porta própria; a
+  **reconciliação não usa `Reader()` nem o pool entre consultas**: o saldo e a soma saem do mesmo `pgx.Tx` `READ ONLY, REPEATABLE READ`. O caso de uso (`Service.ListLedger`,
+`Service.Reconcile`) valida e converte; o HTTP só autentica (`internal-service`), traduz parâmetros e erros. O domínio não conhece pgx.
+
+* **Ledger por posição.** `SELECT … WHERE wallet_id = $1 AND seq > $2 ORDER BY seq LIMIT $3` sobre `ix_ledger_wallet_seq (wallet_id, seq)`: sem `OFFSET`, custo
+  independente da profundidade da página. O pressuposto de continuidade — dentro de uma carteira, `seq` cresce na ordem de confirmação — vale porque todo lançamento é inserido
+  sob o `FOR UPDATE` da carteira, que só termina no commit, **e** porque o banco tem uma guarda própria contra `seq` antigo: a identity pode ser alocada antes do lock que o trigger
+  `ledger_enforce_chain` toma sobre a carteira, mas um INSERT cuja posição ficou para trás de uma confirmada é recusado (`40001`) em vez de entrar fora de ordem (comprovado por dois escritores SQL reais); uma sequence sozinha não provaria a monotonicidade (testado com escritores paralelos na mesma carteira: nenhuma travessia pula ou repete item). `seq` é interno e não é exposto.
+* **Cursor.** `base64url({"v":1,"w":walletId,"s":seq})`, aceito apenas na forma canônica que o servidor produz; ver o contrato no README. Não é assinado: a assinatura não seria
+  a fronteira de autorização (o servidor já autoriza e delimita o escopo pela rota), e um cursor adulterado só pode apontar para outra posição **da mesma carteira**.
+* **Snapshot da reconciliação.** Uma transação `READ ONLY, REPEATABLE READ` (prazo 10 s): a primeira consulta (saldo da carteira, sem lock) fixa o snapshot e a segunda
+  (`count`, soma `NUMERIC` créditos − débitos e contagem de moeda divergente) o enxerga. Com `READ COMMITTED` as duas poderiam ver momentos diferentes e inventar uma divergência; o teste com barreira
+  confirma um movimento **entre** as consultas e mostra que a resposta continua de um único momento e que o escritor independente não espera (a leitura não retém lock).
+* **Soma exata.** `sum()` sobre `bigint` do PostgreSQL devolve `NUMERIC`: não há overflow intermediário. O texto do resultado é lido como `big.Int` e convertido a `Money`
+  com verificação (`IsInt64`, e `MinInt64` é recusado). A diferença também é calculada em `big.Int`. Fora da faixa → `ErrReconciliationFailed` (500), nunca sucesso.
+* **Divergência**: resposta + log `ERROR` + `app.WithReconciliationObserver` (onde a métrica será ligada); nada é reparado.
+* **Testes**: `internal/app/ledger_test.go` (cursor e aritmética, unitários) e `test/integration/ledger_reads_test.go`, `reconciliation_test.go` (PostgreSQL, Keycloak e MiniStack reais;
+  divergência e soma fora de faixa só em fixtures exclusivas preparadas pelo dono, nunca como funcionalidade).
+* **Limites**: sem snapshot congelado da navegação do ledger (documentado); métricas e `GET /metrics` ficam para a instrumentação posterior; o prazo da reconciliação (10 s) não é configurável por ambiente.

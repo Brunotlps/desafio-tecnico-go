@@ -1,7 +1,11 @@
 package httpapi
 
 import (
+	"fmt"
 	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
 
 	"desafio-tecnico-go/internal/app"
 	"desafio-tecnico-go/internal/domain"
@@ -52,4 +56,69 @@ func (h *Handler) getWallet(w http.ResponseWriter, r *http.Request, p auth.Princ
 		return
 	}
 	writeJSON(w, http.StatusOK, toWalletResponse(wallet))
+}
+
+var limitRe = regexp.MustCompile(`^[0-9]{1,4}$`)
+
+// getLedger: GET /wallets/{walletId}/ledger?cursor=&limit=, somente serviço interno. limit padrão 50 (1–100); cursor opaco.
+// Parâmetros repetidos ou vazios são entrada inválida (nunca ampliam a consulta).
+func (h *Handler) getLedger(w http.ResponseWriter, r *http.Request, p auth.Principal) {
+	if !p.IsInternal() {
+		forbidden(w, "wallet operations are restricted to the internal service")
+		return
+	}
+	id, err := domain.ParseID("walletId", r.PathValue("walletId"))
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	// Parsing explícito: r.URL.Query() descarta em silêncio os pares malformados (escape inválido, separador ';'), o que faria um
+	// parâmetro inválido sumir (e valer o default) ou uma repetição parecer única. Qualquer erro recusa a requisição inteira, antes de
+	// consumir o mapa parcial e de chamar o serviço.
+	q, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		writeProblem(w, http.StatusBadRequest, "INVALID_QUERY", "the query string is malformed (invalid escape or separator)")
+		return
+	}
+	limit := app.DefaultLedgerLimit
+	if vs, ok := q["limit"]; ok {
+		if len(vs) != 1 || !limitRe.MatchString(vs[0]) {
+			h.writeError(w, r, fmt.Errorf("%w: limit must be an integer", app.ErrInvalidLimit))
+			return
+		}
+		limit, _ = strconv.Atoi(vs[0])
+	}
+	cursor := ""
+	if vs, ok := q["cursor"]; ok {
+		if len(vs) != 1 || vs[0] == "" {
+			h.writeError(w, r, fmt.Errorf("%w: cursor must appear once and not be empty", app.ErrInvalidCursor))
+			return
+		}
+		cursor = vs[0]
+	}
+	page, err := h.svc.ListLedger(r.Context(), id, cursor, limit)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toLedgerResponse(page))
+}
+
+// reconcile: POST /wallets/{walletId}/reconciliation, somente serviço interno. Lê; nunca altera saldo nem ledger.
+func (h *Handler) reconcile(w http.ResponseWriter, r *http.Request, p auth.Principal) {
+	if !p.IsInternal() {
+		forbidden(w, "wallet operations are restricted to the internal service")
+		return
+	}
+	id, err := domain.ParseID("walletId", r.PathValue("walletId"))
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	res, err := h.svc.Reconcile(r.Context(), id)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toReconciliationResponse(res))
 }
