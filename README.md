@@ -1,5 +1,7 @@
 # Wager Service — processamento de apostas (Go, PostgreSQL, Keycloak, SQS)
 
+> 🇧🇷 Português (este arquivo) · 🇬🇧 [English version](README.en.md) · Arquitetura: [`ARCHITECTURE.md`](ARCHITECTURE.md)
+
 Implementação do desafio descrito em [`descricao-desafio/README.md`](descricao-desafio/README.md) (a fonte normativa;
 não é alterada aqui). Este repositório contém a base operacional e o fluxo financeiro vertical
 *abertura de carteira → BET / WIN / LOSS / REFUND / ROLLBACK (com referências pendentes) → consulta*, por HTTP, com autenticação
@@ -29,7 +31,7 @@ curl -s localhost:8080/health/ready
 ```
 
 A primeira subida importa o realm do Keycloak (`deploy/keycloak/wager-realm.json`), provisiona o broker (filas, tópico, identidades,
-políticas e credenciais — serviço one-shot `broker-provision`, ver [Broker](#broker-minestack-com-auth-true)) e aplica as migrations
+políticas e credenciais — serviço one-shot `broker-provision`, ver [Broker](#broker-ministack-com-authtrue)) e aplica as migrations
 (`migrate up`). A API só inicia depois de os dois one-shots terminarem com sucesso. Para recomeçar do zero: `docker compose down -v`
 (o diretório `.local/broker`, com credenciais sintéticas, é do host e fica; o provisionamento o reconcilia).
 
@@ -618,7 +620,7 @@ replay/conflito (409) antes das políticas de operação nova (moeda, tipo).
 | Consumidor SQS e tabela de inbox | **implementados** (ver [Consumidor SQS e inbox](#consumidor-sqs-e-inbox)) |
 | Publicador de outbox (múltiplas instâncias, backoff, recuperação) | **implementado** (ver [Publicador da outbox](#publicador-da-outbox)); *at-least-once*, sem ordem global; a consolidação com 3 processos para SQS ainda não existe |
 | Métricas (resultados, duplicatas, retries, DLQ, atraso da outbox, reconciliação) | **implementadas** (ver [Métricas](#métricas)); contadores locais ao processo, sem percentis; sem tracing nem dashboards |
-| Controle de acesso do broker (credenciais e políticas) | **provado como autorização emulada** (MiniStack 1.5.27, `AUTH=true`; prova na CI). O MiniStack **não valida assinaturas SigV4**: não é autenticação AWS completa nem prova de produção (ver [Broker](#broker-minestack-com-auth-true)). O produtor/consumidor SQS ainda **não** existem |
+| Controle de acesso do broker (credenciais e políticas) | **provado como autorização emulada** (MiniStack 1.5.27, `AUTH=true`; prova na CI). O MiniStack **não valida assinaturas SigV4**: não é autenticação AWS completa nem prova de produção (ver [Broker](#broker-ministack-com-authtrue)). O produtor/consumidor SQS ainda **não** existem |
 | Testes SQS/HTTP cruzados, DLQ, interrupção de consumidor | **provados** (ver Testes) |
 | Prova com 3 processos para SQS/outbox | **provada**: três processos reais do binário compilado com `-race` (consumidor e publisher em cada um), 50 reentregas, duas BETs de 80 sobre 100 cruzando HTTP e SQS, um processo morto por `SIGKILL` e os demais encerrados por `SIGTERM` |
 | Testes de carga, OpenTelemetry, partidas dobradas | opcionais, não feitos |
