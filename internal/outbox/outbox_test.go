@@ -298,26 +298,30 @@ func TestStartWithoutWorkersIsDoneImmediatelyAfterStart(t *testing.T) {
 	}
 }
 
-// A ação SQL final nunca amplia o SQLTimeout configurado nem passa do prazo global restante do encerramento.
+// A ação SQL final nunca amplia o SQLTimeout configurado nem passa do prazo global restante do encerramento. Quando o prazo global
+// é o limitante, o deadline ENTREGUE à ação é exatamente o instante informado (comparação sem tolerância): o orçamento não é
+// convertido em duração e recomeçado.
 func TestTheFinalSQLActionNeverExceedsTheSQLTimeoutNorTheRemainingShutdownTime(t *testing.T) {
 	const slack = 15 * time.Millisecond
 	for name, tc := range map[string]struct {
-		sql      time.Duration
-		deadline time.Duration // a partir de agora; 0 = nenhum prazo informado
-		max      time.Duration // teto esperado para o prazo da ação
+		sql           time.Duration
+		global        time.Duration // a partir de agora; 0 = nenhum prazo informado
+		max           time.Duration // teto esperado para o prazo da ação, a partir do início
+		globalLimited bool          // o prazo global é o menor limite: o deadline entregue é exatamente o informado
 	}{
-		"no global deadline known":       {40 * time.Millisecond, 0, 40 * time.Millisecond},
-		"plenty of time left":            {40 * time.Millisecond, time.Hour, 40 * time.Millisecond},
-		"budget shorter than the SQL":    {40 * time.Millisecond, 15 * time.Millisecond, 15 * time.Millisecond},
-		"validated tiny shutdown budget": {40 * time.Millisecond, 130 * time.Millisecond, 40 * time.Millisecond},
+		"no global deadline known":       {40 * time.Millisecond, 0, 40 * time.Millisecond, false},
+		"plenty of time left":            {40 * time.Millisecond, time.Hour, 40 * time.Millisecond, false},
+		"budget shorter than the SQL":    {40 * time.Millisecond, 15 * time.Millisecond, 15 * time.Millisecond, true},
+		"validated tiny shutdown budget": {40 * time.Millisecond, 130 * time.Millisecond, 40 * time.Millisecond, false},
 	} {
 		st := &fakeStore{queue: []Reservation{reservation("w", 1)}}
 		cfg := goodConfig()
 		cfg.SQLTimeout = tc.sql
-		cfg.Lease = 20 * time.Second
 		p := New(st, &fakeSink{}, cfg, quiet())
-		if tc.deadline > 0 {
-			p.SetShutdownDeadline(time.Now().Add(tc.deadline))
+		var global time.Time
+		if tc.global > 0 {
+			global = time.Now().Add(tc.global)
+			p.SetShutdownDeadline(global)
 		}
 		start := time.Now()
 		p.Step()
@@ -325,8 +329,15 @@ func TestTheFinalSQLActionNeverExceedsTheSQLTimeoutNorTheRemainingShutdownTime(t
 		if len(c) != 1 {
 			t.Fatalf("%s: expected the final action to run, got %+v", name, c)
 		}
-		if c[0].deadline.IsZero() || c[0].deadline.After(start.Add(tc.max+slack)) {
-			t.Errorf("%s: the final action got a deadline %v after the start, want at most %v", name, c[0].deadline.Sub(start), tc.max)
+		got := c[0].deadline
+		if got.IsZero() || got.After(start.Add(tc.max+slack)) {
+			t.Errorf("%s: the final action got a deadline %v after the start, want at most %v", name, got.Sub(start), tc.max)
+		}
+		if !global.IsZero() && got.After(global) {
+			t.Errorf("%s: the delivered deadline is %v AFTER the global instant", name, got.Sub(global))
+		}
+		if tc.globalLimited && !got.Equal(global) {
+			t.Errorf("%s: the global instant is the limit, so the delivered deadline must be exactly it (got %v, want %v)", name, got, global)
 		}
 	}
 }

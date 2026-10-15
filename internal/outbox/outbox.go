@@ -208,13 +208,13 @@ func (p *Publisher) Step() bool {
 	// A ação final usa um contexto próprio (o cancelamento do shutdown não deve impedir confirmar um envio já aceito nem
 	// liberar a reserva), limitado ao SQLTimeout E ao prazo global restante do encerramento. Sem orçamento, nenhum SQL novo
 	// começa (nem com um prazo artificial): a lease vence e o evento é recuperado.
-	budget, ok := p.finalBudget()
+	deadline, ok := p.finalDeadline()
 	if !ok {
 		p.log.Warn("outbox shutdown budget exhausted; no final SQL action was started and the lease expiry recovers the event",
 			"eventId", res.EventID, "published", perr == nil)
 		return true
 	}
-	fctx, cancel := context.WithTimeout(context.WithoutCancel(p.runCtx), budget)
+	fctx, cancel := context.WithDeadline(context.WithoutCancel(p.runCtx), deadline)
 	defer cancel()
 	switch {
 	case perr == nil:
@@ -252,18 +252,21 @@ func (p *Publisher) logFinish(action string, r Reservation, err error) {
 	p.log.Error("outbox "+action+" failed; the lease expires and the event is recovered", "eventId", r.EventID, "error", sanitize(err.Error()))
 }
 
-// finalBudget é o prazo da ação SQL final: o SQLTimeout configurado, reduzido ao tempo restante do encerramento quando ele é menor.
-// Nunca amplia o SQLTimeout e nunca ultrapassa o prazo global; devolve false se o prazo global já acabou.
-func (p *Publisher) finalBudget() (time.Duration, bool) {
-	d := p.cfg.SQLTimeout
-	if dl := p.deadline.Load(); dl != nil {
-		rem := time.Until(*dl)
-		if rem <= 0 {
-			return 0, false
+// finalDeadline é o INSTANTE ABSOLUTO limite da ação SQL final: o menor entre agora + SQLTimeout e o prazo global informado pelo
+// coordenador. O prazo global não é convertido em duração para recomeçar depois (isso o deslocaria para frente pelo intervalo entre
+// medir e criar o contexto); nunca amplia o SQLTimeout e nunca passa do prazo global. Devolve false se o prazo global já acabou.
+func (p *Publisher) finalDeadline() (time.Time, bool) {
+	now := time.Now()
+	deadline := now.Add(p.cfg.SQLTimeout)
+	if g := p.deadline.Load(); g != nil {
+		if !g.After(now) {
+			return time.Time{}, false
 		}
-		d = min(d, rem)
+		if g.Before(deadline) {
+			deadline = *g
+		}
 	}
-	return d, true
+	return deadline, true
 }
 
 // backoff devolve o intervalo antes de nova tentativa: exponencial a partir de BackoffInitial, jitter uniforme em [d/2, d] e

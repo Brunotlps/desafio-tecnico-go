@@ -679,11 +679,62 @@ func TestTwoPublisherProcessesDrainTheOutboxAndRecoverFromSIGKILL(t *testing.T) 
 	t.Logf("killed the first process with %d of %d events unpublished (%d under its lease when sampled); all were published afterwards", killedAt, len(ids), leasedAtKill)
 }
 
+// finalProbe registra o deadline EXATO entregue a cada ação final (Confirm, Retry, Release) e repassa o prazo global ao
+// repositório concreto, como o publisher faz.
+type finalProbe struct {
+	outbox.Store
+	mu    sync.Mutex
+	calls []finalCall
+}
+
+type finalCall struct {
+	op       string
+	at       time.Time // início da chamada
+	deadline time.Time // deadline do contexto entregue (zero = sem prazo)
+}
+
+func (f *finalProbe) record(op string, ctx context.Context) {
+	dl, _ := ctx.Deadline()
+	f.mu.Lock()
+	f.calls = append(f.calls, finalCall{op: op, at: time.Now(), deadline: dl})
+	f.mu.Unlock()
+}
+func (f *finalProbe) Confirm(ctx context.Context, r outbox.Reservation) error {
+	f.record("confirm", ctx)
+	return f.Store.Confirm(ctx, r)
+}
+func (f *finalProbe) Retry(ctx context.Context, r outbox.Reservation, d time.Duration, why string) error {
+	f.record("retry", ctx)
+	return f.Store.Retry(ctx, r, d, why)
+}
+func (f *finalProbe) Release(ctx context.Context, r outbox.Reservation) error {
+	f.record("release", ctx)
+	return f.Store.Release(ctx, r)
+}
+func (f *finalProbe) SetShutdownDeadline(d time.Time) {
+	if s, ok := f.Store.(interface{ SetShutdownDeadline(time.Time) }); ok {
+		s.SetShutdownDeadline(d)
+	}
+}
+
 // Orçamento SQL final: com um encerramento curto, porém VÁLIDO (config.Validate), a ação SQL final de um publisher que espera um lock
-// termina dentro do prazo global restante — nunca com um prazo maior que o SQLTimeout nem posterior ao orçamento. O lock é real e
-// observável (a ação final espera por ele em pg_stat_activity); nada é publicado como sucesso nem perdido: a reserva segue com o
-// token e a lease, e vence sozinha.
+// termina dentro do prazo global restante — o deadline entregue à ação nunca é posterior ao instante informado nem ao SQLTimeout, e
+// a espera pelo lock real é observada. Nada é publicado como sucesso nem perdido: a reserva segue com o token e a lease, e vence
+// sozinha. Dois casos: o SQLTimeout é o limite (a ação começa cedo) e o prazo global é o limite (a ação começa perto do fim, e o
+// deadline entregue é EXATAMENTE o instante informado).
 func TestAValidatedShortShutdownBudgetBoundsTheFinalSQLAction(t *testing.T) {
+	for name, tc := range map[string]struct {
+		gateAfter     time.Duration // quando a publicação é liberada, a partir do início do Stop
+		globalLimited bool
+	}{
+		"the SQL timeout is the limit":     {5 * time.Millisecond, false},
+		"the global deadline is the limit": {100 * time.Millisecond, true},
+	} {
+		t.Run(name, func(t *testing.T) { shortShutdownBudget(t, tc.gateAfter, tc.globalLimited) })
+	}
+}
+
+func shortShutdownBudget(t *testing.T, gateAfter time.Duration, globalLimited bool) {
 	e := newStoreEnv(t)
 	ctx := context.Background()
 	cfg := config.Config{
@@ -705,13 +756,14 @@ func TestAValidatedShortShutdownBudgetBoundsTheFinalSQLAction(t *testing.T) {
 
 	id := e.insertEvent(uuid.NewString(), "WalletBalanceChanged")
 	inflight, gate := make(chan struct{}, 1), make(chan struct{})
-	// Sink que respeita o contexto: depois do portão devolve o erro do contexto da publicação (prazo de 20 ms já vencido).
+	// Sink que respeita o contexto: depois do portão devolve o erro do contexto da publicação (já vencido ou cancelado).
 	sink := sinkFunc(func(c context.Context, _ outbox.Message) error {
 		inflight <- struct{}{}
 		<-gate
 		return c.Err()
 	})
-	p := outbox.New(e.store(), sink, pcfg, quietLog())
+	probe := &finalProbe{Store: e.store()}
+	p := outbox.New(probe, sink, pcfg, quietLog())
 	co := lifecycle.New(quietLog(), cfg.ShutdownDrain)
 	co.OnShutdown(p.SetShutdownDeadline)
 	co.Add(p)
@@ -731,22 +783,25 @@ func TestAValidatedShortShutdownBudgetBoundsTheFinalSQLAction(t *testing.T) {
 	}
 
 	begin := time.Now()
+	global := begin.Add(cfg.ShutdownTimeout) // o instante que o coordenador informa ao publisher
 	stopped := make(chan error, 1)
 	go func() {
-		sctx, cancel := context.WithDeadline(ctx, begin.Add(cfg.ShutdownTimeout))
+		sctx, cancel := context.WithDeadline(ctx, global)
 		defer cancel()
 		stopped <- co.Stop(sctx)
 	}()
-	time.Sleep(5 * time.Millisecond) // o observador do prazo global já foi chamado
+	time.Sleep(gateAfter)
 	close(gate)
+
+	// A espera pelo lock é obrigatória e observável: a ação final aparece esperando em pg_stat_activity.
 	var lockObserved bool
-	done := false
-	for !done {
+	for done := false; !done; {
 		select {
 		case <-p.Done():
 			done = true
-		case <-time.After(2 * time.Millisecond):
+		default:
 			lockObserved = lockObserved || waitingForLock("%outbox_events%WHERE id = $1%")
+			time.Sleep(time.Millisecond)
 		}
 		if time.Since(begin) > 3*time.Second {
 			t.Fatal("the publisher never reported Done")
@@ -755,12 +810,34 @@ func TestAValidatedShortShutdownBudgetBoundsTheFinalSQLAction(t *testing.T) {
 	elapsed := time.Since(begin)
 	t.Logf("Done after %v (global shutdown budget %v)", elapsed, cfg.ShutdownTimeout)
 	<-stopped // o coordenador pode registrar "incompleto" com um orçamento tão curto: o que se mede é o Done
+	if !lockObserved {
+		t.Fatal("the final SQL action never showed up waiting for the row lock (pg_stat_activity), so the scenario did not exercise it")
+	}
 	if budget := cfg.ShutdownTimeout + 60*time.Millisecond; elapsed > budget {
 		t.Fatalf("Done after %v: the final SQL action outlived the global shutdown budget (%v + tolerance)", elapsed, cfg.ShutdownTimeout)
 	}
-	if !lockObserved {
-		t.Log("note: the wait for the row lock was not sampled (the action may have ended between two samples)")
+
+	// O contexto efetivamente entregue à ação: comparação exata dos instantes, sem tolerância.
+	probe.mu.Lock()
+	calls := append([]finalCall(nil), probe.calls...)
+	probe.mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("exactly one final action expected, got %+v", calls)
 	}
+	c := calls[0]
+	if c.deadline.IsZero() {
+		t.Fatal("the final action must carry a deadline")
+	}
+	if c.deadline.After(global) {
+		t.Fatalf("the final action received a deadline %v AFTER the global instant", c.deadline.Sub(global))
+	}
+	if c.deadline.Sub(c.at) > cfg.OutboxSQLTimeout {
+		t.Fatalf("the final action received %v, more than the SQL timeout %v", c.deadline.Sub(c.at), cfg.OutboxSQLTimeout)
+	}
+	if globalLimited && !c.deadline.Equal(global) {
+		t.Fatalf("the global instant is the limit: the delivered deadline must be exactly it (got %v, want %v)", c.deadline, global)
+	}
+
 	if err := holder.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
