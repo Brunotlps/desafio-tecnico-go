@@ -433,3 +433,52 @@ func TestInboxAndDiagnosticsAreAppendOnlyWithMinimalPrivileges(t *testing.T) {
 		}
 	}
 }
+
+// A migration 00008 aplica, reverte e reaplica sem erro; a concessão ao runtime só inclui as tabelas novas depois dela e só SELECT/INSERT.
+func TestTheInboxMigrationAppliesRollsBackAndGrantsOnlySelectAndInsert(t *testing.T) {
+	ctx := context.Background()
+	url, mig, conn := scratchAt(t, "inboxmig", 7)
+	exists := func() bool {
+		var ok bool
+		if err := conn.QueryRow(ctx, `SELECT to_regclass('public.inbox_messages') IS NOT NULL AND to_regclass('public.message_diagnostics') IS NOT NULL`).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	if exists() {
+		t.Fatal("the tables must not exist before 00008")
+	}
+	if err := postgres.ProvisionRuntimeRole(ctx, url, postgres.RuntimeRole{Name: env.runtimeRole, Password: env.runtimePass}); err != nil {
+		t.Fatalf("provisioning before 00008 must omit the new tables: %v", err)
+	}
+	if _, err := mig.Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !exists() || schemaVersion(t, conn) != 8 {
+		t.Fatal("00008 must create both tables")
+	}
+	if err := postgres.ProvisionRuntimeRole(ctx, url, postgres.RuntimeRole{Name: env.runtimeRole, Password: env.runtimePass}); err != nil {
+		t.Fatal(err)
+	}
+	priv := func(table, p string) bool {
+		var ok bool
+		if err := conn.QueryRow(ctx, `SELECT has_table_privilege($1, $2, $3)`, env.runtimeRole, table, p).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	for _, table := range []string{"inbox_messages", "message_diagnostics"} {
+		if !priv(table, "SELECT") || !priv(table, "INSERT") || priv(table, "UPDATE") || priv(table, "DELETE") || priv(table, "TRUNCATE") {
+			t.Fatalf("%s: the runtime must have exactly SELECT and INSERT", table)
+		}
+	}
+	if _, err := mig.Down(ctx); err != nil {
+		t.Fatalf("down: %v", err)
+	}
+	if exists() || schemaVersion(t, conn) != 7 {
+		t.Fatal("the rollback must drop the tables and return to schema 7")
+	}
+	if _, err := mig.Up(ctx); err != nil || !exists() {
+		t.Fatalf("reapply: %v", err)
+	}
+}

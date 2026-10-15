@@ -199,6 +199,15 @@ partida; todos os problemas são reportados de uma vez.
 | `REFERENCE_POLL_INTERVAL` | `1s` | pausa do worker entre varreduras |
 | `REFERENCE_PHASE_TIMEOUT` | `10s` | limite da fase financeira de uma tentativa (locks e commit) |
 | `REFERENCE_WORKERS` | `1` | executores de referências por processo (`0` desliga) |
+| `SQS_CONSUMERS` | `4` | executores do consumidor SQS por processo (0 a 16; `0` desliga a entrada por SQS neste processo) |
+| `CONSUMER_NAME` | `wager-consumer` | `consumerName` da inbox: **estável** entre instâncias e reinícios (nunca hostname nem PID) |
+| `SQS_DLQ_NAME` | `wager-transactions-dlq.fifo` | DLQ para onde as mensagens permanentes são encaminhadas (e cuja profundidade aproximada a métrica lê) |
+| `CONSUMER_RECEIVE_WAIT` | `10s` | long polling (cancelável na admissão do encerramento) |
+| `CONSUMER_PHASE_TIMEOUT` | `10s` | fase financeira de uma tentativa (locks e commit) |
+| `CONSUMER_IO_TIMEOUT` | `5s` | cada ação de transporte (Delete, visibilidade, DLQ) e cada gravação/consulta de diagnóstico |
+| `CONSUMER_BACKOFF_INITIAL`, `CONSUMER_BACKOFF_MAX` | `5s`, `60s` | backoff de reentrega: exponencial pelo `ApproximateReceiveCount`, com jitter em [d/2, d] e teto |
+| `CONSUMER_PAUSE_MAX` | `30s` | teto da pausa das buscas depois de falhas consecutivas (falha global) |
+| `SQS_CREDENTIALS_FILE`, `SQS_AWS_PROFILE` | vazio, `wager-runtime` | opcional: arquivo e perfil do cliente SQS (padrão: cadeia do SDK, perfil de runtime) |
 | `OUTBOX_PUBLISHERS` | `1` | executores do publicador da outbox por processo (0 a 8; `0` desliga — sem destino nem credenciais exigidos) |
 | `SNS_EVENT_TOPIC_ARN` | — (obrigatório com publicador) | ARN do tópico FIFO de saída (`arn:aws:sns:us-east-1:000000000000:wager-events.fifo` no MiniStack) |
 | `OUTBOX_CREDENTIALS_FILE`, `OUTBOX_AWS_PROFILE` | `AWS_SHARED_CREDENTIALS_FILE`, `wager-publisher` | arquivo e **perfil do principal publisher**, lidos pelo construtor do cliente SNS (o cliente SQS de readiness segue com `wager-runtime`; nenhuma variável global do processo é alterada) |
@@ -237,7 +246,7 @@ reler o arquivo).
 | Principal (usuário IAM = perfil) | Permissões (por ação e recurso, sem curingas) |
 | --- | --- |
 | `wager-producer` (produtor interno) | `SendMessage`, `GetQueueUrl` na entrada. Sem consumo, remoção, DLQ ou SNS |
-| `wager-runtime` (consumidor; **selecionado pela API**) | na entrada: `GetQueueUrl`, `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility`; na DLQ: `GetQueueUrl`, `SendMessage` |
+| `wager-runtime` (consumidor; **selecionado pela API**) | na entrada: `GetQueueUrl`, `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility`; na DLQ: `GetQueueUrl`, `SendMessage` e `GetQueueAttributes` (só a profundidade aproximada, para a métrica; nada na entrada nem na auditoria) |
 | `wager-publisher` (publicador da outbox; cliente SNS próprio) | `sns:Publish` e `sns:GetTopicAttributes` no tópico de eventos. Não consome a entrada |
 | `wager-inspector` (testes/diagnóstico) | observa e prepara cenários na DLQ e na fila de auditoria; atributos da entrada; assinaturas do tópico |
 | `wager-nobody` | nenhuma política (comprova `AccessDenied`) |
@@ -294,7 +303,8 @@ por versões anteriores, **não apague nada**: rode `migrate up` (no Compose: `d
   `REFUND`, `ROLLBACK`) precisa, no COMMIT, do lançamento da própria carteira, e `result_balance` tem de ser o `balance_after`
   desse lançamento (`LOSS` e rejeições não têm lançamento).
 
-* `00007_outbox_publisher_lease.sql` — **versão final esperada pela aplicação (7)**; reserva do publicador da outbox: `lease_token` e `lease_expires_at` (ambos NULL ou ambos preenchidos; nunca num evento publicado) e o marcador `published_at`, uma vez gravado, passa a ser imutável. Eventos, snapshots, agenda, tentativas, diagnósticos e marcadores existentes ficam intactos (as colunas novas chegam NULL e o backlog é publicado normalmente). Reversão (`migrate down`, um passo): descarta só a reserva (transitória) e restaura o guard anterior; nada mais muda.
+* `00008_inbox_and_message_diagnostics.sql` — **versão final esperada pela aplicação (8)**; `inbox_messages` (identidade `(consumer_name, message_id)`, `body_hash` = SHA-256 dos bytes exatos, linha **já concluída**, `transaction_id` NOT NULL com FK) e `message_diagnostics` (recusas permanentes, sem transação nem corpo financeiro); ambas append-only (trigger recusa UPDATE/DELETE/TRUNCATE até para o dono; o runtime só tem SELECT e INSERT). A reversão descarta as duas tabelas (a idempotência financeira vive em `wager_transactions` e não é afetada).
+* `00007_outbox_publisher_lease.sql` — versão anterior; reserva do publicador da outbox: `lease_token` e `lease_expires_at` (ambos NULL ou ambos preenchidos; nunca num evento publicado) e o marcador `published_at`, uma vez gravado, passa a ser imutável. Eventos, snapshots, agenda, tentativas, diagnósticos e marcadores existentes ficam intactos (as colunas novas chegam NULL e o backlog é publicado normalmente). Reversão (`migrate down`, um passo): descarta só a reserva (transitória) e restaura o guard anterior; nada mais muda.
 * `00006_pending_shape_and_schedule_preservation.sql` — corrige dois achados da auditoria sem reescrever a 00005; corrige dois achados da auditoria sem reescrever a 00005. (1) **Forma de `PENDING_REFERENCE` imposta no schema**: a referência externa, quando existe, precisa ter uma forma que a reidratação aceita (não vazia, ≤ 128 caracteres, sem caracteres de controle nem espaços nas pontas, diferente do próprio id externo) e `PENDING_REFERENCE` só existe para origem externa, tipo `WIN`/`REFUND`/`ROLLBACK` e com referência externa; o histórico incompatível é **recusado** (contagem e primeiros ids, sob exclusão dos escritores), nunca corrigido. (2) **Restaura a agenda preservada** por um rollback anterior (ver abaixo). Reversão: remove as garantias; não toca em dados.
 * `00005_references_and_reversals.sql` — Instala no banco as garantias das reversões e das
   pendências (referência interna coerente com a externa e o escopo, alvo `PROCESSED` de tipo elegível, valor integral, sentido do
@@ -320,7 +330,7 @@ instala nada: reverter só retrocede a versão) e **não altera dados**.
 ```sh
 docker compose stop api                 # recomendado: parar todos os escritores (todas as instâncias da API)
 docker compose run --rm migrate up      # papel dono do schema; espera escritores abertos e valida sob exclusão
-docker compose run --rm migrate status  # a versão final (00007) precisa constar como aplicada
+docker compose run --rm migrate status  # a versão final (00008) precisa constar como aplicada
 docker compose up -d --build api        # a API só inicia na versão final do schema
 ```
 
@@ -409,6 +419,71 @@ falha em voz alta com `AccessDenied`. **Shutdown:** o publicador é um component
 publicação/confirmação em andamento é drenada, no limite de drenagem a publicação é cancelada e a **reserva é liberada** (nunca confirmada), e `Done`
 só fecha depois da ação SQL final, que usa contexto próprio e é limitada **ao `OUTBOX_SQL_TIMEOUT` e ao prazo global restante** (nunca amplia o primeiro nem passa do segundo; o rollback do repositório também). Sem orçamento restante, nenhum SQL novo é iniciado, nem com um prazo artificial: a lease vence e o evento é recuperado (um envio já aceito é republicado com o mesmo `eventId`).
 
+## Consumidor SQS e inbox
+
+A fila `wager-transactions.fifo` é de **produtores internos confiáveis**; provedores externos não recebem `SendMessage` direto. O consumidor
+(componente do coordenador de lifecycle, principal **wager-runtime**) recebe **uma** mensagem por busca em cada executor livre e a trata com o
+**mesmo núcleo financeiro do HTTP** (`Service.processExternal`), numa única transação que também grava a inbox.
+
+**Envelope** (`WagerTransactionRequested`): `messageId`, `type`, `occurredAt` (RFC 3339) e `data` com `providerId`, `externalTransactionId`,
+`idempotencyKey`, `playerId`, `walletId`, `roundId`, `gameId`, `kind`, `money {amount, currency}` e `referenceExternalTransactionId` opcional.
+Validação explícita: um único objeto JSON, sem campos desconhecidos, tipos exatos (valores monetários são strings; nada passa por `float`) e `OPENING`
+recusado. A chave financeira é `data.idempotencyKey` (nunca derivada do `messageId`). **`MessageGroupId = walletId`; `MessageDeduplicationId = messageId`.**
+
+**Inbox.** Identidade `(consumerName, messageId do envelope)` com UNIQUE no banco; `body_hash` = SHA-256 dos **bytes exatos** recebidos (distinto do hash
+financeiro canônico). Uma tentativa SQL: consulta a inbox → `processExternal` → grava a inbox (já concluída) → commit; saldo, transação, ledger, agenda de
+pendência, outbox e inbox compartilham o commit, e qualquer falha desfaz tudo. Mesmo `messageId` e mesmo hash já concluído = **duplicata** (nada é
+reaplicado); mesmo `messageId` com **outro** corpo = **conflito permanente** (a inbox original não é tocada); envelope novo para uma operação já registrada =
+**replay financeiro** (nova linha de inbox, resultado original). Unicidades revelam corridas: a tentativa é desfeita e uma nova a enxerga.
+
+| Resultado | Commit durável e ação de transporte |
+| --- | --- |
+| PROCESSED, replay financeiro, duplicata | inbox e efeitos confirmados → `DeleteMessage` (receipt handle da entrega atual) |
+| REJECTED por regra de negócio | rejeição, evento e inbox confirmados → `DeleteMessage`; sem ledger |
+| PENDING_REFERENCE | pendência, agenda, evento e inbox confirmados → `DeleteMessage`; o worker de referências assume |
+| Transitório, disputa, commit incerto, erro inesperado | **nada é removido**; `ChangeMessageVisibility` com backoff (5 s a 60 s, jitter, a partir do `ApproximateReceiveCount`, arredondado para cima) |
+| Envelope inválido, `OPENING`, carteira inexistente/divergente, moeda ou tipo não aceitos, conflito de identidade ou de idempotência | **diagnóstico confirmado → envio confirmado à DLQ → `DeleteMessage`** |
+
+O diagnóstico (`message_diagnostics`: consumidor, fila, id do broker, hash, código estável) **não é uma operação financeira**: não há transação nem ledger fictícios. Um
+diagnóstico existente **não dispensa** o envio à DLQ: depois de uma queda entre o diagnóstico e o envio, a reentrega o retoma (consulta o diagnóstico antes de
+tratar; erro de consulta é retry, nunca "ausente"). O corpo original vai à DLQ; `MessageGroupId` = `walletId` (ou `unparsed` se o corpo não é legível) e
+`MessageDeduplicationId` = SHA-256 de fila + id do broker + hash. Falha do banco não é diagnóstico confirmado; envio ou remoção com resultado incerto mantém a origem
+recuperável (a DLQ pode receber a duplicata, aceita para não perder). Erro desconhecido é sempre recuperável: **nunca vira rejeição permanente**.
+
+**Limites e parâmetros.** Visibility timeout 60 s e redrive após 5 recebimentos (`maxReceiveCount` conta recebimentos, não commits: uma operação PROCESSED cuja remoção falhe
+repetidamente pode chegar à DLQ sem que o resultado financeiro mude — o destino da mensagem não é o estado do dinheiro). 4 executores por processo, fase financeira
+10 s e ações de transporte 5 s (a validação exige fase + 3×ação menor que a visibilidade). Sem renovação de visibilidade. Falhas consecutivas pausam as buscas (exponencial até
+30 s), sem transação SQL durante nenhuma espera de rede. Um grupo FIFO em retry atrasa só ele mesmo; as travas do PostgreSQL continuam autoritativas.
+
+**Encerramento.** A admissão cancela o long polling e impede despachar trabalho novo; o tratamento admitido segue até o limite de drenagem (uma mensagem recebida por uma busca
+concorrente ao fechamento é devolvida com visibilidade 0, nunca removida). No limite, o tratamento é cancelado e a mensagem liberada para reentrega. As ações finais no broker usam
+o menor **instante absoluto** entre o limite próprio e o prazo global, e sem orçamento nada novo começa (a visibilidade devolve a mensagem). `Done` inclui buscas, SQL/rollback e
+ações finais.
+
+**Produtor interno** (`cmd/sqs-producer`, principal **wager-producer**): autentica a origem (client credentials verificado contra o IdP pelo verificador existente), vincula-a ao
+`providerId` do envelope (**provider-a não publica como provider-b**; o serviço interno publica para qualquer provedor; o corpo não autentica ninguém) e só então envia o corpo exato.
+`docker compose run --rm -T -e PRODUCER_CLIENT_ID=provider-a -e PRODUCER_CLIENT_SECRET=... sqs-producer < envelope.json`. O MiniStack avalia políticas, mas **não valida SigV4**:
+isto é autorização emulada, não autenticação AWS completa.
+
+## Métricas
+
+`GET /metrics` (texto compatível com Prometheus), **somente `internal-service`** (401 sem token, 403 para provedor; `/health/*` segue público). Contadores **locais ao processo**
+(reiniciam com ele), observados **depois do commit**; **não são contabilidade financeira** (ledger, inbox e outbox são a fonte de verdade) e podem perder uma observação entre o commit
+e a emissão. Rótulos de conjuntos limitados (nunca ids, hashes, `providerId` livre ou texto de erro; excedente vira `other`). Dinheiro nunca aparece.
+
+| Categoria do enunciado | Métrica |
+| --- | --- |
+| Resultados por status | `wager_transactions_total{origin=http\|sqs\|references,kind,status,replay}` (replay financeiro distinguido) |
+| Duplicatas | `wager_inbox_total{outcome=new\|duplicate\|conflict}` (duplicata da inbox ≠ replay financeiro) |
+| Retries | `wager_retries_total{component=consumer\|outbox\|references,reason}` |
+| DLQ | `wager_dlq_forwarded_total{code}` (envio manual CONFIRMADO) e `wager_dlq_messages_approx{state}` (gauge aproximado do broker, lido sob demanda) |
+| Conflitos de concorrência | `wager_concurrency_conflicts_total{reason}` (unicidades resolvidas por nova tentativa, carteira ocupada, lease perdida) |
+| Atraso da outbox | `wager_outbox_pending`, `wager_outbox_reserved`, `wager_outbox_oldest_pending_age_seconds` (sob demanda, do estado durável) e `wager_outbox_published_total` |
+| Latência | `wager_processing_seconds_sum/_count{component=http_submit\|sqs_message\|outbox_publish}` (soma e contagem; sem percentis) |
+| Divergências de reconciliação | `wager_reconciliation_divergences_total` (só divergência REAL, via `WithReconciliationObserver`) e `wager_reconciliation_errors_total` |
+
+Os gauges são coletados **sob demanda, com prazo de 2 s por fonte**; se a coleta falhar, as amostras são **omitidas** e `wager_collector_up{source="outbox|dlq"}` vale 0 — nunca um zero fictício.
+
 ## Executar a aplicação sem Docker para a API
 
 ```sh
@@ -461,6 +536,10 @@ Variáveis opcionais (padrões coincidem com o Compose): `TEST_DATABASE_URL`, `T
 | Movimento concluído | `completed_movement_test.go` | **pelo papel restrito**, com payloads de hash válido: `BET PROCESSED` sem lançamento nem alteração da carteira, `OPENING` sem lançamento, `PENDING`→`PROCESSED` sem lançamento e resultado diferente do `balance_after` do lançamento (777,00 × 90,00; zero × 90,00) são recusados no COMMIT; várias operações válidas na mesma transação SQL guardam o resultado próprio e o replay (HTTP) devolve o saldo original; `LOSS` e rejeições seguem sem lançamento |
 | Publicador da outbox (store) | `outbox_store_test.go` | evento de transação aberta/revertida nunca é reservado; reserva exclusiva e expiração com **token novo** (mesma instância); executor antigo não confirma/reagenda/libera o estado do novo dono (nem com a lease vencida e sem novo dono); **confirmação que esperou um lock** é validada depois da espera (a posse venceu durante ela); backoff persistido e prefixos em retry, sob lease ou travados não escondem os seguintes; 8 reservadores simultâneos nunca dividem um evento; privilégios do runtime (só colunas de controle), imutabilidade e forma da reserva impostas pelo banco; upgrade 6→7, reversão e reaplicação preservam eventos, agenda, tentativas, diagnósticos e marcadores |
 | Publicador da outbox (SNS) | `outbox_publisher_test.go`, `internal/outbox/outbox_test.go` | todos os tipos de evento (backlog anterior inclusive) com snapshot exato, `walletId` como grupo (≠ `aggregateId`) e `eventId` como deduplicação, observados na fila assinante; sem permissão: `AccessDenied` na partida e retry sem `published_at`; dois publishers sem dividir eventos; reserva abandonada recuperada; **envio sem confirmação → republicação do mesmo `eventId`/snapshot sem efeito financeiro**; falha/resultado incerto do `Publish` e da confirmação, backoff do banco preservado entre instâncias; evento em falha persistente não bloqueia nem some; shutdown (drenagem e cancelamento com liberação; **orçamento global curto porém válido, com a ação final esperando um lock real, termina dentro do prazo**); dois processos reais, um morto por `SIGKILL`, e `SIGTERM` drenado |
+| Inbox e entrada de mensagens | `inbox_test.go`, `internal/app/inbound_test.go` | inbox e finanças no mesmo commit (saldo, ledger, outbox, inbox); 50 reentregas = uma inbox e nenhum efeito extra; mesmo `messageId` com outro corpo = conflito permanente com o original intacto; envelope novo para a mesma operação = replay financeiro; rejeição sem ledger; pendência com agenda durável; corrida de entregas resolvida pelo banco; entradas permanentes sem registro financeiro e diagnóstico idempotente; falha transitória/commit incerto/erro inesperado = retry e **falha da inbox desfaz as finanças**; append-only e privilégios mínimos; parsing estrito do envelope |
+| Consumidor SQS | `consumer_test.go`, `sqs_e2e_test.go`, `internal/inbound/consumer_test.go` | todos os tipos por SQS com as mesmas regras; **50 reentregas reais** (recebidas pela aplicação, com bypass controlado da deduplicação FIFO); conflito → diagnóstico → DLQ com o corpo exato antes do Delete; inválidos sem operação fictícia; queda depois do commit e antes do Delete recuperada por reentrega real; diagnóstico já gravado não dispensa o envio à DLQ; retry com backoff sem Delete antes do commit; falha de visibilidade; redrive após o limite; encerramento por drenagem e por cancelamento; produtor vinculado à origem e principais não autorizados negados; HTTP e SQS concorrentes (duas BETs de 80 sobre 100, mesma operação, mesma chave com conteúdo diferente); fluxo completo até o assinante |
+| Métricas | `metrics_test.go`, `internal/metrics/metrics_test.go` | 401/403/200; todas as categorias com observações reais (aplicação completa); rótulos sem ids; backlog e idade da outbox, reservados; divergência real; falha de coleta sem zero fictício |
+| Três processos com SQS | `sqs_multiprocess_test.go` | binário **compilado com `-race`** (corrida ou crash do filho falha o teste), 50 reentregas comprovadas pelos logs, BETs de 80 cruzando HTTP e SQS, `SIGKILL` no meio do tratamento, `SIGTERM` drenado |
 | Banco | `constraints_test.go`, `db_integrity_test.go` | SQL direto: unicidade, saldo não negativo, ledger append-only (UPDATE/DELETE/TRUNCATE), saldo×ledger no mesmo commit, OPENING único, forma interna×externa, política de zero, imutabilidade de terminais e da outbox; **cadeia contínua do ledger** (cenário da revisão, primeiro lançamento, vários lançamentos por transação, escritor concorrente obsoleto, carteira independente não bloqueada); **vínculo lançamento→transação→carteira**; **resultado explícito (NULL e valores inválidos)** |
 | Papéis | `role_test.go` | o papel de runtime não é superusuário nem dono, e 20+ tentativas (UPDATE/DELETE/TRUNCATE do ledger, `DISABLE TRIGGER`, `session_replication_role`, DDL…) são negadas; o fluxo financeiro e a verificação de schema funcionam com ele; provisão idempotente |
 | Upgrade com escritores ativos | `upgrade_window_test.go` | sondagem da auditoria: escritor antigo com `BET PROCESSED` sem lançamento aberto → upgrade espera → commit → o schema **nunca** termina na versão final com o órfão (relata o id, nada é apagado, a API recusa iniciar; corrigido manualmente, o upgrade conclui); escritor retido e escritor válido concorrentes; histórico já inválido (órfã, resultado, cadeia, saldo, lançamento de rejeitada); trigger ausente/desabilitado; escritor que ignora triggers; espera/retenção pelo lock; dados preservados; reversão/reaplicação |
@@ -536,14 +615,14 @@ replay/conflito (409) antes das políticas de operação nova (moeda, tipo).
 
 | Item do enunciado | Situação |
 | --- | --- |
-| Consumidor SQS e tabela de inbox | ausentes (a fila é provisionada e a readiness a verifica) |
+| Consumidor SQS e tabela de inbox | **implementados** (ver [Consumidor SQS e inbox](#consumidor-sqs-e-inbox)) |
 | Publicador de outbox (múltiplas instâncias, backoff, recuperação) | **implementado** (ver [Publicador da outbox](#publicador-da-outbox)); *at-least-once*, sem ordem global; a consolidação com 3 processos para SQS ainda não existe |
-| Métricas (resultados, duplicatas, retries, DLQ, atraso da outbox, reconciliação) | ausentes (a reconciliação já expõe o ponto de integração e o log de divergência); há logs JSON com `correlationId`, `transactionId`, `walletId`, `providerId` |
+| Métricas (resultados, duplicatas, retries, DLQ, atraso da outbox, reconciliação) | **implementadas** (ver [Métricas](#métricas)); contadores locais ao processo, sem percentis; sem tracing nem dashboards |
 | Controle de acesso do broker (credenciais e políticas) | **provado como autorização emulada** (MiniStack 1.5.27, `AUTH=true`; prova na CI). O MiniStack **não valida assinaturas SigV4**: não é autenticação AWS completa nem prova de produção (ver [Broker](#broker-minestack-com-auth-true)). O produtor/consumidor SQS ainda **não** existem |
-| Testes SQS/HTTP cruzados, DLQ, interrupção de consumidor | dependem do consumidor SQS (dois publishers: provados, ver Testes) |
-| Prova com 3 processos para SQS/outbox | HTTP, reversões, pendências e **publicador** (dois processos publicando, um morto por `SIGKILL`) já têm; SQS depende do consumidor |
+| Testes SQS/HTTP cruzados, DLQ, interrupção de consumidor | **provados** (ver Testes) |
+| Prova com 3 processos para SQS/outbox | **provada**: três processos reais do binário compilado com `-race` (consumidor e publisher em cada um), 50 reentregas, duas BETs de 80 sobre 100 cruzando HTTP e SQS, um processo morto por `SIGKILL` e os demais encerrados por `SIGTERM` |
 | Testes de carga, OpenTelemetry, partidas dobradas | opcionais, não feitos |
 | Limites das garantias atuais | o dono do schema e superusuários podem desabilitar triggers (a API roda com papel restrito); o `result_balance` de `LOSS` (saldo observado, sem lançamento) não é verificável contra o ledger; o sentido do lançamento de `ROLLBACK` é imposto no banco desde a 00005 (ARCHITECTURE §10); a regressão de relógio entre instâncias é recusada pelo domínio e tratada por quem chama a transição (ARCHITECTURE §3); rotação de chaves do IdP pode causar 401 por até 30 s |
 
-**Próximo incremento recomendado:** inbox + consumidor SQS sobre o mesmo núcleo financeiro (`Service.processExternal`). A infraestrutura do broker já está decidida e provada (MiniStack 1.5.27, `AUTH=true`; ver "Broker").
+**Estado:** todos os componentes obrigatórios existem. O que não foi feito: fuzz, carga, tracing, dashboards, partidas dobradas e renovação de lease/visibilidade. Detalhes e limites em `ARCHITECTURE.md`.
 Detalhes em `ARCHITECTURE.md`.

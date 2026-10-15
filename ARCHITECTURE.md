@@ -213,11 +213,17 @@ continuidade durável.
   consumidores deduplicam por `eventId` (a entrega é *at-least-once*; a deduplicação do broker é temporária) e projeções de saldo aplicam
   `balanceAfter` só se `walletVersion` for maior, de forma atômica; consumidores de histórico preservam os eventos relevantes. Limites: sem renovação
   de lease (uma publicação mais longa que a lease pode ser republicada); o token protege o estado SQL, não uma publicação antiga já enviada.
-* **Inbox**: tabela e consumidor **não criados** (sem schema fictício). Desenho previsto: `UNIQUE(consumer_name,
-  message_id)` + hash, inserida na mesma transação do caso de uso; `Submit` já é reutilizável pela entrada SQS
-  (a chave é `data.idempotencyKey`). Fila: `MessageGroupId = walletId`, `MessageDeduplicationId = messageId`,
-  visibilidade 60 s, `maxReceiveCount = 5` → DLQ; mensagens inválidas vão direto para a DLQ; rejeição de negócio
-  confirmada remove a mensagem.
+* **Inbox e consumidor (incremento 4)** — `inbox_messages` (migration 00008): identidade `(consumer_name, message_id do envelope)` com UNIQUE, `body_hash` = SHA-256 dos
+  **bytes exatos** (≠ hash financeiro canônico), linha **já concluída** e ligada por FK à transação tratada. `Service.ProcessMessage` abre UMA UnitOfWork, consulta a inbox
+  (mesmo hash = duplicata; outro hash = conflito permanente, original intacto), chama o **mesmo `processExternal` do HTTP** com os repositórios da tentativa e grava a inbox no
+  mesmo commit de saldo, transação, ledger, agenda e outbox. Uma violação de unicidade (da inbox ou financeira) desfaz a tentativa e uma nova a enxerga; nunca é sucesso por si só.
+  Resultado classificado: Done (remover depois do commit), Retry (transitório, disputa, commit incerto, erro inesperado: nunca remover) ou Permanent (diagnóstico confirmado →
+  DLQ confirmada → Delete; sem transação fictícia). `message_diagnostics` é o registro operacional (consumidor, fila, id do broker, hash, código), append-only, e é consultado
+  ANTES do tratamento para retomar o envio à DLQ. O consumidor (`internal/inbound`) é um componente do coordenador: 4 executores, uma mensagem por busca, busca (contexto
+  cancelado na admissão) separada do tratamento (cancelado no limite), backoff pelo `ApproximateReceiveCount`, pausa em falha consecutiva e ações finais com o menor **instante absoluto**
+  entre o limite próprio e o prazo global. Produtor interno: `MessageGroupId = walletId`, `MessageDeduplicationId = messageId`, origem vinculada ao `Principal` do verificador existente.
+  Limites: sem renovação de visibilidade; `maxReceiveCount` conta recebimentos (uma operação PROCESSED pode ir à DLQ após falhas de remoção, sem alterar o dinheiro); a dedup FIFO é temporária
+  (a idempotência durável é a inbox e a idempotência financeira).
 
 ## 8. Reversões, referências e pendências (implementado)
 
@@ -360,7 +366,7 @@ continuidade durável.
 
 ## 10. Garantias impostas pelo PostgreSQL (§5.3, §5.8)
 
-Migrations `00001_init.sql` a `00007_…` — verificadas por tentativas **diretas de SQL** (inclusive pelo papel restrito de runtime) em `constraints_test.go`, `db_integrity_test.go` e `completed_movement_test.go`:
+Migrations `00001_init.sql` a `00008_…` — verificadas por tentativas **diretas de SQL** (inclusive pelo papel restrito de runtime) em `constraints_test.go`, `db_integrity_test.go` e `completed_movement_test.go`:
 
 | Garantia | Mecanismo |
 | --- | --- |
@@ -384,6 +390,7 @@ Migrations `00001_init.sql` a `00007_…` — verificadas por tentativas **diret
 | Forma por estado | `CHECK` com `IS NOT NULL` explícito: `PROCESSED` exige `result_balance` não nulo e ≥ 0; `REJECTED` exige código e resultado; `PENDING*` não têm código nem resultado; `FAILED` exige código (um `CHECK` aceita `NULL` como "desconhecido", então `>= 0` sozinho não basta). Formato do `failure_code` também por `CHECK` |
 | Terminais imutáveis; transações nunca apagadas | trigger `wager_transactions_guard` |
 | Outbox: snapshot imutável; `published_at` imutável depois de gravado (00007) | trigger `outbox_events_guard` (só tentativas/agenda/reserva/publicação mudam) |
+| Inbox e diagnósticos append-only (00008) | trigger `message_records_forbid_mutation` (UPDATE/DELETE/TRUNCATE recusados, também ao dono); `ck_inbox_*` (hash de 32 bytes, disposição, identidade não vazia), FK `transaction_id` NOT NULL |
 | Outbox: forma da reserva (00007) | `CHECK ck_outbox_lease_pair` (token e prazo juntos) e `ck_outbox_published_has_no_lease` (evento publicado não tem reserva) |
 | **Referência coerente** (migration 00005) | trigger `BEFORE INSERT/UPDATE` `wager_tx_reference_guard`: a referência interna aponta para o alvo com o **mesmo** provedor, id externo referenciado, jogador, carteira, moeda e rodada; alvo `PROCESSED`; tipo elegível (`REFUND`→`BET`, `WIN`→`BET`, `ROLLBACK`→`BET|WIN|REFUND`); reversões com **valor idêntico**. `CHECK`: referência interna exige a externa (`ck_wager_tx_reference_pair`) e não pode ser a própria transação |
 | **Referência resolvida para concluir** | `CHECK ck_wager_tx_processed_reference`: `REFUND`, `ROLLBACK` e `WIN` com referência externa só ficam `PROCESSED` com a referência interna preenchida (forma `NULL` coberta explicitamente) |
@@ -421,6 +428,7 @@ versão anterior).
 | --- | --- | --- | --- |
 | `00002_ledger_chain_and_result_integrity` | cadeia do ledger quebrada; lançamento incoerente com sua transação; `PROCESSED`/`REJECTED` com resultado nulo; `failure_code` inválido; saldo ≠ ledger | cadeia contínua, FK composta, resultado explícito | remove o que instalou |
 | `00003_completed_movement_requires_ledger` | transação `PROCESSED` (≠ `LOSS`) **sem lançamento**; `result_balance` ≠ `balance_after` do lançamento | trigger deferido da transação e verificação de resultado no lado do ledger | remove o trigger e restaura a função de 00002; **não toca nos dados** (após a reversão a lacuna volta a existir) |
+| `00008_inbox_and_message_diagnostics` | sem preflight (tabelas novas) | `inbox_messages`, `message_diagnostics` e o trigger append-only | descarta as duas tabelas (dedup por mensagem e diagnósticos; a idempotência financeira não é afetada) |
 | `00007_outbox_publisher_lease` | sem preflight (as colunas novas chegam NULL; o backlog não é tocado) | `lease_token`, `lease_expires_at`, `ck_outbox_lease_pair`, `ck_outbox_published_has_no_lease` e o guard que torna `published_at` imutável | descarta só a reserva (transitória), restaura o guard da 00001; eventos, agenda, tentativas, diagnósticos e marcadores permanecem |
 | `00006_pending_shape_and_schedule_preservation` | **exclusão dos escritores**; recusa, com contagem e primeiros ids: `PENDING_REFERENCE` irretomável (não externo, tipo que não espera referência, ou referência ausente/inválida), referência externa com forma que a reidratação rejeita (vazia, > 128, controle, espaços nas pontas, igual ao próprio id) e cópia preservada sem transação correspondente | `CHECK ck_wager_tx_reference_form` (qualquer estado) e `ck_wager_tx_pending_reference_shape`, função `wager_valid_external_reference`; **restaura** a agenda preservada por um rollback anterior (valores originais, inclusive as concluídas) sobre as linhas que o `Up` da 00005 reconstruiu, e remove a cópia | remove os dois `CHECK` e a função; não toca em dados |
 | `00005_references_and_reversals` | **exclusão dos escritores** (mesmo `LOCK TABLE` da 00004) e, com eles excluídos: transação confirmada como `PENDING`; reversão/`WIN` com referência `PROCESSED` sem a referência interna; referência interna incoerente com a externa, o escopo, o tipo, o estado ou o valor; alvo com mais de uma reversão `PROCESSED`; lançamento de `ROLLBACK` no sentido errado (contagem e primeiros ids) | tudo o que está em §10 na linha "Referência coerente" em diante, mais a agenda `pending_references` | remove as garantias, restaura as funções da 00001/00003 e `DROP`a a agenda (transações e ledger intactos). **O migrador preserva a agenda antes dessa reversão e a 00006 a restaura na reaplicação** — ver "Rollback e a agenda das pendências" abaixo |
@@ -584,8 +592,11 @@ espera/retenção pelo lock, dados preservados, reversão/reaplicação e partid
   além do necessário ao diagnóstico.
 * Health: `/health/live` (processo) e `/health/ready` (PostgreSQL `Ping` + SQS `GetQueueUrl`, em paralelo, prazo de 2 s;
   503 se qualquer um falhar). O IdP não entra na readiness (o JWKS fica em cache; falha dele aparece como 401).
-* **Pendente**: métricas (resultados por status, duplicatas, retries, DLQ, conflitos de concorrência, atraso da outbox,
-  latência, divergências de reconciliação) e tracing. O worker de referências registra em log (`transactionId`, `walletId`, `providerId`,
+* **Métricas (incremento 5)**: `GET /metrics` (somente `internal-service`), texto compatível com Prometheus, contadores LOCAIS ao processo observados depois do commit via `app.Observer`
+  (resultados por origem/tipo/status/replay; inbox new/duplicate/conflict; retries por componente; DLQ confirmada; conflitos de concorrência; divergência REAL de reconciliação por
+  `WithReconciliationObserver`), latência como soma e contagem, e gauges coletados SOB DEMANDA com prazo (backlog, reservados e idade da outbox; profundidade aproximada da DLQ com
+  `GetQueueAttributes` só na DLQ). Falha de coleta omite as amostras e marca `wager_collector_up` = 0, nunca um zero fictício. Rótulos limitados, sem ids; não é contabilidade financeira.
+  Sem tracing nem dashboards. O worker de referências registra em log (`transactionId`, `walletId`, `providerId`,
   `kind`, `status`, `failureCode`) cada pendência concluída e cada tentativa abortada.
 
 ## 13. Interpretações adotadas (resumo)
@@ -605,9 +616,9 @@ espera/retenção pelo lock, dados preservados, reversão/reaplicação e partid
 
 ## 14. Limitações e trabalho não concluído
 
-Ver "Escopo e pendências" no README. Em síntese, **ainda ausentes**: SQS + inbox (consumidor, retry/DLQ, produtor autorizado), métricas (`GET /metrics`), e a prova com três processos para os fluxos SQS (o publicador tem dois processos reais e um `SIGKILL`). O controle de acesso do
+Ver "Escopo e pendências" no README. Em síntese, **fora do escopo entregue**: fuzz, carga, tracing, dashboards, partidas dobradas e renovação de lease/visibilidade. O controle de acesso do
 broker está **provado como autorização emulada** (§9), com o limite de não validar SigV4. A prova com três processos **existe** para
-HTTP (apostas, WIN/LOSS) e para reversões e pendências com o worker real (`references_multiprocess_test.go`).
+HTTP (apostas, WIN/LOSS), reversões e pendências com o worker real e, no incremento 4, para SQS + outbox (`sqs_multiprocess_test.go`, filhos compilados com `-race`).
 
 Limites das garantias atuais (detalhes nas seções indicadas): dono do schema e superusuários podem desabilitar triggers — a aplicação
 nunca roda com eles (§10.1); o `result_balance` de `LOSS` não é verificável contra o ledger (§10.2); a regressão de relógio entre instâncias

@@ -113,6 +113,10 @@ services:
       AWS_SHARED_CREDENTIALS_FILE: /run/broker/credentials
       AWS_PROFILE: wager-runtime
       SQS_WAGER_QUEUE_NAME: wager-transactions.fifo
+      # Consumidor SQS (incremento 4): principal de RUNTIME (receber, remover, visibilidade, DLQ), 4 executores, nome estável.
+      SQS_CONSUMERS: "4"
+      CONSUMER_NAME: wager-consumer
+      SQS_DLQ_NAME: wager-transactions-dlq.fifo
       # Publicador da outbox: principal próprio (perfil wager-publisher do mesmo arquivo montado) e tópico de eventos.
       OUTBOX_PUBLISHERS: "1"
       OUTBOX_AWS_PROFILE: wager-publisher
@@ -134,6 +138,31 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
+
+  # One-shot (perfil "tools"): produtor INTERNO da fila de entrada. Autentica a origem (client credentials verificado contra o IdP), vincula-a
+  # ao providerId do envelope e envia o corpo exato com o principal wager-producer. Uso (envelope na entrada padrão):
+  #   docker compose run --rm -T -e PRODUCER_CLIENT_ID=provider-a -e PRODUCER_CLIENT_SECRET=... sqs-producer < envelope.json
+  sqs-producer:
+    build: .
+    profiles: ["tools"]
+    entrypoint: ["/app/sqs-producer"]
+    environment:
+      KEYCLOAK_TOKEN_URL: http://keycloak:8080/realms/wager/protocol/openid-connect/token
+      OIDC_ISSUER: http://localhost:${KEYCLOAK_PORT:-8081}/realms/wager
+      OIDC_JWKS_URL: http://keycloak:8080/realms/wager/protocol/openid-connect/certs
+      OIDC_AUDIENCE: wager-api
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://ministack:4566
+      BROKER_CREDENTIALS_FILE: /run/broker/credentials
+      SQS_WAGER_QUEUE_NAME: wager-transactions.fifo
+    volumes:
+      - ${BROKER_DIR:-./.local/broker}:/run/broker:ro
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      broker-provision:
+        condition: service_completed_successfully
+    restart: "no"
 
 volumes:
   pgdata:
