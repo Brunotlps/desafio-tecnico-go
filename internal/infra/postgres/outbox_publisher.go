@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,7 +21,11 @@ import (
 // transação curta — primeiro o lock da linha (onde a espera acontece), depois o UPDATE, cujo predicado de posse é avaliado
 // só depois do lock. (Um único UPDATE não bastaria: se o lock é solto sem alterar a linha, o PostgreSQL não reavalia o
 // predicado, e uma posse vencida durante a espera seria aceita.)
-type OutboxStore struct{ src PoolSource }
+type OutboxStore struct {
+	src PoolSource
+	// shutdownDeadline, quando definido, limita o rollback ao prazo global restante do encerramento.
+	shutdownDeadline atomic.Pointer[time.Time]
+}
 
 // NewOutboxStore cria o repositório de controle da publicação. O pool é resolvido a cada operação.
 func NewOutboxStore(src PoolSource) *OutboxStore { return &OutboxStore{src: src} }
@@ -36,9 +41,18 @@ func (s *OutboxStore) begin(ctx context.Context) (pgx.Tx, error) {
 	return tx, classify(err)
 }
 
-// rollback desfaz sem depender do contexto da operação (devolve a conexão sem locks pendentes), com prazo próprio e curto.
-func rollback(tx pgx.Tx) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+// SetShutdownDeadline informa o prazo global do encerramento: a partir daí, o rollback de uma operação nunca o ultrapassa. Um
+// prazo já vencido faz o rollback falhar sem esperar a rede, e o driver descarta a conexão (o servidor desfaz a transação).
+func (s *OutboxStore) SetShutdownDeadline(deadline time.Time) { s.shutdownDeadline.Store(&deadline) }
+
+// rollback desfaz sem depender do contexto da operação (devolve a conexão sem locks pendentes), com prazo próprio de até 2 s e
+// nunca além do prazo global do encerramento.
+func (s *OutboxStore) rollback(tx pgx.Tx) {
+	deadline := time.Now().Add(2 * time.Second)
+	if p := s.shutdownDeadline.Load(); p != nil && p.Before(deadline) {
+		deadline = *p
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	_ = tx.Rollback(ctx)
 }
@@ -53,7 +67,7 @@ func (s *OutboxStore) Reserve(ctx context.Context, lease time.Duration) (*outbox
 	if err != nil {
 		return nil, err
 	}
-	defer rollback(tx)
+	defer s.rollback(tx)
 	token := uuid.New()
 	var r outbox.Reservation
 	var wallet *string
@@ -95,7 +109,7 @@ func (s *OutboxStore) owned(ctx context.Context, r outbox.Reservation, update st
 	if err != nil {
 		return err
 	}
-	defer rollback(tx)
+	defer s.rollback(tx)
 	// A espera por um lock de outra transação acontece aqui, sob o prazo do contexto.
 	var id uuid.UUID
 	if err := tx.QueryRow(ctx, `SELECT id FROM outbox_events WHERE id = $1 FOR UPDATE`, r.EventID).Scan(&id); err != nil {

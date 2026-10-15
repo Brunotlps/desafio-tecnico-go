@@ -678,3 +678,94 @@ func TestTwoPublisherProcessesDrainTheOutboxAndRecoverFromSIGKILL(t *testing.T) 
 	}
 	t.Logf("killed the first process with %d of %d events unpublished (%d under its lease when sampled); all were published afterwards", killedAt, len(ids), leasedAtKill)
 }
+
+// Orçamento SQL final: com um encerramento curto, porém VÁLIDO (config.Validate), a ação SQL final de um publisher que espera um lock
+// termina dentro do prazo global restante — nunca com um prazo maior que o SQLTimeout nem posterior ao orçamento. O lock é real e
+// observável (a ação final espera por ele em pg_stat_activity); nada é publicado como sucesso nem perdido: a reserva segue com o
+// token e a lease, e vence sozinha.
+func TestAValidatedShortShutdownBudgetBoundsTheFinalSQLAction(t *testing.T) {
+	e := newStoreEnv(t)
+	ctx := context.Background()
+	cfg := config.Config{
+		ShutdownTimeout: 130 * time.Millisecond, ShutdownDrain: 80 * time.Millisecond, // reserva de 50 ms
+		ReferenceTTL: time.Minute, ReferenceBackoffInitial: time.Second, ReferenceBackoffMax: time.Second,
+		ReferencePollInterval: time.Second, ReferencePhaseTimeout: 50 * time.Millisecond, ReferenceWorkers: 0,
+		OutboxPublishers: 1, OutboxLease: 20 * time.Second, OutboxPublishTimeout: 20 * time.Millisecond, OutboxSQLTimeout: 40 * time.Millisecond,
+		OutboxPollInterval: 5 * time.Millisecond, OutboxBackoffInitial: 10 * time.Millisecond, OutboxBackoffMax: 20 * time.Millisecond,
+		SNSEventTopicARN: "arn:aws:sns:us-east-1:000000000000:wager-events.fifo", OutboxCredentialsFile: "unused", OutboxAWSProfile: "unused",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("the short budget must be an accepted configuration: %v", err)
+	}
+	pcfg := outbox.Config{Workers: 1, Lease: cfg.OutboxLease, PublishTimeout: cfg.OutboxPublishTimeout, SQLTimeout: cfg.OutboxSQLTimeout,
+		PollInterval: cfg.OutboxPollInterval, BackoffInitial: cfg.OutboxBackoffInitial, BackoffMax: cfg.OutboxBackoffMax}
+	if err := pcfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	id := e.insertEvent(uuid.NewString(), "WalletBalanceChanged")
+	inflight, gate := make(chan struct{}, 1), make(chan struct{})
+	// Sink que respeita o contexto: depois do portão devolve o erro do contexto da publicação (prazo de 20 ms já vencido).
+	sink := sinkFunc(func(c context.Context, _ outbox.Message) error {
+		inflight <- struct{}{}
+		<-gate
+		return c.Err()
+	})
+	p := outbox.New(e.store(), sink, pcfg, quietLog())
+	co := lifecycle.New(quietLog(), cfg.ShutdownDrain)
+	co.OnShutdown(p.SetShutdownDeadline)
+	co.Add(p)
+	if err := co.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-inflight // o evento está reservado e a publicação em andamento
+
+	// A linha da outbox é retida por outra transação: a ação final vai esperar por este lock.
+	holder, err := e.owner.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = holder.Rollback(context.Background()) })
+	if _, err := holder.Exec(ctx, `SELECT 1 FROM outbox_events WHERE id = $1 FOR UPDATE`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	begin := time.Now()
+	stopped := make(chan error, 1)
+	go func() {
+		sctx, cancel := context.WithDeadline(ctx, begin.Add(cfg.ShutdownTimeout))
+		defer cancel()
+		stopped <- co.Stop(sctx)
+	}()
+	time.Sleep(5 * time.Millisecond) // o observador do prazo global já foi chamado
+	close(gate)
+	var lockObserved bool
+	done := false
+	for !done {
+		select {
+		case <-p.Done():
+			done = true
+		case <-time.After(2 * time.Millisecond):
+			lockObserved = lockObserved || waitingForLock("%outbox_events%WHERE id = $1%")
+		}
+		if time.Since(begin) > 3*time.Second {
+			t.Fatal("the publisher never reported Done")
+		}
+	}
+	elapsed := time.Since(begin)
+	t.Logf("Done after %v (global shutdown budget %v)", elapsed, cfg.ShutdownTimeout)
+	<-stopped // o coordenador pode registrar "incompleto" com um orçamento tão curto: o que se mede é o Done
+	if budget := cfg.ShutdownTimeout + 60*time.Millisecond; elapsed > budget {
+		t.Fatalf("Done after %v: the final SQL action outlived the global shutdown budget (%v + tolerance)", elapsed, cfg.ShutdownTimeout)
+	}
+	if !lockObserved {
+		t.Log("note: the wait for the row lock was not sampled (the action may have ended between two samples)")
+	}
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Sem perda e sem sucesso fictício: a reserva continua com o token (a lease vence sozinha) e nada foi publicado.
+	if s := e.state(id); s.Published || s.Token == nil || s.Attempts != 1 {
+		t.Fatalf("the event must stay reserved and unpublished (lease expiry recovers it): %+v", s)
+	}
+}

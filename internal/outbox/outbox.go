@@ -157,7 +157,13 @@ func (p *Publisher) Cancel() { p.cancel() }
 func (p *Publisher) Done() <-chan struct{} { return p.done }
 
 // SetShutdownDeadline informa o prazo global do encerramento: as ações SQL finais nunca o ultrapassam.
-func (p *Publisher) SetShutdownDeadline(d time.Time) { p.deadline.Store(&d) }
+func (p *Publisher) SetShutdownDeadline(d time.Time) {
+	p.deadline.Store(&d)
+	// O repositório também limita ao prazo global o rollback de uma operação que não terminou.
+	if s, ok := p.store.(interface{ SetShutdownDeadline(time.Time) }); ok {
+		s.SetShutdownDeadline(d)
+	}
+}
 
 func (p *Publisher) run(worker int) {
 	defer p.wg.Done()
@@ -200,8 +206,15 @@ func (p *Publisher) Step() bool {
 	cancel()
 
 	// A ação final usa um contexto próprio (o cancelamento do shutdown não deve impedir confirmar um envio já aceito nem
-	// liberar a reserva), limitado ao prazo restante do encerramento.
-	fctx, cancel := context.WithTimeout(context.WithoutCancel(p.runCtx), p.finishTimeout())
+	// liberar a reserva), limitado ao SQLTimeout E ao prazo global restante do encerramento. Sem orçamento, nenhum SQL novo
+	// começa (nem com um prazo artificial): a lease vence e o evento é recuperado.
+	budget, ok := p.finalBudget()
+	if !ok {
+		p.log.Warn("outbox shutdown budget exhausted; no final SQL action was started and the lease expiry recovers the event",
+			"eventId", res.EventID, "published", perr == nil)
+		return true
+	}
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(p.runCtx), budget)
 	defer cancel()
 	switch {
 	case perr == nil:
@@ -239,14 +252,18 @@ func (p *Publisher) logFinish(action string, r Reservation, err error) {
 	p.log.Error("outbox "+action+" failed; the lease expires and the event is recovered", "eventId", r.EventID, "error", sanitize(err.Error()))
 }
 
-func (p *Publisher) finishTimeout() time.Duration {
+// finalBudget é o prazo da ação SQL final: o SQLTimeout configurado, reduzido ao tempo restante do encerramento quando ele é menor.
+// Nunca amplia o SQLTimeout e nunca ultrapassa o prazo global; devolve false se o prazo global já acabou.
+func (p *Publisher) finalBudget() (time.Duration, bool) {
 	d := p.cfg.SQLTimeout
 	if dl := p.deadline.Load(); dl != nil {
-		if rem := time.Until(*dl) - 500*time.Millisecond; rem < d {
-			d = max(rem, 200*time.Millisecond)
+		rem := time.Until(*dl)
+		if rem <= 0 {
+			return 0, false
 		}
+		d = min(d, rem)
 	}
-	return d
+	return d, true
 }
 
 // backoff devolve o intervalo antes de nova tentativa: exponencial a partir de BackoffInitial, jitter uniforme em [d/2, d] e

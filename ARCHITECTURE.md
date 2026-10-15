@@ -561,7 +561,7 @@ espera/retenção pelo lock, dados preservados, reversão/reaplicação e partid
   cancelamento, cleanup e fechamento das dependências. Sequência: (1) **admissão fechada em todos os componentes ao mesmo tempo**: o servidor
   fecha o listener e responde `503 SHUTTING_DOWN` a requisições novas (inclusive em conexões keep-alive), o worker deixa de buscar trabalho;
   (2) **drenagem simultânea** do trabalho admitido (inclusive a publicação e a confirmação em andamento do publicador); (3) no limite de drenagem, **cancelamento** do que restou (fecha as conexões e cancela o
-  contexto das requisições; cancela a tentativa do worker, cuja transação é desfeita; cancela a publicação em andamento, cuja reserva é **liberada** — a ação SQL final usa contexto próprio limitado ao prazo restante e `Done` só fecha depois dela); (4) **confirmação observável do término** de cada
+  contexto das requisições; cancela a tentativa do worker, cuja transação é desfeita; cancela a publicação em andamento, cuja reserva é **liberada** — a ação SQL final usa contexto próprio, limitada ao `OUTBOX_SQL_TIMEOUT` **e** ao prazo global restante — sem orçamento restante nenhum SQL novo começa e a lease vence — e `Done` só fecha depois dela); (4) **confirmação observável do término** de cada
   componente (`Done`): o servidor só confirma quando o `http.Server` terminou **e** todos os handlers retornaram — o fim do `Serve`, sozinho,
   não prova isso, e cancelar um contexto não prova o fim de uma goroutine; (5) só então o Fx executa os `OnStop` das dependências em ordem
   inversa (verificador, SQS, pool). Se algum componente não confirmar até o prazo global menos uma margem de 1 s, o encerramento é registrado

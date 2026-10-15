@@ -21,9 +21,10 @@ func goodConfig() Config {
 }
 
 type call struct {
-	op     string
-	delay  time.Duration
-	reason string
+	op       string
+	delay    time.Duration
+	reason   string
+	deadline time.Time // prazo do contexto da ação final (zero = sem prazo)
 }
 
 // fakeStore entrega as reservas da fila, uma por Reserve, e registra as escritas.
@@ -56,6 +57,7 @@ func (f *fakeStore) record(ctx context.Context, c call) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	c.deadline, _ = ctx.Deadline()
 	f.calls = append(f.calls, c)
 	return f.finishErr
 }
@@ -293,5 +295,60 @@ func TestStartWithoutWorkersIsDoneImmediatelyAfterStart(t *testing.T) {
 	case <-p.Done():
 	case <-time.After(time.Second):
 		t.Fatal("Done never closed")
+	}
+}
+
+// A ação SQL final nunca amplia o SQLTimeout configurado nem passa do prazo global restante do encerramento.
+func TestTheFinalSQLActionNeverExceedsTheSQLTimeoutNorTheRemainingShutdownTime(t *testing.T) {
+	const slack = 15 * time.Millisecond
+	for name, tc := range map[string]struct {
+		sql      time.Duration
+		deadline time.Duration // a partir de agora; 0 = nenhum prazo informado
+		max      time.Duration // teto esperado para o prazo da ação
+	}{
+		"no global deadline known":       {40 * time.Millisecond, 0, 40 * time.Millisecond},
+		"plenty of time left":            {40 * time.Millisecond, time.Hour, 40 * time.Millisecond},
+		"budget shorter than the SQL":    {40 * time.Millisecond, 15 * time.Millisecond, 15 * time.Millisecond},
+		"validated tiny shutdown budget": {40 * time.Millisecond, 130 * time.Millisecond, 40 * time.Millisecond},
+	} {
+		st := &fakeStore{queue: []Reservation{reservation("w", 1)}}
+		cfg := goodConfig()
+		cfg.SQLTimeout = tc.sql
+		cfg.Lease = 20 * time.Second
+		p := New(st, &fakeSink{}, cfg, quiet())
+		if tc.deadline > 0 {
+			p.SetShutdownDeadline(time.Now().Add(tc.deadline))
+		}
+		start := time.Now()
+		p.Step()
+		c := st.got()
+		if len(c) != 1 {
+			t.Fatalf("%s: expected the final action to run, got %+v", name, c)
+		}
+		if c[0].deadline.IsZero() || c[0].deadline.After(start.Add(tc.max+slack)) {
+			t.Errorf("%s: the final action got a deadline %v after the start, want at most %v", name, c[0].deadline.Sub(start), tc.max)
+		}
+	}
+}
+
+// Sem orçamento restante, nenhum trabalho SQL novo é iniciado com um prazo artificial: a lease vence e o evento é recuperado.
+func TestNoFinalSQLActionIsStartedWhenTheShutdownBudgetIsGone(t *testing.T) {
+	for name, publish := range map[string]func(*Publisher) error{
+		"accepted publication":  func(*Publisher) error { return nil },
+		"failed publication":    func(*Publisher) error { return errors.New("broker unavailable") },
+		"cancelled publication": func(p *Publisher) error { p.Cancel(); return context.Canceled },
+	} {
+		st := &fakeStore{queue: []Reservation{reservation("w", 1)}}
+		var p *Publisher
+		sk := &fakeSink{fn: func(context.Context, Message) error { return publish(p) }}
+		p = New(st, sk, goodConfig(), quiet())
+		p.SetShutdownDeadline(time.Now().Add(-time.Millisecond))
+		p.Step()
+		if len(sk.msgs) != 1 {
+			t.Fatalf("%s: the reserved event is still published or attempted once", name)
+		}
+		if c := st.got(); len(c) != 0 {
+			t.Errorf("%s: no SQL may start without budget (lease expiry recovers), got %+v", name, c)
+		}
 	}
 }
