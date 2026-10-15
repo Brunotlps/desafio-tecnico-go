@@ -288,14 +288,19 @@ func runtimeAttemptNow(t *testing.T, d *upgradeDB, id uuid.UUID) error {
 // até a restauração. Uma retomada real do runtime durante a janela é negada em voz alta (nada é confirmado para ser sobrescrito), a
 // restauração traz os valores originais e os privilégios do runtime são devolvidos ao final.
 func TestUpAndUpToExcludeTheRuntimeFromTheDecisionUntilTheRestoration(t *testing.T) {
-	for name, run := range map[string]func(*upgradeDB) func(context.Context) error{
-		"Up": func(d *upgradeDB) func(context.Context) error {
+	// `Up` segue até a versão final (a 00007, do publicador da outbox, vem depois da restauração da 00006); `UpTo(6)` pára nela.
+	for name, tc := range map[string]struct {
+		run  func(*upgradeDB) func(context.Context) error
+		want func(*testing.T) int64
+	}{
+		"Up": {func(d *upgradeDB) func(context.Context) error {
 			return func(ctx context.Context) error { _, err := d.mig.Up(ctx); return err }
-		},
-		"UpTo(6)": func(d *upgradeDB) func(context.Context) error {
+		}, finalVersion},
+		"UpTo(6)": {func(d *upgradeDB) func(context.Context) error {
 			return func(ctx context.Context) error { _, err := d.mig.UpTo(ctx, 6); return err }
-		},
+		}, func(*testing.T) int64 { return 6 }},
 	} {
+		run, want := tc.run, tc.want
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
 			d, open, done := reauditSchedule(t)
@@ -326,8 +331,8 @@ func TestUpAndUpToExcludeTheRuntimeFromTheDecisionUntilTheRestoration(t *testing
 			if err := <-upDone; err != nil {
 				t.Fatalf("the Up failed: %v", err)
 			}
-			if v := schemaVersion(t, d.owner); v != 6 {
-				t.Fatalf("schema %d, want 6", v)
+			if v := schemaVersion(t, d.owner); v != want(t) {
+				t.Fatalf("schema %d, want %d", v, want(t))
 			}
 			if after := scheduleJSON(t, d, "pending_references"); after != before {
 				t.Fatalf("the restoration did not bring back the original schedule:\n%s\n%s", before, after)

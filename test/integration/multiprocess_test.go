@@ -84,6 +84,7 @@ func startProcEnv(t *testing.T, name string, extra ...string) *proc {
 		"OIDC_ISSUER="+env.issuer, "OIDC_JWKS_URL="+env.jwksURL, "OIDC_AUDIENCE=wager-api", "OIDC_CLOCK_SKEW=1s",
 		"AWS_ENDPOINT_URL="+env.awsEndpoint, "SQS_WAGER_QUEUE_NAME=wager-transactions.fifo",
 		"REFERENCE_WORKERS=0", // o worker é ligado só pelos testes que o exercitam
+		"OUTBOX_PUBLISHERS=0", // o publisher da outbox também (os testes que o exercitam passam o destino e as credenciais)
 	)
 	p.cmd.Env = append(p.cmd.Env, extra...)
 	p.cmd.Stdout, p.cmd.Stderr = p.out, p.out
