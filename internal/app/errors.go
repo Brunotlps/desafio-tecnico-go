@@ -57,6 +57,10 @@ var (
 	ErrReconciliationFailed = errors.New("reconciliation could not be computed")
 	// ErrLedgerNotConfigured: o serviço foi montado sem o leitor do ledger.
 	ErrLedgerNotConfigured = errors.New("ledger reader not configured")
+	// ErrInboxNotFound: não há registro de inbox para a identidade. ErrDuplicateInbox: outra transação confirmou a mesma
+	// identidade (consumerName, messageId); uma nova tentativa a enxerga.
+	ErrInboxNotFound  = errors.New("no inbox record for this message")
+	ErrDuplicateInbox = errors.New("duplicate inbox identity")
 	// ErrPendingNotFound: não há agenda aberta para a transação.
 	ErrPendingNotFound = errors.New("no open pending reference schedule")
 )

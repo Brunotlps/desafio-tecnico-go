@@ -18,6 +18,8 @@ type Repositories struct {
 	Ledger       LedgerRepository
 	Outbox       OutboxRepository
 	Pending      PendingReferenceRepository
+	Inbox        InboxRepository
+	Diagnostics  DiagnosticRepository
 }
 
 // UnitOfWork delimita a transação SQL de uma operação financeira.
@@ -145,4 +147,41 @@ type LedgerReader interface {
 	// ReconciliationSnapshot lê o saldo e reconstrói o ledger numa transação READ ONLY, REPEATABLE READ (um snapshot), sem
 	// travar a carteira. ErrWalletNotFound se a carteira não existe.
 	ReconciliationSnapshot(ctx context.Context, walletID uuid.UUID) (ReconciliationSnapshot, error)
+}
+
+// InboxRecord é a conclusão durável do tratamento de uma mensagem SQS. É gravada JÁ CONCLUÍDA, na mesma transação das finanças.
+type InboxRecord struct {
+	ConsumerName    string
+	MessageID       string // messageId do envelope (não o id do broker)
+	BodyHash        []byte // SHA-256 dos bytes exatos do corpo recebido
+	ReceivedAt      time.Time
+	CompletedAt     time.Time
+	Disposition     string // status da operação tratada: PROCESSED, REJECTED, PENDING_REFERENCE (ou FAILED)
+	FinancialReplay bool   // o resultado foi o de uma operação já registrada
+	TransactionID   uuid.UUID
+}
+
+// InboxRepository: a identidade é (consumerName, messageId). Get devolve ErrInboxNotFound quando não há registro; Insert devolve
+// ErrDuplicateInbox quando outra transação confirmou a mesma identidade (o chamador desfaz a tentativa e reconsulta).
+type InboxRepository interface {
+	Get(ctx context.Context, consumerName, messageID string) (InboxRecord, error)
+	Insert(ctx context.Context, rec InboxRecord) error
+}
+
+// Diagnostic é o registro operacional de uma mensagem permanentemente recusada. Não é uma operação financeira.
+type Diagnostic struct {
+	ConsumerName      string
+	SourceQueue       string
+	BrokerMessageID   string
+	BodyHash          []byte
+	Code              string
+	EnvelopeMessageID string // vazio se o envelope não tem identidade válida
+	CorrelationID     string
+	CreatedAt         time.Time
+}
+
+// DiagnosticRepository: Record é idempotente (a repetição não altera o registro original); Exists distingue ausência de falha da consulta.
+type DiagnosticRepository interface {
+	Record(ctx context.Context, d Diagnostic) error
+	Exists(ctx context.Context, consumerName, sourceQueue, brokerMessageID string, bodyHash []byte) (bool, error)
 }

@@ -30,6 +30,8 @@ var grants = []string{
 	`GRANT UPDATE (next_attempt_at, attempts, last_attempt_at, last_error, completed_at) ON pending_references TO %[1]s`,          // prazo e identidade imutáveis
 	`GRANT SELECT, INSERT ON outbox_events TO %[1]s`,                                                                              // sem DELETE/TRUNCATE; UPDATE só nas colunas de controle abaixo
 	`GRANT UPDATE (attempts, next_attempt_at, last_error, published_at, lease_token, lease_expires_at) ON outbox_events TO %[1]s`, // publicador: payload e identidade do evento imutáveis (migration 00007)
+	`GRANT SELECT, INSERT ON inbox_messages TO %[1]s`,                                                                             // append-only: sem UPDATE/DELETE/TRUNCATE (migration 00008)
+	`GRANT SELECT, INSERT ON message_diagnostics TO %[1]s`,                                                                        // append-only: sem UPDATE/DELETE/TRUNCATE (migration 00008)
 	`GRANT SELECT, INSERT ON wallets TO %[1]s`,                                                                                    // sem DELETE
 	`GRANT UPDATE (balance, version, updated_at) ON wallets TO %[1]s`,                                                             // identidade da carteira é imutável
 	`GRANT SELECT ON goose_db_version TO %[1]s`,                                                                                   // verificação da versão do schema
@@ -96,6 +98,14 @@ func ProvisionRuntimeRole(ctx context.Context, ownerURL string, role RuntimeRole
 		AND attname = 'lease_token' AND NOT attisdropped)`).Scan(&hasLease); err != nil {
 		return err
 	}
+	// inbox_messages/message_diagnostics existem a partir da migration 00008; antes dela os privilégios delas são omitidos.
+	var hasInbox bool
+	if err := tx.QueryRow(ctx, `SELECT to_regclass('public.inbox_messages') IS NOT NULL`).Scan(&hasInbox); err != nil {
+		return err
+	}
+	if hasInbox {
+		revoked += ", inbox_messages, message_diagnostics"
+	}
 	stmts := []string{
 		`GRANT CONNECT ON DATABASE ` + pgx.Identifier{db}.Sanitize() + ` TO ` + ident,
 		`GRANT USAGE ON SCHEMA public TO ` + ident,
@@ -108,6 +118,9 @@ func ProvisionRuntimeRole(ctx context.Context, ownerURL string, role RuntimeRole
 			continue
 		}
 		if !hasLease && strings.Contains(g, "lease_token") {
+			continue
+		}
+		if !hasInbox && (strings.Contains(g, "inbox_messages") || strings.Contains(g, "message_diagnostics")) {
 			continue
 		}
 		stmts = append(stmts, fmt.Sprintf(g, ident))
