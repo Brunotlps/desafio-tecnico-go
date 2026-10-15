@@ -1,5 +1,7 @@
 # ARCHITECTURE
 
+> 🇧🇷 Português (este arquivo) · 🇬🇧 [English version](ARCHITECTURE.en.md) · Operação e uso: [`README.md`](README.md)
+
 Este documento registra as decisões de arquitetura e o estado de cada incremento entregue. Cada decisão aponta se é
 **requisito explícito** do enunciado (`descricao-desafio/README.md`), **interpretação** adotada, **decisão
 técnica** ou **pendência**. O estado de implementação está no fim e no README.
