@@ -125,6 +125,36 @@ func (m *Migrator) preserveSchedule(ctx context.Context) (restore func() error, 
 	}
 
 	// 1. Exclusão dos escritores: captura, revoga e verifica o efeito.
+	grants, err := excludeScheduleWriters(ctx, tx)
+	if err != nil {
+		return nil, refuse("%s", err.Error())
+	}
+
+	// 2. A cópia: nunca substitui o original por um estado reconstruído.
+	copyExists, sameTable, err := scheduleCopyState(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	if !copyExists || sameTable {
+		if err := refreshCopy(ctx, tx); err != nil {
+			return nil, err
+		}
+	} else if msg, err := reconstructionDrift(ctx, tx); err != nil {
+		return nil, err
+	} else if msg != "" {
+		return nil, refuse("%s", msg)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return func() error { return m.restoreScheduleGrants(grants) }, nil
+}
+
+// excludeScheduleWriters captura os privilégios concedidos sobre a agenda (tabela e coluna, PUBLIC inclusive), revoga-os de todo papel
+// que não seja o dono e VERIFICA no catálogo que nenhum papel de login (fora superusuários, o dono e a sessão do migrador) ainda
+// escreve — direta, herdada ou por pertencer a um papel com escrita. Se algum ainda escrever, devolve erro e quem chama desfaz a
+// transação (nada muda). A revogação vale até quem a fez devolver os privilégios capturados (restoreScheduleGrants).
+func excludeScheduleWriters(ctx context.Context, tx *sql.Tx) ([]scheduleGrant, error) {
 	rows, err := tx.QueryContext(ctx, grantsSQL)
 	if err != nil {
 		return nil, fmt.Errorf("read the schedule privileges: %w", err)
@@ -162,28 +192,10 @@ func (m *Migrator) preserveSchedule(ctx context.Context) (restore func() error, 
 		return nil, fmt.Errorf("verify the writers excluded from the schedule: %w", err)
 	}
 	if writers != "" {
-		return nil, refuse("the role(s) %s would still be able to write the pending reference schedule (privilege inherited or through "+
+		return nil, fmt.Errorf("the role(s) %s would still be able to write the pending reference schedule (privilege inherited or through "+
 			"membership of a role with write access); revoke that access or the membership and retry", writers)
 	}
-
-	// 2. A cópia: nunca substitui o original por um estado reconstruído.
-	copyExists, sameTable, err := scheduleCopyState(ctx, tx)
-	if err != nil {
-		return nil, err
-	}
-	if !copyExists || sameTable {
-		if err := refreshCopy(ctx, tx); err != nil {
-			return nil, err
-		}
-	} else if msg, err := reconstructionDrift(ctx, tx); err != nil {
-		return nil, err
-	} else if msg != "" {
-		return nil, refuse("%s", msg)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return func() error { return m.restoreScheduleGrants(grants) }, nil
+	return grants, nil
 }
 
 // scheduleCopyState diz se existe a cópia e, se existir, se a agenda viva é a MESMA tabela que foi copiada (mesmo token em
@@ -248,44 +260,61 @@ func reconstructionDrift(ctx context.Context, tx *sql.Tx) (string, error) {
 //   - a agenda viva é a MESMA tabela que foi copiada (um Down preparado foi cancelado ou falhou antes de apagá-la): ela contém tudo,
 //     inclusive o que o runtime confirmou depois; a cópia, defasada, seria restaurada por cima e perderia esse trabalho — é descartada;
 //   - a agenda viva é a reconstrução da 00005 e a cópia é o original: a restauração é o que se quer, desde que a reconstrução esteja
-//     intacta; se não, o Up é RECUSADO antes de qualquer perda.
-func (m *Migrator) settleScheduleCopyBeforeUp(ctx context.Context) error {
+//     intacta; se não, o Up é RECUSADO antes de qualquer perda. Como a restauração só acontece depois, quando a 00006 for aplicada, os
+//     privilégios de escrita na agenda são REVOGADOS na mesma transação da decisão e só devolvidos (pela função devolvida) depois de a
+//     restauração terminar: a exclusão cobre toda a janela entre decidir e restaurar, inclusive para um runtime que já tinha recuperado
+//     o acesso por `migrate grants`. Nada confirmado na reconstrução nesse intervalo pode ser sobrescrito.
+//
+// A função devolvida (nil se nada foi revogado) devolve os privilégios; deve ser chamada ao fim do Up, com sucesso ou não.
+func (m *Migrator) settleScheduleCopyBeforeUp(ctx context.Context) (restore func() error, err error) {
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
 	var exists bool
 	if err := tx.QueryRowContext(ctx, `SELECT to_regclass('public.pending_references') IS NOT NULL AND to_regclass('public.pending_references_preserved') IS NOT NULL`).Scan(&exists); err != nil {
-		return err
+		return nil, err
 	}
 	if !exists {
-		return nil
+		return nil, nil
 	}
 	for _, stmt := range []string{
 		`SET LOCAL lock_timeout = '30s'`,
 		`LOCK TABLE wallets, wager_transactions, pending_references IN SHARE ROW EXCLUSIVE MODE`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("settle the preserved pending reference schedule before applying migration 00006: %w", err)
+			return nil, fmt.Errorf("settle the preserved pending reference schedule before applying migration 00006: %w", err)
 		}
 	}
 	_, sameTable, err := scheduleCopyState(ctx, tx)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	var grants []scheduleGrant
 	if sameTable {
 		for _, stmt := range []string{`DROP TABLE ` + preservedTable, `COMMENT ON TABLE ` + scheduleTable + ` IS NULL`} {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
-				return fmt.Errorf("discard the stale schedule copy: %w", err)
+				return nil, fmt.Errorf("discard the stale schedule copy: %w", err)
 			}
 		}
-	} else if msg, err := reconstructionDrift(ctx, tx); err != nil {
-		return err
-	} else if msg != "" {
-		return fmt.Errorf("refusing to apply migration 00006, nothing was changed: %s", msg)
+	} else {
+		if msg, err := reconstructionDrift(ctx, tx); err != nil {
+			return nil, err
+		} else if msg != "" {
+			return nil, fmt.Errorf("refusing to apply migration 00006, nothing was changed: %s", msg)
+		}
+		if grants, err = excludeScheduleWriters(ctx, tx); err != nil {
+			return nil, fmt.Errorf("refusing to apply migration 00006, nothing was changed: %w", err)
+		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if grants == nil {
+		return nil, nil
+	}
+	return func() error { return m.restoreScheduleGrants(grants) }, nil
 }
 
 // restoreScheduleGrants devolve os privilégios revogados pela preparação quando a reversão não chegou a apagar a agenda

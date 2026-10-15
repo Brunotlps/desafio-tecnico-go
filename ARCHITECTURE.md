@@ -264,14 +264,19 @@ continuidade durável.
   `FOR UPDATE` conflita com todos. A tentativa pede `FOR UPDATE` (`TryLockForUpdate`), então a seleção pede o **mesmo** `FOR UPDATE`: pula as carteiras seguradas por `FOR KEY SHARE`,
   `FOR SHARE`, `FOR NO KEY UPDATE`, `UPDATE` não chave ou `FOR UPDATE` (as cinco são testadas), e um prefixo de candidatos ocupados, por maior que seja, não esconde as carteiras
   independentes — sem estado entre varreduras, portanto também para várias chamadas e instâncias. Aumentar apenas o lote ou as páginas só deslocaria o limiar. A consulta é só uma
-  leitura: o lock de linha dura o tempo da consulta (sem espera e sem lock durante o backoff) e a carteira e a elegibilidade são revalidadas sob os locks da tentativa.
+  leitura: o lock de linha dura o tempo da consulta (sem espera e sem lock durante o backoff) e a carteira e a elegibilidade são revalidadas sob os locks da tentativa. As **linhas da agenda**
+  também são puladas quando outra transação as segura (`FOR UPDATE OF w, p SKIP LOCKED`), a tentativa lê a agenda com `SKIP LOCKED` (`ErrPendingBusy` = ocupada, como uma carteira ocupada) e o `Defer`
+  também não espera: nenhuma etapa fica esperando por uma linha que alguém fora do protocolo da carteira (outro escritor, um adiamento de outra instância) segura, então três agendas seguradas
+  por `UPDATE`s do runtime não fazem a tentativa nem o adiamento esgotarem o `PhaseTimeout`.
   * **Carteira ocupada na tentativa ou com falha** é excluída das páginas seguintes da mesma varredura. Uma **falha de infraestrutura** (erro transitório, timeout) nunca é uma rejeição
     financeira: a transação da tentativa é desfeita por inteiro (sem efeito parcial) e a agenda é **adiada** com o backoff numa transação curta de uma única linha (`Defer`: próxima
     tentativa, contador e diagnóstico; não renova o prazo, não toca saldo/ledger/estado, não sobrescreve um reagendamento mais novo nem uma agenda concluída). Assim um prefixo de falhas
     numa carteira (lote 1 ou 20) não monopoliza as varreduras nem o orçamento: a carteira independente avança e o retry segue pelo estado durável quando o adiamento vence. Se o próprio
-    adiamento falhar, a agenda segue como estava e a próxima varredura tenta de novo.
+    adiamento não conseguir persistir (ou a falha não for adiável), há uma **posição de continuação entre chamadas** (em memória, por instância): uma varredura interrompida pelo teto de falhas
+    faz a seguinte recomeçar **depois** do prefixo que falhou, e uma varredura que termina normalmente a zera. Assim a carteira saudável avança em poucas chamadas mesmo sem nenhum adiamento
+    persistido (testado com 4 e 7 carteiras falhando, lotes 1 e 20, sem `Defer` que funcione), sem aumentar limites; numa indisponibilidade real o custo continua de poucas tentativas por chamada.
   * **Trabalho limitado**: no máximo `BatchSize` tentativas efetivas, 50 páginas e **3 falhas seguidas** (falha geral: a varredura termina com `failed=true` e o worker espaça a próxima, sem
-    martelar a dependência); as puladas por ocupação, as ainda não vencidas e as que falharam não contam como tentativas efetivas, mas cada carteira com falha é tentada uma vez por
+    martelar a dependência; a próxima chamada continua depois do prefixo); as puladas por ocupação, as ainda não vencidas e as que falharam não contam como tentativas efetivas, mas cada carteira com falha é tentada uma vez por
     varredura. O cancelamento é respeitado entre candidatos (e um erro por cancelamento não adia nada); uma varredura toda ocupada termina sem tentar nada e **sem tocar** nenhuma
     agenda, e o worker só varre de novo depois do intervalo de espera, sem laço ativo.
 * **Elegibilidade temporal sob os locks**: depois de travar a carteira e a agenda, a tentativa compara o `next_attempt_at` **recarregado** com o relógio; uma seleção
@@ -457,6 +462,10 @@ perda **não** a corrige; como a 00005 não pode ser reescrita, a correção é 
   copiada** (um `Down` preparado foi cancelado ou falhou antes de apagá-la), ela contém tudo — inclusive o que o runtime confirmou depois da devolução dos grants — e a cópia, defasada, é
   **descartada** em vez de restaurada por cima; se a agenda viva é a reconstrução da 00005 e a cópia é o original, a restauração é o esperado desde que a reconstrução esteja intacta; se não,
   o `Up` é **recusado** antes de qualquer perda (contagem e ids; nada muda). Nunca se aplica um snapshot velho em silêncio.
+* **Exclusão de toda a janela decisão → restauração.** No caso em que a restauração vai acontecer (reconstrução intacta, cópia original), a mesma transação da decisão **revoga a escrita** na agenda de todo papel
+  que não seja o dono e verifica o efeito no catálogo (a mesma exclusão do rollback; se algum escritor não puder ser excluído, o `Up` é recusado), e os privilégios só são devolvidos depois que a 00006
+  restaurou (ou falhou) — inclusive para um runtime que já tinha recuperado o acesso por `migrate grants`. Uma retomada real do runtime nessa janela é negada em voz alta em vez de ser confirmada
+  e depois sobrescrita. Um `Up` que aplicaria a 00005 e a 00006 de uma vez para na 00005 para tomar essa decisão sobre a reconstrução já criada. Se o processo morrer dentro da janela, `migrate grants` devolve o acesso.
 * **Restauração** (00006, na reaplicação): substitui as linhas reconstruídas pelo `Up` da 00005 pelos valores originais, inclusive as concluídas,
   desabilitando o gatilho de imutabilidade só durante a restauração (dono, sob exclusão dos escritores), dispara as verificações deferidas e remove a cópia.
   Uma cópia sem transação correspondente é recusada com contagem e ids (preflight), não descartada; uma restauração que falha deixa a cópia (a migration é transacional).

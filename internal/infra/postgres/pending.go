@@ -32,9 +32,19 @@ func (r pendingRepo) Insert(ctx context.Context, p app.PendingReference) error {
 }
 
 func (r pendingRepo) GetOpenForUpdate(ctx context.Context, txID uuid.UUID) (app.PendingReference, error) {
+	// SKIP LOCKED: a tentativa nunca espera pela linha da agenda (quem a segura sem passar pela carteira — outro escritor, um adiamento
+	// de outra instância — é tratado como ocupação, como uma carteira ocupada). Sem linha devolvida, distingue-se "ocupada" de "não há
+	// agenda aberta" por uma leitura sem lock.
 	p, err := scanPending(r.q.QueryRow(ctx, `SELECT `+pendingColumns+` FROM pending_references
-		WHERE transaction_id = $1 AND completed_at IS NULL FOR UPDATE`, txID))
+		WHERE transaction_id = $1 AND completed_at IS NULL FOR UPDATE SKIP LOCKED`, txID))
 	if errors.Is(err, pgx.ErrNoRows) {
+		var open bool
+		if qerr := r.q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pending_references WHERE transaction_id = $1 AND completed_at IS NULL)`, txID).Scan(&open); qerr != nil {
+			return app.PendingReference{}, classify(qerr)
+		}
+		if open {
+			return app.PendingReference{}, app.ErrPendingBusy
+		}
 		return app.PendingReference{}, app.ErrPendingNotFound
 	}
 	return p, classify(err)
@@ -67,9 +77,12 @@ func (r pendingRepo) Complete(ctx context.Context, txID uuid.UUID, at time.Time)
 }
 
 func (r pendingRepo) Defer(ctx context.Context, txID uuid.UUID, next, at time.Time, reason string) error {
+	// Não espera por uma linha segurada por outra transação (SKIP LOCKED): quem a segura está cuidando dela, e esperar só repetiria o
+	// timeout da tentativa que acabou de falhar.
 	_, err := r.q.Exec(ctx, `UPDATE pending_references
 		SET next_attempt_at = $2, attempts = attempts + 1, last_attempt_at = $3, last_error = $4
-		WHERE transaction_id = $1 AND completed_at IS NULL AND next_attempt_at <= $3`, txID, next, at, reason)
+		WHERE transaction_id IN (SELECT transaction_id FROM pending_references
+			WHERE transaction_id = $1 AND completed_at IS NULL AND next_attempt_at <= $3 FOR UPDATE SKIP LOCKED)`, txID, next, at, reason)
 	return classify(err)
 }
 
@@ -88,7 +101,7 @@ func (r pendingRepo) Due(ctx context.Context, q app.DueQuery) ([]app.PendingRefe
 	// (FOR KEY SHARE, FOR SHARE, FOR NO KEY UPDATE — o de um UPDATE de coluna não chave —, FOR UPDATE), e só ele garante que uma carteira
 	// que a seleção devolve não será "ocupada" para a tentativa por um modo que a seleção não enxergou. Assim um prefixo ocupado, de qualquer
 	// tamanho e por qualquer escritor, não esconde as carteiras independentes que vêm depois dele, sem estado entre varreduras. É só uma
-	// leitura: o lock de linha dura o tempo da consulta (sem espera e sem lock durante o backoff) e a carteira e a elegibilidade são
+	// leitura (as linhas da agenda seguradas por outra transação também são puladas): o lock de linha dura o tempo da consulta (sem espera e sem lock durante o backoff) e a carteira e a elegibilidade são
 	// revalidadas sob os locks da tentativa.
 	rows, err := r.q.Query(ctx, `SELECT `+pendingColumnsP+` FROM pending_references p
 		JOIN wallets w ON w.id = p.wallet_id
@@ -96,7 +109,7 @@ func (r pendingRepo) Due(ctx context.Context, q app.DueQuery) ([]app.PendingRefe
 		  AND ($3::timestamptz IS NULL OR (p.next_attempt_at, p.transaction_id) > ($3, $4))
 		  AND NOT (p.wallet_id = ANY($5::uuid[]))
 		ORDER BY p.next_attempt_at, p.transaction_id LIMIT $2
-		FOR UPDATE OF w SKIP LOCKED`, q.Now, q.Limit, afterAt, afterID, exclude)
+		FOR UPDATE OF w, p SKIP LOCKED`, q.Now, q.Limit, afterAt, afterID, exclude)
 	if err != nil {
 		return nil, classify(err)
 	}

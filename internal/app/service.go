@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -78,6 +79,9 @@ type Service struct {
 	now     func() time.Time
 	newID   domain.IDGenerator
 	ref     ReferenceConfig
+
+	scanMu     sync.Mutex
+	scanResume *DueCursor // ver ProcessDue
 }
 
 // NewService cria o serviço com relógio e gerador de ids de produção (UUIDv7).

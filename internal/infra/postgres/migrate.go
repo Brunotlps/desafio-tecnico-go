@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"strconv"
@@ -139,21 +140,40 @@ func (m *Migrator) ProvisionRuntime(ctx context.Context, role RuntimeRole) error
 }
 
 // upLocked aplica as migrations (todas se version == 0). Antes de a 00006 restaurar a cópia da agenda por cima da tabela, decide
-// com segurança o que fazer com ela (ver settleScheduleCopyBeforeUp). Deve ser chamado dentro de exclusive.
-func (m *Migrator) upLocked(ctx context.Context, version int64) ([]*goose.MigrationResult, error) {
+// com segurança o que fazer com ela (ver settleScheduleCopyBeforeUp) e, quando a restauração vai acontecer, mantém os escritores
+// excluídos até ela terminar (e devolve os privilégios ao final). Se o percurso aplicaria a 00005 e a 00006 de uma vez, para na 00005
+// para decidir sobre a reconstrução já criada. Deve ser chamado dentro de exclusive.
+func (m *Migrator) upLocked(ctx context.Context, version int64) (res []*goose.MigrationResult, err error) {
 	current, err := m.provider.GetDBVersion(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if current == scheduleMigration && (version == 0 || version > scheduleMigration) {
-		if err := m.settleScheduleCopyBeforeUp(ctx); err != nil {
-			return nil, err
+	reachesRestoration := version == 0 || version > scheduleMigration
+	if current < scheduleMigration && reachesRestoration {
+		if res, err = m.provider.UpTo(ctx, scheduleMigration); err != nil {
+			return res, err
+		}
+		current = scheduleMigration
+	}
+	var restore func() error
+	if current == scheduleMigration && reachesRestoration {
+		if restore, err = m.settleScheduleCopyBeforeUp(ctx); err != nil {
+			return res, err
 		}
 	}
+	var rest []*goose.MigrationResult
 	if version == 0 {
-		return m.provider.Up(ctx)
+		rest, err = m.provider.Up(ctx)
+	} else {
+		rest, err = m.provider.UpTo(ctx, version)
 	}
-	return m.provider.UpTo(ctx, version)
+	res = append(res, rest...)
+	if restore != nil {
+		if rerr := restore(); rerr != nil {
+			err = errors.Join(err, fmt.Errorf("the schedule privileges were NOT given back (run `migrate grants`): %w", rerr))
+		}
+	}
+	return res, err
 }
 
 // scheduleMigration é a migration que cria a agenda das pendências (00005). Reverter essa migration apaga a

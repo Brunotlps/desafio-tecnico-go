@@ -144,7 +144,7 @@ func (s *Service) resumeOnce(ctx context.Context, ref PendingReference) (resumeS
 		return nil
 	})
 	switch {
-	case errors.Is(err, ErrWalletBusy):
+	case errors.Is(err, ErrWalletBusy), errors.Is(err, ErrPendingBusy):
 		return resumeBusy, nil
 	case err != nil:
 		if errors.Is(err, ErrCommitUnknown) {
@@ -187,7 +187,25 @@ func (s *Service) ProcessDue(ctx context.Context, stop <-chan struct{}) (complet
 		skip[w] = struct{}{}
 		excluded = append(excluded, w)
 	}
+	// Posição de continuação entre chamadas: depois de uma varredura interrompida pelo teto de falhas, a seguinte recomeça DEPOIS do
+	// prefixo que falhou (mesmo que o adiamento dele não tenha conseguido persistir). Uma varredura que termina normalmente zera a posição.
+	s.scanMu.Lock()
 	var cursor *DueCursor
+	if s.scanResume != nil {
+		c := *s.scanResume
+		cursor = &c
+	}
+	s.scanMu.Unlock()
+	setResume := func(c *DueCursor) {
+		s.scanMu.Lock()
+		defer s.scanMu.Unlock()
+		if c == nil {
+			s.scanResume = nil
+			return
+		}
+		cc := *c
+		s.scanResume = &cc
+	}
 	attempts, consecutiveFailures := 0, 0
 	reader := s.uow.Reader().Pending
 	for page := 0; page < maxScanPages && attempts < s.ref.BatchSize; page++ {
@@ -212,6 +230,7 @@ func (s *Service) ProcessDue(ctx context.Context, stop <-chan struct{}) (complet
 				continue
 			}
 			if attempts >= s.ref.BatchSize {
+				setResume(nil)
 				return completed, failed
 			}
 			attemptCtx, cancel := context.WithTimeout(ctx, s.ref.PhaseTimeout)
@@ -229,6 +248,7 @@ func (s *Service) ProcessDue(ctx context.Context, stop <-chan struct{}) (complet
 					"transactionId", p.TransactionID, "walletId", p.WalletID, "error", err.Error())
 				s.deferFailedAttempt(ctx, p, err)
 				if consecutiveFailures >= maxConsecutiveFailures {
+					setResume(cursor) // a próxima chamada continua depois do prefixo com falha
 					return completed, failed
 				}
 				continue
@@ -245,6 +265,7 @@ func (s *Service) ProcessDue(ctx context.Context, stop <-chan struct{}) (complet
 			consecutiveFailures = 0
 		}
 	}
+	setResume(nil)
 	return completed, failed
 }
 
