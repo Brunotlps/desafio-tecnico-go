@@ -49,6 +49,14 @@ var (
 	ErrWalletBusy = errors.New("wallet is locked by another transaction")
 	// ErrPendingBusy: a agenda aberta existe, mas outra transação segura a sua linha (a tentativa não espera por ela).
 	ErrPendingBusy = errors.New("pending reference schedule is locked by another transaction")
+	// ErrInvalidCursor / ErrInvalidLimit: parâmetros de paginação do ledger inválidos (entrada, nunca uma consulta ampliada).
+	ErrInvalidCursor = errors.New("invalid cursor")
+	ErrInvalidLimit  = errors.New("invalid limit")
+	// ErrReconciliationFailed: a reconstrução não pôde ser concluída com segurança (limite numérico, moeda inconsistente
+	// ou leitura impossível de interpretar). Nunca é apresentada como resultado consistente nem como divergência.
+	ErrReconciliationFailed = errors.New("reconciliation could not be computed")
+	// ErrLedgerNotConfigured: o serviço foi montado sem o leitor do ledger.
+	ErrLedgerNotConfigured = errors.New("ledger reader not configured")
 	// ErrPendingNotFound: não há agenda aberta para a transação.
 	ErrPendingNotFound = errors.New("no open pending reference schedule")
 )

@@ -122,14 +122,14 @@ func outboxModule(cfg config.Config) fx.Option {
 
 var applicationModule = fx.Module("application",
 	fx.Provide(
-		func(uow app.UnitOfWork, cfg config.Config, log *slog.Logger) *app.Service {
+		func(uow app.UnitOfWork, store *postgres.Store, cfg config.Config, log *slog.Logger) *app.Service {
 			return app.NewService(uow, app.Config{
 				AllowedCurrencies: cfg.AllowedCurrencies,
 				Reference: app.ReferenceConfig{
 					TTL: cfg.ReferenceTTL, BackoffInitial: cfg.ReferenceBackoffInitial, BackoffMax: cfg.ReferenceBackoffMax,
 					PollInterval: cfg.ReferencePollInterval, PhaseTimeout: cfg.ReferencePhaseTimeout,
 				},
-			}, log)
+			}, log, app.WithLedgerReader(store))
 		},
 		func(svc *app.Service, log *slog.Logger) *app.ReferenceWorker { return app.NewReferenceWorker(svc, log) },
 	),

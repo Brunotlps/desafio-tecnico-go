@@ -23,6 +23,8 @@ type Service interface {
 	GetTransaction(ctx context.Context, id uuid.UUID) (*domain.WagerTransaction, error)
 	GetTransactionForProvider(ctx context.Context, providerID string, id uuid.UUID) (*domain.WagerTransaction, error)
 	GetTransactionByExternalID(ctx context.Context, providerID, externalID string) (*domain.WagerTransaction, error)
+	ListLedger(ctx context.Context, walletID uuid.UUID, cursor string, limit int) (app.LedgerPage, error)
+	Reconcile(ctx context.Context, walletID uuid.UUID) (app.ReconciliationResult, error)
 }
 
 // TokenVerifier valida access tokens.
@@ -57,8 +59,8 @@ func New(svc Service, verifier TokenVerifier, checks []ReadinessCheck, log *slog
 	// Operações de carteira: somente serviço interno.
 	mux.HandleFunc("POST /wallets", h.authenticate(h.openWallet))
 	mux.HandleFunc("GET /wallets/{walletId}", h.authenticate(h.getWallet))
-	mux.HandleFunc("GET /wallets/{walletId}/ledger", h.authenticate(h.notImplemented))
-	mux.HandleFunc("POST /wallets/{walletId}/reconciliation", h.authenticate(h.notImplemented))
+	mux.HandleFunc("GET /wallets/{walletId}/ledger", h.authenticate(h.getLedger))
+	mux.HandleFunc("POST /wallets/{walletId}/reconciliation", h.authenticate(h.reconcile))
 
 	// Operações de provedor.
 	mux.HandleFunc("POST /wagering/transactions", h.authenticate(h.submit))
@@ -69,14 +71,4 @@ func New(svc Service, verifier TokenVerifier, checks []ReadinessCheck, log *slog
 		writeProblem(w, http.StatusNotFound, "NOT_FOUND", "no such route")
 	})
 	return h.observe(mux)
-}
-
-// notImplemented responde 501 depois de autenticar e autorizar: o contrato
-// existe no enunciado, mas a funcionalidade é de um incremento posterior.
-func (h *Handler) notImplemented(w http.ResponseWriter, r *http.Request, p auth.Principal) {
-	if !p.IsInternal() {
-		forbidden(w, "internal service access required")
-		return
-	}
-	writeProblem(w, http.StatusNotImplemented, "NOT_IMPLEMENTED", "this endpoint is not implemented yet")
 }

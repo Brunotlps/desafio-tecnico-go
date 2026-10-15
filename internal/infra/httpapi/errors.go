@@ -54,6 +54,9 @@ var errorMappings = []mapping{
 	{domain.ErrInvalidKind, http.StatusBadRequest, "INVALID_KIND"},
 	{domain.ErrInvalidRequest, http.StatusBadRequest, "INVALID_REQUEST"},
 	{domain.ErrUninitializedMoney, http.StatusBadRequest, "INVALID_REQUEST"},
+	{app.ErrInvalidCursor, http.StatusBadRequest, "INVALID_CURSOR"},
+	{app.ErrInvalidLimit, http.StatusBadRequest, "INVALID_LIMIT"},
+	{app.ErrReconciliationFailed, http.StatusInternalServerError, "RECONCILIATION_FAILED"},
 	{app.ErrCommitUnknown, http.StatusServiceUnavailable, "COMMIT_OUTCOME_UNKNOWN"},
 	{app.ErrTransient, http.StatusServiceUnavailable, "TEMPORARILY_UNAVAILABLE"},
 	// Não ocorre com o lock da carteira; se ocorrer, nada foi gravado e repetir é seguro.

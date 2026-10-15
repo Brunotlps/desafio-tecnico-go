@@ -87,9 +87,48 @@ curl -s -H "Authorization: Bearer $INTERNAL"   localhost:8080/wallets/$WALLET
 | `GET /wagering/transactions/{transactionId}`                          | `provider` (só as suas) · `internal-service` (todas) | 200 |
 | `GET /providers/{providerId}/wagering/transactions/{externalTransactionId}` | `provider` (só o seu id) · `internal-service` | 200 |
 | `GET /health/live`, `GET /health/ready`                               | público            | 200 / 503 |
-| `GET /wallets/{id}/ledger`, `POST /wallets/{id}/reconciliation`       | `internal-service` | **501** (não implementado) |
+| `GET /wallets/{walletId}/ledger?cursor=&limit=`                       | `internal-service` | 200 (ver "Ledger paginado") |
+| `POST /wallets/{walletId}/reconciliation`                             | `internal-service` | 200 (ver "Reconciliação") |
 
 Respostas de erro: `{"code":"...","message":"..."}`.
+
+### Ledger paginado
+
+`GET /wallets/{walletId}/ledger?cursor=<opaco>&limit=<1..100>` — só `internal-service` (provedor → 403, sem token/token inválido → 401, sem dados nem efeitos).
+
+* Ordem crescente pela **posição `seq`** do ledger, no escopo da carteira; a continuação é `seq > último devolvido` (**sem `OFFSET`**). Gaps de `seq` e
+  `createdAt` iguais são válidos: o cursor nunca usa o instante. `limit` padrão **50**, mínimo 1, máximo 100.
+* Resposta: `{"items":[{"id","walletId","transactionId","direction":"DEBIT|CREDIT","money","balanceBefore","balanceAfter","createdAt"}],"nextCursor":"..."}`.
+  Valores monetários são `{"amount":"25.00","currency":"BRL"}` (string, nunca número). `nextCursor` só existe quando há próxima página (o servidor lê `limit+1`
+  para decidir, sem perder nem duplicar o item extra). Carteira existente sem lançamentos → `{"items":[]}`; inexistente → 404 `WALLET_NOT_FOUND`.
+* **Cursor opaco e versionado**: base64url de `{"v":1,"w":<carteira>,"s":<seq>}`. O cliente o trata como opaco; ele **não autoriza nada** (autorização e escopo
+  continuam no servidor): só delimita a continuação. É validado em formato canônico, tamanho (≤ 200), versão, posição (≥ 1) e correspondência com a carteira da rota;
+  qualquer falha é `400 INVALID_CURSOR` (nunca uma consulta ampliada). `limit` não inteiro, fora de 1..100 ou repetido → `400 INVALID_LIMIT`; `cursor` vazio ou repetido → `400 INVALID_CURSOR`. A query é interpretada de forma explícita: qualquer erro de
+  parsing (escape `%` inválido, separador `;`, inclusive em parâmetros desconhecidos) recusa a requisição inteira com `400 INVALID_QUERY`, sem dados e sem consultar o ledger — um par malformado
+  nunca é descartado em silêncio (o que faria um parâmetro inválido virar o default ou uma repetição parecer única). A autenticação e a autorização vêm antes (sem token → 401, provedor → 403).
+* **Visão de leitura**: cada página tem a sua própria visão (uma consulta, sem transação mantida entre requisições). Lançamentos confirmados depois podem aparecer nas
+  páginas seguintes; **não há snapshot congelado da navegação inteira**. Não se perde nem se duplica um item já navegável porque todo lançamento é gravado sob o lock da
+  carteira, liberado só no commit: dentro de uma carteira, uma posição menor nunca é confirmada depois de uma maior.
+
+### Reconciliação
+
+`POST /wallets/{walletId}/reconciliation` — só `internal-service`. Lê o saldo armazenado e reconstrói o ledger (incluindo a abertura) na **mesma visão**: uma transação
+PostgreSQL `READ ONLY, REPEATABLE READ`, com prazo de 10 s, sem lock da carteira (movimentos independentes não esperam) e sem reparo. A `UnitOfWork` financeira continua `READ COMMITTED`.
+
+```json
+{"walletId":"…","storedBalance":{"amount":"75.00","currency":"BRL"},"calculatedBalance":{"amount":"75.00","currency":"BRL"},
+ "difference":{"amount":"0.00","currency":"BRL"},"consistent":true,"checkedEntries":2}
+```
+
+`calculatedBalance` = créditos − débitos; `difference` = armazenado − calculado (pode ser negativo); `checkedEntries` = lançamentos considerados. Carteira zero sem lançamentos → 0,00/0,00/0,00,
+`consistent:true`, `checkedEntries:0`. `LOSS` e rejeições não geram lançamento; reversões acrescentam seus movimentos normais.
+
+* **Aritmética exata**: a soma é feita pelo PostgreSQL em `NUMERIC` (créditos − débitos, sem o limite de `int64`: somas separadas podem passar de `MaxInt64` com saldo final válido) e convertida para
+  `Money` com verificação de faixa; nada passa por ponto flutuante. Se o saldo calculado ou a diferença não couberem em `Money`, ou houver lançamento em outra moeda, a resposta é
+  `500 RECONCILIATION_FAILED` (log com a carteira) — **nunca** `consistent:true` nem uma divergência inventada. Falha de leitura é indisponibilidade (`503`), não resultado.
+* **Divergência** (`consistent:false`): resposta com os valores, log de nível `ERROR` (`reconciliation divergence detected`, com carteira, valores, `checkedEntries` e versão) e um
+  ponto de integração para a métrica (`app.WithReconciliationObserver`); saldo, ledger, versão, transações e eventos **não** são alterados.
+* A métrica de divergência e as demais categorias de `GET /metrics` fazem parte da instrumentação posterior (não implementada).
 
 | Situação                                              | HTTP | `code`                                   |
 | ----------------------------------------------------- | ---- | ---------------------------------------- |
@@ -436,6 +475,8 @@ Variáveis opcionais (padrões coincidem com o Compose): `TEST_DATABASE_URL`, `T
 | Correções da reauditoria do incremento 2 | `reaudit_regressions_test.go` | (1) uma carteira livre avança atrás de **120 carteiras ocupadas distintas** com `BatchSize=1` (muito além de qualquer orçamento de páginas), sem tocar nas ocupadas, e várias instâncias concorrentes a avançam **uma só vez**; (2) `DownTo(4) → UpTo(5) → Down → Up` e `Down` cancelado com o lock do goose retido por outra sessão **preservam a cópia original** (TTL de 7 min, vencida, 7 tentativas e diagnóstico, agenda concluída; todas as colunas), a escrita do runtime é devolvida pelo migrador, uma repetição renova a cópia a partir da agenda viva, um rollback que perderia dados é **recusado sem alterar nada** (API e binário `migrate`) e um segundo migrador espera o primeiro; (3) papel só com grants **por coluna**, `PUBLIC` por coluna e papel que herda de um grupo ficam sem escrita durante a janela, o runtime padrão continua bloqueado e recupera os grants ao cancelar, e um escritor que não pode ser excluído recusa o rollback antes de qualquer alteração |
 | Correções da reauditoria focada (2109d38) | `reaudit2_regressions_test.go` | (1) carteira livre avança atrás de 60 carteiras seguradas por **cada** modo de lock (`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`, `UPDATE` não chave) e a transação do prefixo confirma com as constraints; (2) falha localizada numa carteira (lotes 1 e 20): a livre avança, a pendência com falha continua `PENDING_REFERENCE`, é adiada com backoff e diagnóstico e o retry segue pelo estado durável; falha geral para após 3 falhas seguidas; (3) `Up`/`UpTo` direto depois de `Down` cancelado preservam o trabalho confirmado pelo runtime na agenda viva (tentativas 8, não 7), o ciclo seguinte ainda preserva e uma reconstrução alterada recusa o `Up` sem mudar nada; (4) o binário `migrate grants` e `migrate up` esperam um `Down` preparado, o runtime continua negado enquanto esperam, o cancelamento (SIGINT) termina sem vazar lock, e após `SIGKILL` do migrador `grants` e `up` recuperam sem perder trabalho |
 | Correções residuais da base (06c6c65) | `reaudit3_regressions_test.go` | (1) três agendas seguradas por `UPDATE`s reais do runtime (sem lock das carteiras, lotes 1 e 20, `PhaseTimeout` de 2 s): a primeira varredura conclui a carteira livre, sem erro e sem esperar, e as seguradas voltam a ser retomadas ao serem liberadas; com tentativa **e** adiamento falhando (4 e 7 carteiras), a saudável avança em poucas chamadas pela posição de continuação, sem nada persistido para o prefixo; falha geral custa ≤ 3 tentativas por chamada; (2) `DownTo(4) → UpTo(5) → migrate grants → Up/UpTo(6)`: com a decisão confirmada e a restauração retida, o runtime não tem escrita, uma retomada real é negada, a restauração traz a agenda original, os privilégios voltam e o trabalho seguinte funciona |
+| Ledger paginado | `ledger_reads_test.go`, `internal/app/ledger_test.go` | percurso completo por várias páginas e limites (1, 3, 7, 8, 9, 100; bordas `limit` = restantes e +1; padrão 50) em ordem de `seq`, sem vazamento de outra carteira; `limit`/`cursor` inválidos, repetidos ou de **outra carteira** → 400 sem dados; carteira zero → `items:[]`, inexistente → 404; query malformada (`limit=%ZZ`, `cursor=%ZZ`, repetição com escape inválido, separador `;`, cursor válido repetido com `%ZZ`, parâmetro desconhecido malformado) → 400 `INVALID_QUERY` sem dados, e 401/403 antes dela; `createdAt` iguais e gaps de `seq`; lançamentos novos no meio da navegação (sem perda nem duplicação, sem sessão `idle in transaction`); 6 escritores paralelos na mesma carteira (toda travessia é prefixo da ordem final); cursor: forma canônica, versão, posição, tamanho |
+| Reconciliação | `reconciliation_test.go`, `internal/app/ledger_test.go` | carteira zero, abertura, o exemplo do enunciado (100,00 + BET 25,00 → 75,00/75,00/0,00, 2 lançamentos), cadeia BET/WIN/LOSS/rejeição/REFUND/ROLLBACK, estado intacto após ler; **movimento confirmado entre as consultas** (barreira): resposta de um único momento e escritor sem espera; somas separadas **acima de `int64`** com saldo final `MaxInt64` (exato); divergência real em banco exclusivo (resposta, log, sinal, nada alterado, diferença negativa); soma fora de `Money` → falha (não divergência); falha de leitura → erro; aritmética em unidades (`big.Int`) |
 | Shutdown coordenado | `internal/lifecycle/coordinator_test.go`, `shutdown_test.go` | ordem (admissão em todos → drenagem → cancelamento → confirmação), término incompleto, falha de partida; com infraestrutura real: requisição presa no lock é recusada/drenada/cancelada e o **pool só fecha depois**, tentativa do worker presa é cancelada e outra instância conclui, partida com porta ocupada sem vazar conexões, configuração incoerente recusada |
 | Multiprocesso | `multiprocess_test.go`, `win_loss_test.go`, `references_multiprocess_test.go` | **3 processos do binário real**: 50 reenvios espalhados, disputa 2×80,00 entre processos, conexões próprias, `SIGTERM` com saída 0; `SIGKILL` de um processo no meio da carga sem duplicar nem perder débito; reenvios de `WIN`/`LOSS`; **reversões pendentes resolvidas pelos executores dos três processos** (por carteira: uma processada, uma rejeitada, um crédito), `SIGKILL` do processo que aceitou a pendência, expiração com três executores (uma rejeição, um evento). O binário dos filhos é compilado **sem `-race`** (pendência registrada) |
 
@@ -497,8 +538,7 @@ replay/conflito (409) antes das políticas de operação nova (moeda, tipo).
 | --- | --- |
 | Consumidor SQS e tabela de inbox | ausentes (a fila é provisionada e a readiness a verifica) |
 | Publicador de outbox (múltiplas instâncias, backoff, recuperação) | **implementado** (ver [Publicador da outbox](#publicador-da-outbox)); *at-least-once*, sem ordem global; a consolidação com 3 processos para SQS ainda não existe |
-| `GET /wallets/{id}/ledger` (cursor) e `POST /wallets/{id}/reconciliation` | 501 |
-| Métricas (resultados, duplicatas, retries, DLQ, atraso da outbox, reconciliação) | ausentes; há logs JSON com `correlationId`, `transactionId`, `walletId`, `providerId` |
+| Métricas (resultados, duplicatas, retries, DLQ, atraso da outbox, reconciliação) | ausentes (a reconciliação já expõe o ponto de integração e o log de divergência); há logs JSON com `correlationId`, `transactionId`, `walletId`, `providerId` |
 | Controle de acesso do broker (credenciais e políticas) | **provado como autorização emulada** (MiniStack 1.5.27, `AUTH=true`; prova na CI). O MiniStack **não valida assinaturas SigV4**: não é autenticação AWS completa nem prova de produção (ver [Broker](#broker-minestack-com-auth-true)). O produtor/consumidor SQS ainda **não** existem |
 | Testes SQS/HTTP cruzados, DLQ, interrupção de consumidor | dependem do consumidor SQS (dois publishers: provados, ver Testes) |
 | Prova com 3 processos para SQS/outbox | HTTP, reversões, pendências e **publicador** (dois processos publicando, um morto por `SIGKILL`) já têm; SQS depende do consumidor |

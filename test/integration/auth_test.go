@@ -124,8 +124,13 @@ func TestAuthorizationAndProviderIsolation(t *testing.T) {
 	expect("provider reconciles", call(t, a.URL, "POST", "/wallets/"+w.ID+"/reconciliation", tokA, nil, nil), 403, "FORBIDDEN")
 	// O serviço interno não é um provedor: não envia operações.
 	expect("internal submits", submit(t, a, "internal-service", id("ki"), betBody(w, "provider-a", id("ti"), "1.00")), 403, "FORBIDDEN")
-	// Pontos ainda não implementados respondem 501 apenas depois de autenticar/autorizar.
-	expect("ledger (not implemented)", call(t, a.URL, "GET", "/wallets/"+w.ID+"/ledger", tokInt, nil, nil), 501, "NOT_IMPLEMENTED")
+	// O serviço interno lê o ledger e reconcilia.
+	if r := call(t, a.URL, "GET", "/wallets/"+w.ID+"/ledger", tokInt, nil, nil); r.Status != 200 {
+		t.Errorf("internal reads the ledger: %d %s", r.Status, r.Raw)
+	}
+	if r := call(t, a.URL, "POST", "/wallets/"+w.ID+"/reconciliation", tokInt, nil, nil); r.Status != 200 || r.Body["consistent"] != true {
+		t.Errorf("internal reconciles: %d %s", r.Status, r.Raw)
+	}
 
 	// Provedor B não age em nome do A: o providerId do corpo precisa coincidir com o token.
 	expect("B sends as A", submit(t, a, "provider-b", id("ka2"), betBody(w, "provider-a", id("ta2"), "10.00")), 403, "FORBIDDEN")

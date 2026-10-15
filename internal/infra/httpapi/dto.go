@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"desafio-tecnico-go/internal/app"
 	"desafio-tecnico-go/internal/domain"
 )
 
@@ -117,4 +118,50 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 		return errors.New("unexpected data after JSON object")
 	}
 	return nil
+}
+
+type ledgerEntryResponse struct {
+	ID            string    `json:"id"`
+	WalletID      string    `json:"walletId"`
+	TransactionID string    `json:"transactionId"`
+	Direction     string    `json:"direction"`
+	Money         *moneyDTO `json:"money"`
+	BalanceBefore *moneyDTO `json:"balanceBefore"`
+	BalanceAfter  *moneyDTO `json:"balanceAfter"`
+	CreatedAt     string    `json:"createdAt"`
+}
+
+// ledgerResponse: items sempre presente (lista vazia numa carteira sem lançamentos); nextCursor só se houver próxima página.
+type ledgerResponse struct {
+	Items      []ledgerEntryResponse `json:"items"`
+	NextCursor string                `json:"nextCursor,omitempty"`
+}
+
+func toLedgerResponse(p app.LedgerPage) ledgerResponse {
+	out := ledgerResponse{Items: make([]ledgerEntryResponse, 0, len(p.Items)), NextCursor: p.NextCursor}
+	for _, e := range p.Items {
+		out.Items = append(out.Items, ledgerEntryResponse{
+			ID: e.ID().String(), WalletID: e.WalletID().String(), TransactionID: e.TransactionID().String(),
+			Direction: string(e.Direction()), Money: toMoneyDTO(e.Money()),
+			BalanceBefore: toMoneyDTO(e.BalanceBefore()), BalanceAfter: toMoneyDTO(e.BalanceAfter()),
+			CreatedAt: e.CreatedAt().Format(time.RFC3339Nano),
+		})
+	}
+	return out
+}
+
+type reconciliationResponse struct {
+	WalletID          string    `json:"walletId"`
+	StoredBalance     *moneyDTO `json:"storedBalance"`
+	CalculatedBalance *moneyDTO `json:"calculatedBalance"`
+	Difference        *moneyDTO `json:"difference"`
+	Consistent        bool      `json:"consistent"`
+	CheckedEntries    int64     `json:"checkedEntries"`
+}
+
+func toReconciliationResponse(r app.ReconciliationResult) reconciliationResponse {
+	return reconciliationResponse{
+		WalletID: r.WalletID.String(), StoredBalance: toMoneyDTO(r.Stored), CalculatedBalance: toMoneyDTO(r.Calculated),
+		Difference: toMoneyDTO(r.Difference), Consistent: r.Consistent, CheckedEntries: r.CheckedEntries,
+	}
 }
